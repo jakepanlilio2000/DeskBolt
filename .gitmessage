@@ -1,0 +1,7 @@
+# <type>(<scope>): <imperative summary <= 72 chars>
+# Types: feat | feat! | fix | refactor | docs | build | ci | chore
+# Optional release tags in body: [stable] | [overhaul] | [skip ci] | BREAKING CHANGE
+
+- Root cause / gap:
+- Concrete change & affected crate/module:
+- Verification:
