@@ -18,7 +18,7 @@ Self-hosted remote desktop, file transfer, and system administration for Windows
 
 ## Core Capabilities
 
-- **Remote desktop.** Control a remote computer, view its screen, or open a file-only session. Switch monitors and synchronize the clipboard over a direct, encrypted connection. Supported devices accelerate motion video and fall back to bundled codecs when needed. Open **Quality HUD** in the session toolbar to see latency, render rate, codec, bandwidth, decode time, and recent frame drops.
+- **Remote desktop.** Control a remote computer, view its screen, or open a file-only session. Choose one display, stitch **All Screens** into one canvas, or open separate desktop windows with **Pop Out Displays**. Synchronize the clipboard over the same encrypted connection. Supported devices accelerate motion video and fall back to bundled codecs when needed. Open **Quality HUD** in the session toolbar to see latency, render rate, codec, bandwidth, decode time, and recent frame drops.
 - **Terminal access.** Open an interactive host shell, connect to SSH and serial devices, reuse command snippets, and run a command on multiple saved hosts.
 - **Files and logs.** Browse and transfer files, resume interrupted copies, compare directories with exclusion rules, edit remote text files, and follow live logs. Transfers use SHA-256 verification.
 - **Network and system administration.** Forward TCP ports, troubleshoot connectivity, and inspect remote systems, processes, and services.
@@ -26,6 +26,9 @@ Self-hosted remote desktop, file transfer, and system administration for Windows
 - **Power and hardware control.** Restart or shut down an authorized host, send Wake-on-LAN, or use the BIOS console and network boot on compatible hardware.
 
 ## Quick Start
+
+In a Full Control session, **Match Viewer Window Size** temporarily changes the selected host display to a supported mode and restores it after the session. **Blank Remote Screen** and **Lock Remote Keyboard & Mouse** are separate controls. Enable each action in Host Settings before using it. Headless capture requires a compatible virtual display provider or an existing graphical session that supports a virtual screen.
+
 
 System audio is off by default. Enable **Allow System Audio Forwarding** in the host settings, then select **System Audio** in the Viewer toolbar. Set playback defaults under **Tools → Options → Audio & Chat**. Linux requires a compatible desktop audio service in the active session. On macOS 14.6 or later, grant system audio recording permission and select an output device without a microphone.
 
