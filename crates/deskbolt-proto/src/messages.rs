@@ -583,6 +583,8 @@ pub enum PowerMsg {
         accepted: bool,
         message: String,
     },
+    #[cfg(all(feature = "dev-mcp", not(target_os = "android")))]
+    SimulatePowerAction(PowerAction),
 }
 
 /// Local IPC messages exchanged over `\\.\pipe\DeskBolt_IPC` between Session-0 and `--agent`.
@@ -635,6 +637,13 @@ pub enum IpcMsg {
 mod tests {
     use super::*;
     use crate::frame::{decode_bincode, encode_bincode};
+
+    #[cfg(not(all(feature = "dev-mcp", not(target_os = "android"))))]
+    #[test]
+    fn default_power_codec_rejects_simulation() {
+        let simulated_restart = [2, 0, 0, 0, 1, 0, 0, 0];
+        assert!(decode_bincode::<PowerMsg>(&simulated_restart).is_err());
+    }
 
     #[test]
     fn message_bincode_roundtrips() {

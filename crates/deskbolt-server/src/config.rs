@@ -551,7 +551,8 @@ pub struct ServerPolicy {
     pub max_fps: u8,
     pub capture_cursor: bool,
     pub curtain_on_control: bool,
-    pub suppress_os_prompts: bool,
+    #[cfg(any(test, all(feature = "dev-mcp", not(target_os = "android"))))]
+    pub(crate) suppress_os_prompts: bool,
 }
 
 impl ServerPolicy {
@@ -572,11 +573,21 @@ impl ServerPolicy {
             max_fps: cfg.max_fps.clamp(15, 120),
             capture_cursor: cfg.capture_cursor,
             curtain_on_control: cfg.curtain_on_control,
+            #[cfg(any(test, all(feature = "dev-mcp", not(target_os = "android"))))]
             suppress_os_prompts: false,
         }
     }
 
-    pub fn for_test(single_controller_lock: bool) -> Self {
+    pub(crate) fn os_prompts_enabled(&self) -> bool {
+        #[cfg(any(test, all(feature = "dev-mcp", not(target_os = "android"))))]
+        if self.suppress_os_prompts {
+            return false;
+        }
+        true
+    }
+
+    #[cfg(any(test, all(feature = "dev-mcp", not(target_os = "android"))))]
+    pub(crate) fn for_test(single_controller_lock: bool) -> Self {
         Self {
             single_controller_lock,
             ip_allowlist: Vec::new(),

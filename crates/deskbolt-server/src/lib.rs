@@ -7,6 +7,8 @@ pub mod agent;
 pub mod config;
 pub mod files;
 pub mod ipc;
+#[cfg(all(feature = "dev-mcp", not(target_os = "android")))]
+pub mod loopback;
 pub mod net;
 pub mod platform;
 #[cfg(not(target_os = "android"))]

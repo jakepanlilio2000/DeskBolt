@@ -106,7 +106,8 @@ pub async fn run_tcp_server(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn serve_listener(
+#[cfg(test)]
+async fn serve_listener(
     listener: TcpListener,
     cert_der: Vec<u8>,
     key_der: Vec<u8>,
@@ -143,6 +144,13 @@ pub async fn serve_listener_with_policy(
     preauth_timeout: Duration,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), String> {
+    #[cfg(all(feature = "dev-mcp", not(target_os = "android")))]
+    if !policy.os_prompts_enabled()
+        && listener.local_addr().map_err(|e| e.to_string())?.ip()
+            != std::net::Ipv4Addr::LOCALHOST
+    {
+        return Err("The fixture listener requires 127.0.0.1.".into());
+    }
     let cert_fp = sha256_fingerprint(&cert_der);
     let tls_cfg = build_server_config(cert_der, key_der).map_err(|e| e.to_string())?;
     let limiter = Arc::new(Mutex::new(match policy.lockout_threshold {
@@ -291,7 +299,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         let _ = hub
             .to_agent_tx
             .try_send(IpcMsg::SetCaptureCursor(policy.capture_cursor));
-        if mode == SessionMode::FullControl && policy.curtain_on_control && !policy.suppress_os_prompts {
+        if mode == SessionMode::FullControl && policy.curtain_on_control && policy.os_prompts_enabled() {
             let _ = hub.to_agent_tx.try_send(IpcMsg::SetCurtainMode(true));
         }
     }
@@ -314,7 +322,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     if needs_desktop {
         if mode == SessionMode::FullControl {
             let _ = hub.to_agent_tx.try_send(IpcMsg::Input(InputMsg::ReleaseAllKeys));
-            if policy.curtain_on_control && !policy.suppress_os_prompts {
+            if policy.curtain_on_control && policy.os_prompts_enabled() {
                 let _ = hub.to_agent_tx.try_send(IpcMsg::SetCurtainMode(false));
                 let _ = set_curtain_mode(false);
             }
@@ -487,7 +495,7 @@ async fn authenticate_stream<S: AsyncRead + AsyncWrite + Unpin>(
         return Err("requested mode disallowed by host policy".into());
     }
 
-    if policy.confirm_connect && !policy.suppress_os_prompts {
+    if policy.confirm_connect && policy.os_prompts_enabled() {
         let timeout_secs = policy.confirm_timeout_secs;
         let def_allow = policy.confirm_default_allow;
         let approved = tokio::task::spawn_blocking(move || {
@@ -1107,15 +1115,19 @@ async fn dispatch_client_frame(
                         body: body.clone(),
                         urgent,
                     });
-                    let ack = if policy.suppress_os_prompts {
-                        CommsMsg::PopupAck {
+                    #[cfg(any(test, all(feature = "dev-mcp", not(target_os = "android"))))]
+                    if !policy.os_prompts_enabled() {
+                        let ack = CommsMsg::PopupAck {
                             shown: true,
                             message: format!("Popup '{title}' queued."),
+                        };
+                        if let Ok(f) = pack_message(ChannelId::Comms, FLAG_NONE, &ack, None) {
+                            let _ = out_tx.send(f).await;
                         }
-                    } else {
-                        let t = title.clone();
-                        let b = body.clone();
-                        match tokio::task::spawn_blocking(move || show_desktop_popup(&t, &b, urgent))
+                        return Ok(());
+                    }
+                    let ack =
+                        match tokio::task::spawn_blocking(move || show_desktop_popup(&title, &body, urgent))
                             .await
                         {
                             Ok(Ok(())) => CommsMsg::PopupAck {
@@ -1130,8 +1142,7 @@ async fn dispatch_client_frame(
                                 shown: false,
                                 message: format!("popup task failed: {e}"),
                             },
-                        }
-                    };
+                        };
                     if let Ok(f) = pack_message(ChannelId::Comms, FLAG_NONE, &ack, None) {
                         let _ = out_tx.send(f).await;
                     }
@@ -1141,23 +1152,24 @@ async fn dispatch_client_frame(
                         send_control_error(out_tx, "Voice chat is disabled by host administrator.");
                         return Ok(());
                     }
-                    if policy.suppress_os_prompts {
+                    #[cfg(any(test, all(feature = "dev-mcp", not(target_os = "android"))))]
+                    if !policy.os_prompts_enabled() {
                         if let Ok(f) = pack_message(ChannelId::Comms, FLAG_NONE, &CommsMsg::VoiceAccept, None) {
                             let _ = out_tx.send(f).await;
                         }
-                    } else {
-                        match VoiceEngine::start(None, None, voice_tx.clone(), Arc::new(VoiceControls::default())) {
-                            Ok(eng) => {
-                                *voice_engine = Some(eng);
-                                if let Ok(f) = pack_message(ChannelId::Comms, FLAG_NONE, &CommsMsg::VoiceAccept, None) {
-                                    let _ = out_tx.send(f).await;
-                                }
+                        return Ok(());
+                    }
+                    match VoiceEngine::start(None, None, voice_tx.clone(), Arc::new(VoiceControls::default())) {
+                        Ok(eng) => {
+                            *voice_engine = Some(eng);
+                            if let Ok(f) = pack_message(ChannelId::Comms, FLAG_NONE, &CommsMsg::VoiceAccept, None) {
+                                let _ = out_tx.send(f).await;
                             }
-                            Err(e) => {
-                                send_control_error(out_tx, &format!("Host audio unavailable: {e}"));
-                                if let Ok(f) = pack_message(ChannelId::Comms, FLAG_NONE, &CommsMsg::VoiceEnd, None) {
-                                    let _ = out_tx.send(f).await;
-                                }
+                        }
+                        Err(e) => {
+                            send_control_error(out_tx, &format!("Host audio unavailable: {e}"));
+                            if let Ok(f) = pack_message(ChannelId::Comms, FLAG_NONE, &CommsMsg::VoiceEnd, None) {
+                                let _ = out_tx.send(f).await;
                             }
                         }
                     }
@@ -1176,22 +1188,24 @@ async fn dispatch_client_frame(
             }
         }
         ChannelId::PowerControl => {
-            let PowerMsg::PowerCommand {
-                action,
-                force,
-                delay_secs,
-            } = unpack_message(&frame).map_err(|e| e.to_string())?
-            else {
-                return Ok(());
-            };
-            if *mode != SessionMode::FullControl || !policy.permissions.power_control {
-                let ack = PowerMsg::PowerAck {
-                    accepted: false,
-                    message: "Power control is disabled by host policy or requires Full Control.".into(),
-                };
-                if let Ok(f) = pack_message(ChannelId::PowerControl, FLAG_URGENT, &ack, None) {
-                    let _ = out_tx.send(f).await;
+            let permitted = *mode == SessionMode::FullControl && policy.permissions.power_control;
+            let denied = "Power control is disabled by host policy or requires Full Control.";
+            let (action, force, delay_secs) = match unpack_message(&frame).map_err(|e| e.to_string())? {
+                PowerMsg::PowerCommand { action, force, delay_secs } => (action, force, delay_secs),
+                PowerMsg::PowerAck { .. } => return Ok(()),
+                #[cfg(all(feature = "dev-mcp", not(target_os = "android")))]
+                PowerMsg::SimulatePowerAction(action) => {
+                    let result = if permitted && !policy.os_prompts_enabled() {
+                        Ok(format!("Simulated power action: {action:?}"))
+                    } else {
+                        Err(denied.into())
+                    };
+                    send_power_ack(out_tx, result).await;
+                    return Ok(());
                 }
+            };
+            if !permitted || !policy.os_prompts_enabled() {
+                send_power_ack(out_tx, Err(denied.into())).await;
                 return Ok(());
             }
             log_audit_event(
@@ -1200,36 +1214,23 @@ async fn dispatch_client_frame(
                 "power_command",
                 &format!("{action:?} force={force} delay={delay_secs}"),
             );
-            let ack = if policy.suppress_os_prompts {
-                PowerMsg::PowerAck {
-                    accepted: true,
-                    message: format!("Power command {action:?} accepted."),
-                }
-            } else {
-                match tokio::task::spawn_blocking(move || execute_power_action(action, force, delay_secs))
-                    .await
-                {
-                    Ok(Ok(message)) => PowerMsg::PowerAck {
-                        accepted: true,
-                        message,
-                    },
-                    Ok(Err(message)) => PowerMsg::PowerAck {
-                        accepted: false,
-                        message,
-                    },
-                    Err(e) => PowerMsg::PowerAck {
-                        accepted: false,
-                        message: format!("power action task failed: {e}"),
-                    },
-                }
-            };
-            if let Ok(f) = pack_message(ChannelId::PowerControl, FLAG_URGENT, &ack, None) {
-                let _ = out_tx.send(f).await;
-            }
+            let result = tokio::task::spawn_blocking(move || execute_power_action(action, force, delay_secs))
+                .await
+                .unwrap_or_else(|e| Err(format!("Could not run the power action: {e}")));
+            send_power_ack(out_tx, result).await;
         }
         ChannelId::VideoTiles => {}
     }
     Ok(())
+}
+
+async fn send_power_ack(out_tx: &mpsc::Sender<Frame>, result: Result<String, String>) {
+    let accepted = result.is_ok();
+    let message = result.unwrap_or_else(|message| message);
+    let ack = PowerMsg::PowerAck { accepted, message };
+    if let Ok(f) = pack_message(ChannelId::PowerControl, FLAG_URGENT, &ack, None) {
+        let _ = out_tx.send(f).await;
+    }
 }
 
 fn send_control_error(out_tx: &mpsc::Sender<Frame>, message: &str) {
@@ -1269,6 +1270,53 @@ mod tests {
             },
             to_agent_rx,
         )
+    }
+
+    #[cfg(all(feature = "dev-mcp", not(target_os = "android")))]
+    #[tokio::test]
+    async fn regular_listener_rejects_power_simulation() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let id = generate_self_signed_cert(&[]).unwrap();
+            let salt = [0x44; SALT_LEN];
+            let password = b"LoopbackPower#1";
+            let cred = Arc::new(StoredCredential {
+                salt,
+                m_kib: 1024,
+                t_cost: 1,
+                p_cost: 1,
+                auth_key: derive_auth_key(password, &salt, 1024, 1, 1).unwrap(),
+            });
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (hub, _agent_rx) = test_hub();
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let mut policy = ServerPolicy::for_test(false);
+            policy.suppress_os_prompts = false;
+            let server_task = tokio::spawn(serve_listener_with_policy(
+                listener, id.cert_der, id.key_der, cred, hub, false, policy,
+                Duration::from_secs(2), shutdown_rx,
+            ));
+            let (mut tls, mode) =
+                test_auth_connect(addr, id.fingerprint, password, SessionMode::FullControl).await;
+            assert_eq!(mode, SessionMode::FullControl);
+            let frame = pack_message(
+                ChannelId::PowerControl, FLAG_NONE,
+                &PowerMsg::SimulatePowerAction(deskbolt_proto::PowerAction::Restart), None,
+            ).unwrap();
+            write_frame_async(&mut tls, frame.channel, frame.flags, &frame.payload).await.unwrap();
+            loop {
+                let reply = read_frame_async(&mut tls).await.unwrap().unwrap();
+                if reply.channel == ChannelId::PowerControl {
+                    assert!(matches!(
+                        unpack_message::<PowerMsg>(&reply).unwrap(),
+                        PowerMsg::PowerAck { accepted: false, .. }
+                    ));
+                    break;
+                }
+            }
+            shutdown_tx.send(true).unwrap();
+            server_task.await.unwrap().unwrap();
+        }).await.unwrap();
     }
 
     #[tokio::test]

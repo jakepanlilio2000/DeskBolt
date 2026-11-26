@@ -32,8 +32,15 @@ surge-ping = { workspace = true }
 hickory-resolver = { workspace = true }
 cpal = { workspace = true }
 
+[features]
+default = []
+dev-mcp = ["dep:rmcp", "dep:schemars", "dep:deskbolt-server"]
+
 [target.'cfg(not(target_os = "android"))'.dependencies]
 serialport = { workspace = true }
+deskbolt-server = { path = "../deskbolt-server", features = ["dev-mcp"], optional = true }
+rmcp = { version = "3.8.0", features = ["server", "macros", "transport-io"], optional = true }
+schemars = { version = "0.8", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = { workspace = true }

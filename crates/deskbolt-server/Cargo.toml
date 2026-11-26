@@ -24,11 +24,19 @@ tracing-subscriber = { workspace = true }
 sysinfo = { workspace = true }
 cpal = { workspace = true }
 
+[features]
+default = []
+dev-mcp = ["dep:rmcp", "dep:schemars", "dep:rustls", "dep:tempfile", "deskbolt-proto/dev-mcp"]
+
 [target.'cfg(not(target_os = "android"))'.dependencies]
 portable-pty = { workspace = true }
 serialport = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
+rmcp = { version = "3.8.0", features = ["server", "macros", "transport-io"], optional = true }
+rustls = { workspace = true, optional = true }
+schemars = { version = "0.8", optional = true }
+tempfile = { version = "3", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true }

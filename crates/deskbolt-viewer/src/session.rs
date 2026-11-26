@@ -676,7 +676,7 @@ impl ViewerSession {
                     };
                     self.status_banner = message;
                 }
-                SessionUiEvent::Power(PowerMsg::PowerCommand { .. }) => {}
+                SessionUiEvent::Power(_) => {}
             }
         }
         (pin_to_save, clip_to_copy)

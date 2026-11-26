@@ -19,5 +19,8 @@ bincode = { workspace = true }
 thiserror = { workspace = true }
 cpal = { workspace = true }
 
+[features]
+dev-mcp = []
+
 [lints]
 workspace = true
