@@ -1,3 +1,4 @@
+use deskbolt_proto::video_pipeline::VideoCapabilities;
 use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{
@@ -250,7 +251,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         return Err(reason);
     }
 
-    let (tls, mut mode, mut ctrl_guard) = match tokio::time::timeout(
+    let (tls, mut mode, mut ctrl_guard, video_decoders) = match tokio::time::timeout(
         preauth_timeout,
         authenticate_stream(
             stream,
@@ -316,6 +317,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         &policy,
         chat_tx,
         &mut shutdown_rx,
+        video_decoders,
     )
     .await;
 
@@ -367,7 +369,7 @@ async fn authenticate_stream<S: AsyncRead + AsyncWrite + Unpin>(
     limiter: &Mutex<IpRateLimiter>,
     controller_lock: Option<&Arc<AtomicBool>>,
     policy: &ServerPolicy,
-) -> Result<(ServerTlsStream<S>, SessionMode, ControllerGuard), String> {
+) -> Result<(ServerTlsStream<S>, SessionMode, ControllerGuard, VideoCapabilities), String> {
     let mut tls = accept_tls(stream, tls_cfg)
         .await
         .map_err(|e| format!("TLS handshake failed: {e}"))?;
@@ -384,6 +386,7 @@ async fn authenticate_stream<S: AsyncRead + AsyncWrite + Unpin>(
         client_nonce,
         requested_mode,
         client_name: _,
+        video_decoders,
     } = unpack_message::<ControlMsg>(&hello_frame).map_err(|e| e.to_string())?
     else {
         return Err("expected ClientHello message".into());
@@ -554,7 +557,7 @@ async fn authenticate_stream<S: AsyncRead + AsyncWrite + Unpin>(
         .await
         .map_err(|e| e.to_string())?;
 
-    Ok((tls, granted_mode, guard))
+    Ok((tls, granted_mode, guard, video_decoders))
 }
 
 struct OutboundQueues {
@@ -630,6 +633,7 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
     policy: &Arc<ServerPolicy>,
     chat_tx: broadcast::Sender<(u64, CommsMsg)>,
     shutdown_rx: &mut watch::Receiver<bool>,
+    video_decoders: VideoCapabilities,
 ) -> Result<(), String> {
     let (mut reader, mut writer) = tokio::io::split(tls);
     let mut frames = AsyncFrameReader::default();
@@ -645,7 +649,7 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
     let (voice_tx, mut voice_rx) = mpsc::channel::<Vec<u8>>(64);
     let mut voice_engine: Option<VoiceEngine> = None;
     let mut system_audio = SystemAudioState::Idle;
-    let mut video_feedback = VideoFeedback::default();
+    let mut video_feedback = VideoFeedback { decoders: video_decoders, ..VideoFeedback::default() };
 
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(128);
     let wake_agent = hub.to_agent_tx.clone();
@@ -676,6 +680,7 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
 
     // Send current known monitor list immediately if not FileTransfer-only
     if *mode != SessionMode::FileTransfer {
+        let _ = hub.to_agent_tx.try_send(IpcMsg::VideoDecoderSupport { viewer: conn_id, capabilities: Some(video_decoders) });
         #[cfg(target_os = "android")]
         if let Ok(frame) = pack_message(ChannelId::AuthControl, FLAG_NONE, &ControlMsg::AndroidControls, None) {
             let _ = out_tx.send(frame).await;
@@ -728,6 +733,9 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                 }
             }
             _ = probe_tick.tick(), if *mode != SessionMode::FileTransfer => {
+                let _ = hub.to_agent_tx.try_send(IpcMsg::VideoDecoderSupport {
+                    viewer: conn_id, capabilities: Some(video_feedback.decoders),
+                });
                 let nonce = video_feedback.begin_probe();
                 if let Ok(frame) = pack_message(ChannelId::AuthControl, FLAG_URGENT, &ControlMsg::Ping { timestamp_ms: nonce }, None) {
                     let _ = out_tx.try_send(frame);
@@ -820,7 +828,11 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                             continue;
                         }
                         match msg.as_ref() {
-                            IpcMsg::Video(VideoMsg::H264Frame { frame_seq, .. } | VideoMsg::TileBatch { frame_seq, .. }) => {
+                            IpcMsg::Video(VideoMsg::EncodedFrame { codec, .. })
+                                if !video_feedback.decoders.includes(*codec) => continue,
+                            IpcMsg::Video(VideoMsg::H264Frame { frame_seq, .. }
+                                | VideoMsg::EncodedFrame { frame_seq, .. }
+                                | VideoMsg::TileBatch { frame_seq, .. }) => {
                                 if *frame_seq < video_feedback.last_frame {
                                     video_feedback.last_ack = 0;
                                 }
@@ -885,6 +897,9 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
     if system_audio != SystemAudioState::Idle {
         let _ = hub.to_agent_tx.send(IpcMsg::SystemAudioStop(conn_id)).await;
     }
+    if *mode != SessionMode::FileTransfer {
+        let _ = hub.to_agent_tx.send(IpcMsg::VideoDecoderSupport { viewer: conn_id, capabilities: None }).await;
+    }
     if video_feedback.level > 0 {
         let _ = hub.to_agent_tx.try_send(IpcMsg::VideoCongestion { viewer: conn_id, level: 0 });
     }
@@ -899,6 +914,7 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
 
 #[derive(Default)]
 struct VideoFeedback {
+    decoders: VideoCapabilities,
     probe: Option<(u64, Instant)>,
     next_probe: u64,
     rtt: Option<(u64, Instant)>,
@@ -1021,6 +1037,7 @@ fn ipc_to_wire_frame(msg: &IpcMsg) -> Option<Frame> {
         IpcMsg::Video(v) => {
             let flags = match v {
                 VideoMsg::H264Frame { is_keyframe: true, .. }
+                | VideoMsg::EncodedFrame { is_keyframe: true, .. }
                 | VideoMsg::TileBatch { is_full_refresh: true, .. } => FLAG_KEYFRAME,
                 VideoMsg::CursorUpdate { .. } => FLAG_URGENT,
                 _ => FLAG_NONE,
@@ -1070,6 +1087,12 @@ async fn dispatch_client_frame(
                     }
                 }
                 ControlMsg::Pong { timestamp_ms } => video_feedback.pong(timestamp_ms),
+                ControlMsg::VideoCapabilities(capabilities) if *mode != SessionMode::FileTransfer => {
+                    video_feedback.decoders = video_feedback.decoders.intersect(capabilities);
+                    let _ = hub.to_agent_tx.try_send(IpcMsg::VideoDecoderSupport {
+                        viewer: conn_id, capabilities: Some(video_feedback.decoders),
+                    });
+                }
                 ControlMsg::FrameAck { last_seq, decode_ms } if *mode != SessionMode::FileTransfer => {
                     if let Some(level) = video_feedback.acknowledge(last_seq, decode_ms, Instant::now()) {
                         let _ = hub.to_agent_tx.try_send(IpcMsg::VideoCongestion { viewer: conn_id, level });
@@ -1718,6 +1741,7 @@ mod tests {
                 client_nonce: c_nonce,
                 requested_mode: SessionMode::ViewOnly,
                 client_name: "TestViewer".into(),
+                video_decoders: VideoCapabilities::default(),
             },
             None,
         )
@@ -1858,6 +1882,7 @@ mod tests {
                 client_nonce: c_nonce,
                 requested_mode: SessionMode::FullControl,
                 client_name: "LoopbackTester".into(),
+                video_decoders: VideoCapabilities::default(),
             },
             None,
         )
@@ -2228,6 +2253,7 @@ mod tests {
                 client_nonce: c_nonce,
                 requested_mode: mode,
                 client_name: "LockTester".into(),
+                video_decoders: VideoCapabilities::default(),
             },
             None,
         )

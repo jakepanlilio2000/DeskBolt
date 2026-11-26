@@ -55,6 +55,7 @@ pub enum ControlMsg {
         client_nonce: [u8; 32],
         requested_mode: SessionMode,
         client_name: String,
+        video_decoders: crate::video_pipeline::VideoCapabilities,
     },
     ServerChallenge {
         server_nonce: [u8; 32],
@@ -119,6 +120,7 @@ pub enum ControlMsg {
         reason: String,
     },
     AndroidControls,
+    VideoCapabilities(crate::video_pipeline::VideoCapabilities),
 }
 
 /// Screen region copied from `(src_x, src_y)` to `(dst_x, dst_y)` before dirty tiles paint.
@@ -174,6 +176,16 @@ pub enum VideoMsg {
         width: u16,
         height: u16,
         zstd_rgba_shape: Option<Vec<u8>>,
+    },
+    EncodedFrame {
+        codec: crate::video_pipeline::VideoCodec,
+        monitor_id: u8,
+        frame_seq: u64,
+        timestamp_us: u64,
+        width: u16,
+        height: u16,
+        is_keyframe: bool,
+        bytes: Vec<u8>,
     },
 }
 
@@ -723,6 +735,7 @@ pub enum IpcMsg {
     SystemAudioFrame(#[serde(deserialize_with = "crate::audio_codec::bounded_packet")] Vec<u8>),
     SystemAudioFailed(String),
     VideoCongestion { viewer: u64, level: u8 },
+    VideoDecoderSupport { viewer: u64, capabilities: Option<crate::video_pipeline::VideoCapabilities> },
 }
 
 #[cfg(test)]

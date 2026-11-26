@@ -208,6 +208,7 @@ impl Host {
                     client_nonce: nonce,
                     requested_mode: SessionMode::FullControl,
                     client_name: "Loopback protocol check".into(),
+                    video_decoders: Default::default(),
                 },
             )
             .await?;

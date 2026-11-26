@@ -4,11 +4,12 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
+use deskbolt_proto::video_pipeline::{VideoCapabilities, VideoEncoder, VideoInput, ZstdVideo};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use deskbolt_proto::{
-    CursorDelta, DesktopState, DirtyTile, H264VideoEncoder, InputMsg, IpcMsg, MonitorInfo, TileRect, VideoMsg,
-    VideoQualityMode, encode_dirty_tile,
+    CursorDelta, DesktopState, DirtyTile, H264VideoEncoder, InputMsg, IpcMsg, MonitorInfo, VideoMsg,
+    VideoQualityMode,
 };
 #[cfg(target_os = "windows")]
 use deskbolt_proto::{
@@ -43,7 +44,7 @@ pub async fn run_agent_process(pipe_name: &str) -> Result<(), String> {
     let write_task = tokio::spawn(async move {
         while let Some(msg) = ev_rx.recv().await {
             let flags = match &msg {
-                IpcMsg::Video(VideoMsg::H264Frame { is_keyframe: true, .. })
+                IpcMsg::Video(VideoMsg::H264Frame { is_keyframe: true, .. } | VideoMsg::EncodedFrame { is_keyframe: true, .. })
                 | IpcMsg::Video(VideoMsg::TileBatch { is_full_refresh: true, .. }) => FLAG_KEYFRAME,
                 _ => FLAG_NONE,
             };
@@ -127,6 +128,7 @@ struct SharedAgentState {
     target_fps: Mutex<u8>,
     bitrate_kbps: Mutex<u32>,
     congestion: Mutex<HashMap<u64, (u8, Instant)>>,
+    decoder_support: Mutex<HashMap<u64, VideoCapabilities>>,
     force_keyframe: AtomicBool,
     desktop_switched: AtomicBool,
     capture_cursor: AtomicBool,
@@ -156,6 +158,7 @@ fn run_agent_workers(
         target_fps: Mutex::new(30),
         bitrate_kbps: Mutex::new(4000),
         congestion: Mutex::new(HashMap::new()),
+        decoder_support: Mutex::new(HashMap::new()),
         force_keyframe: AtomicBool::new(true),
         desktop_switched: AtomicBool::new(true),
         capture_cursor: AtomicBool::new(true),
@@ -223,6 +226,16 @@ fn run_agent_workers(
                 *shared.target_fps.lock().unwrap() = target_fps.clamp(15, 120);
                 *shared.bitrate_kbps.lock().unwrap() = h264_bitrate_kbps.max(250);
                 shared.force_keyframe.store(true, Ordering::SeqCst);
+            }
+            IpcMsg::VideoDecoderSupport { viewer, capabilities } => {
+                let mut viewers = shared.decoder_support.lock().unwrap();
+                if let Some(capabilities) = capabilities {
+                    if viewers.insert(viewer, capabilities) != Some(capabilities) {
+                        shared.force_keyframe.store(true, Ordering::Relaxed);
+                    }
+                } else {
+                    viewers.remove(&viewer);
+                }
             }
             IpcMsg::VideoCongestion { viewer, level } => {
                 let mut viewers = shared.congestion.lock().unwrap();
@@ -560,7 +573,6 @@ fn encode_loop(
         let (fps, bitrate, downscale) = adaptive_quality(
             shared.congestion_level(), *shared.target_fps.lock().unwrap(), *shared.bitrate_kbps.lock().unwrap(),
         );
-        let fps = f32::from(fps);
         let bitrate = bitrate * 1000;
 
         let dirty_area: u64 = if raw.force_full {
@@ -586,43 +598,45 @@ fn encode_loop(
         last_frame_cache = Some((raw.monitor_id, raw.width, raw.height, raw.bgra.clone()));
         seq += 1;
 
+        let input = VideoInput {
+            bgra: &raw.bgra,
+            width: raw.width,
+            height: raw.height,
+            monitor: raw.monitor_id,
+            sequence: seq,
+            timestamp_us: now_micros(),
+            bitrate,
+            fps,
+            refresh: raw.force_full,
+            dirty_rects: &raw.dirty_rects,
+            moves: &raw.move_rects,
+        };
+
         if use_h264 {
-            let (bgra, width, height) = if downscale && raw.width >= 64 && raw.height >= 64 {
-                let (width, height) = scale_motion_frame(&raw.bgra, raw.width, raw.height, &mut scaled);
-                (scaled.as_slice(), width, height)
-            } else {
-                (raw.bgra.as_slice(), raw.width, raw.height)
+            let mut motion = VideoInput {
+                refresh: input.refresh || !sent_motion || auto_tracker.just_entered_h264(),
+                ..input
             };
+            if downscale && input.width >= 64 && input.height >= 64 {
+                (motion.width, motion.height) = scale_motion_frame(input.bgra, input.width, input.height, &mut scaled);
+                motion.bgra = &scaled;
+            }
             let result = (|| {
                 let encoder = match h264.as_mut() {
-                    Some(encoder) => {
-                        encoder.reconfigure(width, height, bitrate, fps)?;
-                        encoder
-                    }
-                    None => h264.insert(H264VideoEncoder::new(width, height, bitrate, fps)?),
+                    Some(encoder) => encoder,
+                    None => h264.insert(H264VideoEncoder::new(motion.width, motion.height, bitrate, f32::from(fps))?),
                 };
-                if raw.force_full || !sent_motion || auto_tracker.just_entered_h264() {
-                    encoder.force_keyframe();
-                }
-                encoder.encode_bgra(bgra, width, height)
+                encoder.encode(motion)
             })();
             match result {
-                Ok((annex_b, is_keyframe)) => {
-                    let msg = VideoMsg::H264Frame {
-                        monitor_id: raw.monitor_id,
-                        frame_seq: seq,
-                        timestamp_us: now_micros(),
-                        width: width as u16,
-                        height: height as u16,
-                        is_keyframe,
-                        annex_b,
-                    };
+                Ok(Some(msg)) => {
                     if ev_tx.blocking_send(IpcMsg::Video(msg)).is_err() {
                         break;
                     }
                     sent_motion = true;
                     continue;
                 }
+                Ok(None) => continue,
                 Err(error) => {
                     warn!("Motion encoding failed: {error}");
                     h264 = None;
@@ -630,24 +644,11 @@ fn encode_loop(
             }
         }
 
-        let full_refresh = raw.force_full || sent_motion || use_h264;
+        let tiles = VideoInput { refresh: input.refresh || sent_motion || use_h264, ..input };
         sent_motion = false;
-        let tiles = if full_refresh || raw.dirty_rects.is_empty() && raw.move_rects.is_empty() {
-            build_full_tiles(&raw.bgra, raw.width, raw.height)
-        } else {
-            dirty_rects_to_tiles(&raw.bgra, raw.width, raw.height, &raw.dirty_rects)
-        };
-        let msg = VideoMsg::TileBatch {
-            monitor_id: raw.monitor_id,
-            frame_seq: seq,
-            timestamp_us: now_micros(),
-            width: raw.width as u16,
-            height: raw.height as u16,
-            is_full_refresh: full_refresh,
-            move_rects: if full_refresh { Vec::new() } else { raw.move_rects },
-            tiles,
-        };
-        if ev_tx.blocking_send(IpcMsg::Video(msg)).is_err() {
+        if let Ok(Some(msg)) = ZstdVideo.encode(tiles)
+            && ev_tx.blocking_send(IpcMsg::Video(msg)).is_err()
+        {
             break;
         }
     }
@@ -750,78 +751,7 @@ impl AutoModeTracker {
 }
 
 fn build_full_tiles(bgra: &[u8], w: u32, h: u32) -> Vec<DirtyTile> {
-    dirty_rects_to_tiles(bgra, w, h, &[(0, 0, w as i32, h as i32)])
-}
-
-/// Coalesces dirty rectangles and slices oversized rects into Zstd level-3 `DirtyTile`s.
-pub fn dirty_rects_to_tiles(
-    bgra: &[u8],
-    w: u32,
-    h: u32,
-    dirty_rects: &[(i32, i32, i32, i32)],
-) -> Vec<DirtyTile> {
-    let mut clamped: Vec<(u16, u16, u16, u16)> = dirty_rects
-        .iter()
-        .filter_map(|&(l, t, r, b)| {
-            let x0 = l.clamp(0, w as i32) as u16;
-            let y0 = t.clamp(0, h as i32) as u16;
-            let x1 = r.clamp(0, w as i32) as u16;
-            let y1 = b.clamp(0, h as i32) as u16;
-            (x1 > x0 && y1 > y0).then_some((x0, y0, x1, y1))
-        })
-        .collect();
-
-    let mut merged: Vec<(u16, u16, u16, u16)> = Vec::with_capacity(clamped.len());
-    for rect in clamped.drain(..) {
-        let mut absorbed = false;
-        for existing in &mut merged {
-            let ux0 = existing.0.min(rect.0);
-            let uy0 = existing.1.min(rect.1);
-            let ux1 = existing.2.max(rect.2);
-            let uy1 = existing.3.max(rect.3);
-            let union_area = ((ux1 - ux0) as u64) * ((uy1 - uy0) as u64);
-            let sum_area = ((existing.2 - existing.0) as u64) * ((existing.3 - existing.1) as u64)
-                + ((rect.2 - rect.0) as u64) * ((rect.3 - rect.1) as u64);
-            if union_area * 4 <= sum_area * 5 {
-                *existing = (ux0, uy0, ux1, uy1);
-                absorbed = true;
-                break;
-            }
-        }
-        if !absorbed {
-            merged.push(rect);
-        }
-    }
-
-    let mut tiles = Vec::new();
-    const MAX_CHUNK: u16 = 512;
-    for (x0, y0, x1, y1) in merged {
-        let mut y = y0;
-        while y < y1 {
-            let th = (y1 - y).min(MAX_CHUNK);
-            let mut x = x0;
-            while x < x1 {
-                let tw = (x1 - x).min(MAX_CHUNK);
-                if let Ok(tile) = encode_dirty_tile(
-                    bgra,
-                    w,
-                    h,
-                    TileRect {
-                        x,
-                        y,
-                        width: tw,
-                        height: th,
-                    },
-                    3,
-                ) {
-                    tiles.push(tile);
-                }
-                x += tw;
-            }
-            y += th;
-        }
-    }
-    tiles
+    deskbolt_proto::video_pipeline::dirty_rects_to_tiles(bgra, w, h, &[(0, 0, w as i32, h as i32)])
 }
 
 /// Maps `[0.0, 1.0]` normalized monitor coordinates into virtual desktop `0..=65535` space.
@@ -966,7 +896,7 @@ mod tests {
         let w = 64u32;
         let h = 64u32;
         let bgra = vec![200u8; (w * h * 4) as usize];
-        let tiles = dirty_rects_to_tiles(&bgra, w, h, &[(0, 0, 10, 10), (8, 0, 20, 10)]);
+        let tiles = deskbolt_proto::video_pipeline::dirty_rects_to_tiles(&bgra, w, h, &[(0, 0, 10, 10), (8, 0, 20, 10)]);
         assert_eq!(tiles.len(), 1);
         assert_eq!(tiles[0].x, 0);
         assert_eq!(tiles[0].width, 20);

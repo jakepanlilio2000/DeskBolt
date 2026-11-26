@@ -1,3 +1,4 @@
+use deskbolt_proto::video_pipeline::{VideoCodec, VideoDecoder, ZstdVideo};
 use deskbolt_proto::partial_file::{DEFAULT_PART_TTL_HOURS, PartialFile, offer, resume_source};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -13,7 +14,7 @@ use deskbolt_proto::{
     FileTransferMsg, Frame, H264VideoDecoder, InputMsg, MonitorInfo, NONCE_LEN, PROTO_VERSION,
     PowerMsg, SessionMode, SyncEntry, SysAdminMsg, SystemSnapshot, TerminalMsg, TofuPinPolicy,
     TofuServerCertVerifier, TransferDir, TunnelMsg, VOICE_SAMPLE_RATE, VideoMsg, VideoQualityMode,
-    VoiceControls, VoiceEngine, apply_tile_batch_rgba, compute_client_proof, connect_tls,
+    VoiceControls, VoiceEngine, compute_client_proof, connect_tls,
     derive_auth_key, format_fingerprint, pack_message, parse_fingerprint, random_bytes,
     read_frame_async, unpack_message, verify_server_proof, write_frame_async,
 };
@@ -922,6 +923,7 @@ async fn run_session_task(
                 client_nonce: c_nonce,
                 requested_mode: mode,
                 client_name: std::env::var("COMPUTERNAME").unwrap_or_else(|_| "DeskBoltViewer".into()),
+                video_decoders: Default::default(),
             },
             None,
         ) else {
@@ -2007,40 +2009,24 @@ fn run_decode_worker(
 
     while let Ok((msg, queued_at)) = rx.recv() {
         let decode_start = Instant::now();
-        let (seq, updated, codec) = match &msg {
-            VideoMsg::TileBatch { frame_seq: s, .. } => {
-                let ok = apply_tile_batch_rgba(&msg, &mut rgba_buf, &mut buf_w, &mut buf_h).is_ok();
-                (*s, ok, "Zstd 4:4:4")
-            }
-            VideoMsg::H264Frame {
-                frame_seq: s,
-                width,
-                height,
-                annex_b,
-                ..
-            } => {
-                if let Some(dec) = h264.as_mut() {
-                    let produced = dec
-                        .decode_to_rgba(
-                            annex_b,
-                            *width as u32,
-                            *height as u32,
-                            &mut rgba_buf,
-                            &mut buf_w,
-                            &mut buf_h,
-                        )
-                        .unwrap_or(false);
-                    (*s, produced, "H.264 SW")
-                } else {
-                    (*s, false, "H.264 SW")
-                }
-            }
-            VideoMsg::CursorUpdate { .. } => (0, false, ""),
+        let (seq, codec) = match &msg {
+            VideoMsg::TileBatch { frame_seq, .. } => (*frame_seq, VideoCodec::ZstdTiles),
+            VideoMsg::H264Frame { frame_seq, .. } => (*frame_seq, VideoCodec::H264Sw),
+            VideoMsg::EncodedFrame { frame_seq, codec, .. } => (*frame_seq, *codec),
+            VideoMsg::CursorUpdate { .. } => continue,
+        };
+        let updated = match codec {
+            VideoCodec::ZstdTiles => ZstdVideo.decode(&msg, &mut rgba_buf, &mut buf_w, &mut buf_h).unwrap_or(false),
+            VideoCodec::H264Sw | VideoCodec::H264Hw => h264.as_mut().is_some_and(|decoder| {
+                decoder.decode(&msg, &mut rgba_buf, &mut buf_w, &mut buf_h).unwrap_or(false)
+            }),
+            VideoCodec::HevcHw | VideoCodec::Av1Hw => false,
         };
 
         if updated && buf_w > 0 && buf_h > 0 {
             let latency = decode_start.elapsed().as_millis().min(u128::from(u16::MAX)) as u16;
-            stats.lock().unwrap().decoded(seq, codec, latency);
+            let actual = if codec == VideoCodec::H264Hw { VideoCodec::H264Sw } else { codec };
+            stats.lock().unwrap().decoded(seq, actual.label(), latency);
             let next_seq = frame_seq.fetch_add(1, Ordering::SeqCst) + 1;
             *latest_frame.lock().unwrap() = Some(DecodedFrame {
                 seq: next_seq,
