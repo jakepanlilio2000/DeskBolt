@@ -113,8 +113,8 @@ fn decode_png(bytes: &[u8]) -> Option<ImageData<'static>> {
     pixels.truncate(frame.buffer_size());
     let bytes = match frame.color_type {
         ColorType::Rgba => pixels,
-        ColorType::Rgb => pixels.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect(),
-        ColorType::GrayscaleAlpha => pixels.chunks_exact(2).flat_map(|p| [p[0], p[0], p[0], p[1]]).collect(),
+        ColorType::Rgb => pixels.as_chunks::<3>().0.iter().flat_map(|&[r, g, b]| [r, g, b, 255]).collect(),
+        ColorType::GrayscaleAlpha => pixels.as_chunks::<2>().0.iter().flat_map(|&[grey, alpha]| [grey, grey, grey, alpha]).collect(),
         ColorType::Grayscale => pixels.iter().flat_map(|&p| [p, p, p, 255]).collect(),
         ColorType::Indexed => return None,
     };
