@@ -1612,7 +1612,9 @@ impl DeskBoltViewerApp {
                                 if s.mode == SessionMode::FullControl {
                                     let canvas = display_rect.intersect(ui.clip_rect());
                                     let files = ui.input_mut(|input| {
-                                        if input.pointer.hover_pos().is_some_and(|pos| canvas.contains(pos)) {
+                                        if !input.raw.dropped_files.is_empty()
+                                            && drop_position(input, ppp).is_some_and(|pos| canvas.contains(pos))
+                                        {
                                             std::mem::take(&mut input.raw.dropped_files)
                                         } else {
                                             Vec::new()
@@ -2404,6 +2406,66 @@ fn forward_input_sender(
         }
     });
     tx
+}
+
+fn drop_position(input: &egui::InputState, ppp: f32) -> Option<Pos2> {
+    if let Some(window) = input.viewport().inner_rect
+        && let Some(screen) = native_drop_point(input.viewport())
+    {
+        return Some(Pos2::ZERO + (screen / ppp - window.min));
+    }
+    input.pointer.hover_pos()
+}
+
+#[cfg(target_os = "windows")]
+fn native_drop_point(_: &egui::ViewportInfo) -> Option<Pos2> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let mut cursor = POINT::default();
+    // SAFETY: The OS writes the current screen point to this initialized structure.
+    unsafe { GetCursorPos(&mut cursor).ok()?; }
+    Some(Pos2::new(cursor.x as f32, cursor.y as f32))
+}
+
+#[cfg(target_os = "macos")]
+fn native_drop_point(viewport: &egui::ViewportInfo) -> Option<Pos2> {
+    use std::ffi::c_void;
+    #[repr(C)]
+    struct Point { x: f64, y: f64 }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventCreate(source: *const c_void) -> *const c_void;
+        fn CGEventGetLocation(event: *const c_void) -> Point;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFRelease(object: *const c_void);
+    }
+    // SAFETY: A null source requests the current cursor position. The owned event is released once.
+    let point = unsafe {
+        let event = CGEventCreate(std::ptr::null());
+        if event.is_null() { return None; }
+        let location = CGEventGetLocation(event);
+        CFRelease(event);
+        location
+    };
+    let scale = viewport.native_pixels_per_point.unwrap_or(1.0);
+    Some(Pos2::new(point.x as f32 * scale, point.y as f32 * scale))
+}
+
+#[cfg(target_os = "linux")]
+fn native_drop_point(_: &egui::ViewportInfo) -> Option<Pos2> {
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::ConnectionExt;
+    let (connection, screen) = x11rb::connect(None).ok()?;
+    let root = connection.setup().roots.get(screen)?.root;
+    let pointer = connection.query_pointer(root).ok()?.reply().ok()?;
+    pointer.same_screen.then_some(Pos2::new(f32::from(pointer.root_x), f32::from(pointer.root_y)))
+}
+
+#[cfg(target_os = "android")]
+fn native_drop_point(_: &egui::ViewportInfo) -> Option<Pos2> {
+    None
 }
 
 /// Computes the rendered screen rect inside `avail` using `ScaleMode` (`Fit`, `1:1 Pixel`, or `Stretch`).
