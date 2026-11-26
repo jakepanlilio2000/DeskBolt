@@ -76,6 +76,9 @@ jobs:
           read -r -a packages <<< "$LINUX_BUILD_PACKAGES"
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends "${packages[@]}"
+      - name: Install macOS assembler
+        if: runner.os == 'macOS'
+        run: command -v nasm >/dev/null || brew install nasm
       - name: Test the workspace with all features
         run: cargo test --workspace --all-features --locked
       - name: Lint all workspace targets
