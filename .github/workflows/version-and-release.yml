@@ -141,20 +141,21 @@ jobs:
             libxcb-shape0-dev libxcb-xfixes0-dev libasound2-dev libclang-dev clang nasm \
             rpm zstd file desktop-file-utils
           rustup update stable
-          cargo install --locked cargo-deb cargo-generate-rpm
+          cargo install cargo-deb cargo-generate-rpm
           cargo build --release --workspace --locked
 
           VER="${{ steps.rel.outputs.version }}"
           TAG="${{ steps.rel.outputs.tag }}"
+          PKG_PRE_VER="${VER//-/\~}"
           mkdir -p dist/linux-out
 
           # Debian/Ubuntu/Mint .deb
-          cargo deb -p deskbolt-server --no-build -o "dist/linux-out/deskbolt-server_${VER}_amd64.deb"
-          cargo deb -p deskbolt-viewer --no-build -o "dist/linux-out/deskbolt-viewer_${VER}_amd64.deb"
+          cargo deb -p deskbolt-server --no-build --deb-version "${PKG_PRE_VER}-1" -o "dist/linux-out/deskbolt-server_${VER}_amd64.deb"
+          cargo deb -p deskbolt-viewer --no-build --deb-version "${PKG_PRE_VER}-1" -o "dist/linux-out/deskbolt-viewer_${VER}_amd64.deb"
 
           # Fedora/RHEL/openSUSE .rpm
-          cargo generate-rpm -p crates/deskbolt-server -o "dist/linux-out/deskbolt-server-${VER}-1.x86_64.rpm"
-          cargo generate-rpm -p crates/deskbolt-viewer -o "dist/linux-out/deskbolt-viewer-${VER}-1.x86_64.rpm"
+          cargo generate-rpm -p crates/deskbolt-server -s "version = \"${PKG_PRE_VER}\"" -o "dist/linux-out/deskbolt-server-${VER}-1.x86_64.rpm"
+          cargo generate-rpm -p crates/deskbolt-viewer -s "version = \"${PKG_PRE_VER}\"" -o "dist/linux-out/deskbolt-viewer-${VER}-1.x86_64.rpm"
 
           # Universal portable tarball (Alpine, NixOS, Gentoo, Void)
           STAGE="dist/DeskBolt-${TAG}-linux-x86_64"
@@ -270,7 +271,7 @@ jobs:
           sdkmanager "ndk;27.2.12479018" "platforms;android-35" "build-tools;35.0.0"
           export ANDROID_NDK_HOME="${ANDROID_HOME}/ndk/27.2.12479018"
           rustup target add aarch64-linux-android x86_64-linux-android
-          cargo install --locked cargo-ndk
+          cargo install cargo-ndk
           cargo ndk -t arm64-v8a -t x86_64 -p 26 -o android/app/src/main/jniLibs \
             build --release -p deskbolt-viewer -p deskbolt-server --locked
           cd android
