@@ -32,6 +32,7 @@ png = "0.18"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 cpal = { workspace = true, features = ["pipewire"] }
+libloading = "0.8"
 arboard = { workspace = true, features = ["wayland-data-control"] }
 
 [features]

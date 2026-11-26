@@ -225,7 +225,10 @@ pub fn platform_video_decoders() -> VideoCapabilities {
     #[cfg(target_os = "macos")]
     return crate::vt_video::decoders();
 
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    return crate::va_video::decoders();
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     VideoCapabilities::default()
 }
 
@@ -244,6 +247,11 @@ pub fn platform_video_encoder(
         return crate::vt_video::Encoder::open(codec, input)
             .ok()
             .map(|encoder| Box::new(encoder) as _);
+    }
+    #[cfg(target_os = "linux")]
+    if VideoCodec::HARDWARE.contains(&codec) {
+        return crate::va_video::Encoder::open(codec, input)
+            .ok().map(|encoder| Box::new(encoder) as _);
     }
     let _ = (codec, input);
     None
@@ -265,6 +273,11 @@ pub fn platform_video_decoder(
         return crate::vt_video::Decoder::open(codec, width, height)
             .ok()
             .map(|decoder| Box::new(decoder) as _);
+    }
+    #[cfg(target_os = "linux")]
+    if VideoCodec::HARDWARE.contains(&codec) {
+        return crate::va_video::Decoder::open(codec, width, height)
+            .ok().map(|decoder| Box::new(decoder) as _);
     }
     let _ = (codec, width, height);
     None

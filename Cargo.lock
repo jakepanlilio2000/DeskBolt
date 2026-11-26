@@ -1541,6 +1541,7 @@ dependencies = [
  "bincode",
  "cpal",
  "ignore",
+ "libloading",
  "nnnoiseless",
  "openh264",
  "opus",
