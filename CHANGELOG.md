@@ -2,6 +2,20 @@
 
 Each release lists the project commits included since the previous release.
 
+## 0.1.1-beta1
+
+- feat(cursor): capture native Linux and macOS pointer shapes (`9732da4`)
+- fix(files): locate native drops within the remote canvas (`eebbebd`)
+- fix(cursor): preserve monochrome pointer inversion (`b6118d4`)
+- fix(clipboard): decode PNG channels in fixed pixel groups (`477ef48`)
+- docs(session): explain cursor, clipboard, and canvas controls (`489e008`)
+- feat(cursor): stream Windows cursor deltas and render an overlay (`c6abb65`)
+- feat(input): type clipboard text through remote key events (`9fb5383`)
+- feat(files): upload files dropped on the remote canvas (`a73ce60`)
+- fix(protocol): keep partial frames across session events (`5bca937`)
+- feat(clipboard): sync native formats with configurable limits (`0dacd11`)
+- feat(proto): frame and encode rich clipboard formats (`50552d5`)
+
 ## 0.1.0-beta1
 
 - docs(readme): simplify platform setup and source builds (`9a8d7c5`)
