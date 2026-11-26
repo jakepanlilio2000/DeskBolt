@@ -12,7 +12,7 @@ Self-hosted remote desktop, file transfer, and system administration for Windows
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](Cargo.toml)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux%20%7C%20macOS%20%7C%20Android-lightgrey.svg)](#quick-start)
 
-[Download DeskBolt](https://github.com/jakepanlilio2000/DeskBolt/releases) · [Changelog](CHANGELOG.md)
+[Download DeskBolt](https://github.com/jakepanlilio2000/DeskBolt/releases) · [Wiki](https://github.com/jakepanlilio2000/DeskBolt/wiki) · [Changelog](CHANGELOG.md)
 
 </div>
 
