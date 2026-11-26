@@ -71,6 +71,8 @@ sudo deskbolt-server --install
 
 On Wayland, approve the screen-sharing prompt when DeskBolt requests access. For remote input, the host needs access to `/dev/uinput`.
 
+To run the host in your signed-in desktop session, set its password and start it as your user with `deskbolt-server --set-password` and `deskbolt-server --console`. This uses per-user settings and enables desktop alerts, connection approval, and a panel menu on desktops with a compatible system tray. If a host service is already running, stop it or choose another port. Screen blanking needs a desktop that supports it. The blanking overlay can also appear in the remote view.
+
 ### macOS
 
 Open the universal disk image and drag **DeskBolt Viewer** into Applications. If you want to host connections, copy `bin/deskbolt-server` from the image to `/usr/local/bin/`.
@@ -82,9 +84,13 @@ sudo /usr/local/bin/deskbolt-server --install
 
 In **System Settings → Privacy & Security**, grant the host **Screen Recording** for viewing and **Accessibility** for remote control.
 
+For the menu bar host, run `/usr/local/bin/deskbolt-server --set-password` and `/usr/local/bin/deskbolt-server --console` from your signed-in account. This uses per-user settings and allows local connection approval and desktop alerts. If a host service is already running, stop it or choose another port. To start the host at login, enable **Start host automatically with operating system** in Host Settings. macOS can require additional permission for power actions.
+
 ### Android
 
 Install the APK on a device with Android 8.0 or later, then open the viewer and add a host. Tap or drag with one finger to operate the pointer. Use a two-finger tap to right-click and a two-finger drag to scroll. The session toolbar has a virtual keyboard for full-control connections.
+
+To share an Android device, open **DeskBolt Host**, enter a host password, and select **Start Sharing**. Confirm screen capture in the system dialog. For remote control, enable DeskBolt in **Accessibility Settings**. A full-control viewer can drag, long-press, scroll, type into supported fields, and use the **Device** menu for navigation and system actions. Device locking requires Android 9 or later and the host's power permission. Text and HTML clipboard sharing follows the system's clipboard access rules. On recent Android versions, reading local clipboard changes generally requires DeskBolt to have focus. Stop sharing from the host screen or its notification.
 
 ## Developer Reference
 
@@ -104,7 +110,7 @@ TLS 1.3 carries multiplexed frames with a six-byte header. A big-endian 32-bit p
 | --- | --- |
 | `0x01` | Authentication, session and monitor controls, keepalives, Windows secure attention |
 | `0x02` | Screen tiles, video, and cursor updates |
-| `0x03` | Keyboard and pointer input |
+| `0x03` | Keyboard, pointer input, and Android device actions |
 | `0x04` | Text, PNG, HTML, and file-list clipboard updates |
 | `0x05` | File operations, directory synchronization, and log tailing |
 | `0x06` | Host terminal and serial streams |
@@ -119,10 +125,11 @@ Use the stable Rust toolchain and install NASM. On Linux, install the native dev
 
 ```bash
 cargo test --workspace --all-features --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo build --release --workspace --no-default-features --locked
 ```
 
-For Android, use Java 17, Android SDK and build tools 35, NDK r27.2.12479018, and Gradle 8.11.1. Install `cargo-ndk` 4.1.2 and the `aarch64-linux-android` and `x86_64-linux-android` Rust targets. The Gradle task creates an APK in `android/app/build/outputs/apk/release/` using the local debug key.
+For Android, use Java 17, Android SDK and build tools 35, NDK r27.2.12479018, and Gradle 8.11.1. Install `cargo-ndk` 4.1.2 and the `aarch64-linux-android` and `x86_64-linux-android` Rust targets. Provide `ANDROID_KEYSTORE_FILE`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and `ANDROID_KEY_PASSWORD` in the build environment to create a signed APK in `android/app/build/outputs/apk/release/`.
 
 ```bash
 cargo ndk --target arm64-v8a --target x86_64 --platform 26 \
