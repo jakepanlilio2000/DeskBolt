@@ -37,6 +37,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Test release versioning and changelog generation
+        run: python -m unittest scripts/test_bump_version.py scripts/test_update_changelog.py
       - name: Install assembler
         shell: pwsh
         run: |
@@ -48,10 +53,10 @@ jobs:
   version-bump:
     needs: [verify]
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' &&
-       !startsWith(github.ref, 'refs/tags/') &&
-       !contains(github.event.head_commit.message, '[skip ci]'))
+      !startsWith(github.ref, 'refs/tags/') &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'push' &&
+        !contains(github.event.head_commit.message, '[skip ci]')))
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.bump.outputs.version }}
@@ -67,31 +72,33 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Run version bumper unit tests
-        run: python3 -m unittest scripts/test_bump_version.py
-
-      - name: Compute and apply next workspace version
+      - name: Update workspace version and changelog
         id: bump
+        env:
+          RELEASE_TYPE: ${{ inputs.release_type || 'auto' }}
         run: |
-          NEXT_VER=$(python3 scripts/bump_version.py --bump "${{ inputs.release_type || 'auto' }}")
+          PREVIOUS_VER=$(python3 -c 'import tomllib; print(tomllib.loads(open("Cargo.toml").read())["workspace"]["package"]["version"])')
+          NEXT_VER=$(python3 scripts/bump_version.py --bump "${RELEASE_TYPE}")
+          if [[ "${NEXT_VER}" == "${PREVIOUS_VER}" ]]; then
+            echo "The workspace is already at ${NEXT_VER}."
+            exit 0
+          fi
+          python3 scripts/update_changelog.py --version "${NEXT_VER}" --previous-version "${PREVIOUS_VER}"
           cargo metadata --format-version 1 > /dev/null
           echo "version=${NEXT_VER}" >> "$GITHUB_OUTPUT"
           echo "tag=v${NEXT_VER}" >> "$GITHUB_OUTPUT"
 
-      - name: Commit, tag, and push release version
+      - name: Commit, tag, and push the release
+        if: steps.bump.outputs.tag != ''
+        env:
+          TAG: ${{ steps.bump.outputs.tag }}
         run: |
-          VER="${{ steps.bump.outputs.version }}"
-          TAG="${{ steps.bump.outputs.tag }}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          BRANCH="${GITHUB_REF_NAME:-master}"
-          git add Cargo.toml Cargo.lock
-          if ! git diff --cached --quiet; then
-            git commit -m "chore(release): bump version to ${TAG} [skip ci]"
-            git push origin "HEAD:${BRANCH}"
-          fi
+          git add Cargo.toml Cargo.lock CHANGELOG.md
+          git commit -m "chore(release): bump version to ${TAG} [skip ci]"
           git tag -a "${TAG}" -m "DeskBolt ${TAG}"
-          git push origin "${TAG}"
+          git push --atomic origin "HEAD:refs/heads/${GITHUB_REF_NAME}" "refs/tags/${TAG}"
 
   build-matrix:
     needs: [verify, version-bump]
