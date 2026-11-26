@@ -20,7 +20,7 @@ Self-hosted remote desktop, file transfer, and system administration for Windows
 
 - **Remote desktop.** Control a remote computer, view its screen, or open a file-only session. Switch monitors and synchronize the clipboard over a direct, encrypted connection.
 - **Terminal access.** Open an interactive host shell, connect to SSH and serial devices, reuse command snippets, and run a command on multiple saved hosts.
-- **Files and logs.** Browse and transfer files, synchronize directories, edit remote text files, and follow live logs. Transfers use SHA-256 verification.
+- **Files and logs.** Browse and transfer files, resume interrupted copies, compare directories with exclusion rules, edit remote text files, and follow live logs. Transfers use SHA-256 verification.
 - **Network and system administration.** Forward TCP ports, troubleshoot connectivity, and inspect remote systems, processes, and services.
 - **Session communications.** Exchange text messages, send desktop alerts, and talk over voice chat.
 - **Power and hardware control.** Restart or shut down an authorized host, send Wake-on-LAN, or use the BIOS console and network boot on compatible hardware.
@@ -36,6 +36,8 @@ The first connection shows the host certificate's SHA-256 fingerprint. Confirm i
 - **Cursor Sync** displays the host cursor over the remote desktop. Supported capture backends send its shape and position separately from the screen image.
 - **Clipboard → Send Local Clipboard** sends text, PNG images, HTML, or a list of file paths. **Auto-sync clipboard** receives clipboard changes from the active full-control session. Set the size limit under **Options → Display & Input** or with `clipboard_max_bytes` in the host's `config.toml`.
 - Drop local files on the remote desktop to upload them to the directory selected in **Files**, or to the host user's Desktop when no directory is selected. Transfer progress appears on the canvas.
+- To resume an interrupted copy, reconnect and queue the same source and destination. DeskBolt verifies the retained bytes before resuming. Upload checkpoints are eligible for resume for 24 hours by default.
+- In **Compare & Sync**, enter one exclusion rule per line and select **Scan folders**. Both folders use the same rules, such as `target/` to skip build directories and `*.tmp` to skip temporary files.
 - **Type Clipboard** sends clipboard text as keystrokes in full-control sessions. The default shortcut is **Ctrl+Shift+V** and the default delay is **10 ms** per character. The shortcut and delay are configurable in **Options**. For firmware consoles and nested desktops, match the target keyboard layout to US scan codes. Unicode entry depends on the target application and input backend.
 
 ### Windows
