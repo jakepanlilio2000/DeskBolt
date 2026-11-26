@@ -275,6 +275,24 @@ pub enum TransferDir {
     Download,
 }
 
+pub const DESKTOP_UPLOAD_PREFIX: &str = "desktop:";
+
+pub fn valid_drop_filename(name: &str) -> bool {
+    if name.is_empty()
+        || name.ends_with([' ', '.'])
+        || name.chars().any(|c| c.is_control() || matches!(c, '/' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*'))
+    {
+        return false;
+    }
+    let stem = name.split('.').next().unwrap_or_default().trim_end().to_ascii_uppercase();
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$") {
+        return false;
+    }
+    !["COM", "LPT"].iter().any(|prefix| {
+        stem.strip_prefix(prefix).is_some_and(|n| matches!(n, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"))
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DriveEntry {
     pub letter: String,
@@ -702,6 +720,15 @@ mod tests {
             data: ClipboardMsg::PngImage(vec![0; MAX_CLIPBOARD_BYTES + 1]),
         };
         assert!(!oversized.within_limit(usize::MAX));
+    }
+
+    #[test]
+    fn desktop_drop_names_do_not_target_paths_or_devices() {
+        assert!(valid_drop_filename("Résumé 2026.png"));
+        assert!(valid_drop_filename("report.final.txt"));
+        for bad in ["", "..", "../test", r"folder\test", "a.txt:stream", "nul.txt", "COM1", "LPT².txt", "file."] {
+            assert!(!valid_drop_filename(bad), "{bad}");
+        }
     }
 
     #[cfg(not(all(feature = "dev-mcp", not(target_os = "android"))))]

@@ -1025,7 +1025,18 @@ async fn dispatch_client_frame(
         }
         ChannelId::FileTransfer => {
             if *mode == SessionMode::ViewOnly || !policy.permissions.file_transfer {
-                send_control_error(out_tx, "File transfer is disabled by current session policy.");
+                let message = "File transfer is disabled by current session policy.";
+                if let Ok(FileTransferMsg::TransferStart { transfer_id, .. }) = unpack_message(&frame) {
+                    let reply = FileTransferMsg::TransferStartAck {
+                        transfer_id, accepted: false, exists: false, existing_size: 0,
+                        existing_modified_unix: 0, error: Some(message.into()),
+                    };
+                    if let Ok(f) = pack_message(ChannelId::FileTransfer, FLAG_NONE, &reply, None) {
+                        let _ = out_tx.send(f).await;
+                    }
+                } else {
+                    send_control_error(out_tx, message);
+                }
                 return Ok(());
             }
             let ft: FileTransferMsg = unpack_message(&frame).map_err(|e| e.to_string())?;

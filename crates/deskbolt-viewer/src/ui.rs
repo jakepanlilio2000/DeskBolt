@@ -26,7 +26,7 @@ use crate::net_tools::send_wol_packet;
 use crate::oob::OobAction;
 use crate::session::{
     ConnectTarget, ConnectionPhase, LogTailBuffer, OverwritePrompt, SessionCommand,
-    TransferItemStatus, ViewerSession,
+    TransferItem, TransferItemStatus, ViewerSession,
 };
 use crate::sftp_sync::is_quick_edit_ext;
 use crate::shortcuts::create_desktop_shortcut;
@@ -67,6 +67,7 @@ pub struct DeskBoltViewerApp {
     pub(crate) active_tab_id: Option<u64>,
     session_scales: std::collections::HashMap<u64, ScaleMode>,
     textures: std::collections::HashMap<u64, (u64, TextureOptions, TextureHandle)>,
+    canvas_uploads: std::collections::HashMap<u64, CanvasUploads>,
     password_inputs: std::collections::HashMap<u64, String>,
     local_mkdir_input: String,
     remote_mkdir_input: String,
@@ -88,6 +89,96 @@ struct FolderModal {
     parent_id: Option<i64>,
     name: String,
     error: Option<String>,
+}
+
+#[derive(Default)]
+struct CanvasUploads {
+    first_id: u64,
+    targets: Vec<(std::path::PathBuf, String)>,
+    finished_at: Option<f64>,
+}
+
+impl CanvasUploads {
+    fn enqueue(&mut self, session: &mut ViewerSession, files: Vec<egui::DroppedFileHandle>) {
+        if self.targets.is_empty() || self.finished_at.take().is_some() {
+            self.targets.clear();
+            self.first_id = session.file_transfer.queue.last().map_or(1, |entry| entry.id + 1);
+        }
+        let remote_dir = &session.file_transfer.remote_path;
+        let use_directory = !remote_dir.is_empty() && session.file_transfer.remote_error.is_none();
+        for file in files {
+            let local = file.path().to_path_buf();
+            let Some(name) = local.file_name().and_then(|name| name.to_str()) else { continue };
+            if !deskbolt_proto::valid_drop_filename(name) {
+                session.status_banner = "A dropped file has an unsupported name.".into();
+                continue;
+            }
+            let remote = if use_directory {
+                join_remote_path(remote_dir, name)
+            } else {
+                format!("{}{name}", deskbolt_proto::DESKTOP_UPLOAD_PREFIX)
+            };
+            if self.targets.contains(&(local.clone(), remote.clone())) {
+                continue;
+            }
+            if session.cmd_tx.try_send(SessionCommand::QueueUpload {
+                local_path: local.clone(),
+                remote_path: remote.clone(),
+            }).is_ok() {
+                self.targets.push((local, remote));
+            } else {
+                session.status_banner = "The connection is too busy to queue every dropped file.".into();
+            }
+        }
+    }
+
+    fn paint(&mut self, ui: &egui::Ui, canvas: Rect, queue: &[TransferItem]) -> bool {
+        if self.targets.is_empty() {
+            return false;
+        }
+        let mut complete = 0;
+        let mut failed = 0;
+        let mut done = 0u64;
+        let mut total = 0u64;
+        for item in queue.iter().filter(|item| item.id >= self.first_id && item.direction == TransferDir::Upload) {
+            if !self.targets.iter().any(|(local, remote)| local == &item.local_path && remote == &item.remote_path) {
+                continue;
+            }
+            done = done.saturating_add(item.bytes_done);
+            total = total.saturating_add(item.total_bytes);
+            match item.status {
+                TransferItemStatus::Verified => complete += 1,
+                TransferItemStatus::Failed(_) | TransferItemStatus::Skipped => failed += 1,
+                _ => {}
+            }
+        }
+        let now = ui.input(|input| input.time);
+        let count = self.targets.len();
+        let text = if complete + failed >= count {
+            let first = *self.finished_at.get_or_insert(now);
+            let remaining = 4.0 - (now - first);
+            if remaining <= 0.0 {
+                return false;
+            }
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(remaining));
+            if failed == 0 {
+                format!("Uploaded {complete} of {count} files")
+            } else {
+                format!("Uploaded {complete} of {count} files. Open Files for details.")
+            }
+        } else {
+            format!("Uploading files · {complete}/{count} · {} / {}", format_bytes(done), format_bytes(total))
+        };
+        if canvas.is_positive() {
+            let painter = ui.painter_at(canvas);
+            let label = painter.layout_no_wrap(text, egui::FontId::proportional(13.0), Color32::WHITE);
+            let pos = Pos2::new(canvas.left() + 12.0, canvas.bottom() - label.size().y - 12.0);
+            let bounds = Rect::from_min_size(pos, label.size()).expand(6.0);
+            painter.rect_filled(bounds, 4.0, Color32::from_black_alpha(220));
+            painter.galley(pos, label, Color32::WHITE);
+        }
+        true
+    }
 }
 
 struct RenameItemModal {
@@ -143,6 +234,7 @@ impl DeskBoltViewerApp {
             active_tab_id: None,
             session_scales: std::collections::HashMap::new(),
             textures: std::collections::HashMap::new(),
+            canvas_uploads: std::collections::HashMap::new(),
             password_inputs: std::collections::HashMap::new(),
             local_mkdir_input: String::new(),
             remote_mkdir_input: String::new(),
@@ -1192,6 +1284,7 @@ impl DeskBoltViewerApp {
                 self.sessions.retain(|s| !closed_ids.contains(&s.id));
                 for id in &closed_ids {
                     self.textures.remove(id);
+                    self.canvas_uploads.remove(id);
                     self.password_inputs.remove(id);
                 }
                 if self.active_tab_id.is_some_and(|a| closed_ids.contains(&a)) {
@@ -1479,6 +1572,25 @@ impl DeskBoltViewerApp {
                                 );
 
                                 if s.mode == SessionMode::FullControl {
+                                    let canvas = display_rect.intersect(ui.clip_rect());
+                                    let files = ui.input_mut(|input| {
+                                        if input.pointer.hover_pos().is_some_and(|pos| canvas.contains(pos)) {
+                                            std::mem::take(&mut input.raw.dropped_files)
+                                        } else {
+                                            Vec::new()
+                                        }
+                                    });
+                                    if !files.is_empty() {
+                                        self.canvas_uploads.entry(s.id).or_default().enqueue(s, files);
+                                    }
+                                    if let Some(uploads) = self.canvas_uploads.get_mut(&s.id)
+                                        && !uploads.paint(ui, canvas, &s.file_transfer.queue)
+                                    {
+                                        self.canvas_uploads.remove(&s.id);
+                                    }
+                                }
+
+                                if s.mode == SessionMode::FullControl {
                                     let focused = ui.input(|i| i.viewport().focused.unwrap_or(false));
                                     let is_fs = ui.input(|i| i.viewport().fullscreen.unwrap_or(false));
                                     let policy_allows = match sys_mode {
@@ -1605,6 +1717,11 @@ impl DeskBoltViewerApp {
                                 render_panel(ui);
                             }
                             drop(render_panel);
+                            if !s.file_transfer.open
+                                && let Some(prompt) = s.file_transfer.pending_overwrite.clone()
+                            {
+                                render_overwrite_modal(ui.ctx(), s, &prompt);
+                            }
                             if let Some(fit) = pinch_fit_update {
                                 self.session_scales.insert(
                                     s.id,

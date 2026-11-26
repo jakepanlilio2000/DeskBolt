@@ -25,12 +25,12 @@ pub use frame::{
     write_frame_async, write_frame_sync,
 };
 pub use messages::{
-    ClipboardMsg, ClipboardSync, CommsMsg, ControlMsg, DEFAULT_CLIPBOARD_MAX_BYTES, DesktopState,
+    ClipboardMsg, ClipboardSync, CommsMsg, ControlMsg, DEFAULT_CLIPBOARD_MAX_BYTES, DESKTOP_UPLOAD_PREFIX, DesktopState,
     DirtyTile, DiskStat, DriveEntry, FileEntry, FileTransferMsg, InputMsg, IpcMsg, KeyEvent,
     MAX_CLIPBOARD_BYTES, MonitorInfo, MouseBtn, MoveRect, PointerEvent,
     PowerAction, PowerMsg, ProcessStat, SerialParity, ServiceOp, ServiceStat, ServiceStateKind,
     SessionMode, SpecialAction, SyncEntry, SysAdminMsg, SystemSnapshot, TerminalMsg, TransferDir,
-    TunnelMsg, VideoMsg, VideoQualityMode,
+    TunnelMsg, VideoMsg, VideoQualityMode, valid_drop_filename,
 };
 pub use tls::{
     ClientTlsStream, DEFAULT_PORT, GeneratedIdentity, PROTO_VERSION, ServerTlsStream,

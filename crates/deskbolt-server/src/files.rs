@@ -3,7 +3,7 @@ use std::io::SeekFrom;
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use deskbolt_proto::{DriveEntry, FileEntry, FileTransferMsg, SyncEntry, TransferDir};
+use deskbolt_proto::{DESKTOP_UPLOAD_PREFIX, DriveEntry, FileEntry, FileTransferMsg, SyncEntry, TransferDir, valid_drop_filename};
 use ring::digest::{Context, SHA256};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -222,7 +222,7 @@ impl FileSessionHandler {
         total_bytes: u64,
         overwrite: bool,
     ) -> Vec<FileTransferMsg> {
-        let validated = match validate_remote_path(remote_path) {
+        let validated = match transfer_path(direction, remote_path) {
             Ok(p) => p,
             Err(e) => {
                 return vec![FileTransferMsg::TransferStartAck {
@@ -481,6 +481,19 @@ impl FileSessionHandler {
         }
         self.downloads.remove(&transfer_id);
     }
+}
+
+fn transfer_path(direction: TransferDir, raw: &str) -> Result<PathBuf, String> {
+    if direction == TransferDir::Upload
+        && let Some(name) = raw.strip_prefix(DESKTOP_UPLOAD_PREFIX)
+    {
+        if !valid_drop_filename(name) {
+            return Err("The dropped file name is invalid.".into());
+        }
+        let desktop = crate::platform::desktop_dir()?;
+        return validate_remote_path(&desktop.join(name).to_string_lossy());
+    }
+    validate_remote_path(raw)
 }
 
 fn part_path_for(target: &Path, transfer_id: u64) -> PathBuf {

@@ -7,6 +7,9 @@ use deskbolt_proto::{
 };
 use tokio::sync::watch;
 
+mod desktop_dir;
+pub use desktop_dir::desktop_dir;
+
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
