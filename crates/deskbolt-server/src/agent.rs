@@ -319,7 +319,7 @@ fn capture_loop(
 
         if capturer.is_none() {
             match platform::create_capturer(wanted_mon) {
-                Ok(cap) => {
+                Ok(mut cap) => {
                     let desk = cap.current_desktop_name();
                     if desk != current_desktop {
                         current_desktop = desk;
@@ -327,14 +327,23 @@ fn capture_loop(
                         emit_desktop_status(&ev_tx, &current_desktop);
                     }
                     let mons = cap.monitors();
+                    let selected = mons.iter().find(|monitor| monitor.id == wanted_mon)
+                        .or_else(|| mons.first()).map_or(wanted_mon, |monitor| monitor.id);
                     if !mons.is_empty() {
                         *shared.monitors.lock().unwrap() = mons.clone();
+                        if selected != wanted_mon {
+                            let mut active = shared.active_monitor.lock().unwrap();
+                            if *active == wanted_mon {
+                                *active = selected;
+                            }
+                            cap.set_monitor(selected);
+                        }
                         let _ = ev_tx.blocking_send(IpcMsg::MonitorList {
                             monitors: mons,
-                            active_monitor_id: wanted_mon,
+                            active_monitor_id: selected,
                         });
                     }
-                    current_mon_idx = wanted_mon;
+                    current_mon_idx = selected;
                     need_full = true;
                     capturer = Some(cap);
                 }
@@ -347,9 +356,10 @@ fn capture_loop(
         }
 
         if let Some(cap) = capturer.as_mut() {
-            if wanted_mon != current_mon_idx {
-                cap.set_monitor(wanted_mon);
-                current_mon_idx = wanted_mon;
+            let active = *shared.active_monitor.lock().unwrap();
+            if active != current_mon_idx {
+                cap.set_monitor(active);
+                current_mon_idx = active;
                 need_full = true;
             }
 

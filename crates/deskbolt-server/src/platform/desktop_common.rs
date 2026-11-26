@@ -4,7 +4,7 @@ use std::io::{self, BufRead};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
-use deskbolt_proto::{KeyEvent, MonitorInfo, MouseBtn, PointerEvent};
+use deskbolt_proto::{CursorSnapshot, KeyEvent, MonitorInfo, MouseBtn, PointerEvent};
 use tracing::warn;
 use xcap::Monitor;
 
@@ -47,6 +47,8 @@ pub struct XcapCapturer {
     monitors: Vec<MonitorInfo>,
     prev_bgra: Vec<u8>,
     last_dims: (u32, u32),
+    #[cfg(target_os = "linux")]
+    cursor: Option<super::x11_cursor::X11Cursor>,
 }
 
 impl XcapCapturer {
@@ -60,6 +62,8 @@ impl XcapCapturer {
             monitors,
             prev_bgra: Vec::new(),
             last_dims: (0, 0),
+            #[cfg(target_os = "linux")]
+            cursor: super::x11_cursor::X11Cursor::open(),
         })
     }
 }
@@ -73,6 +77,14 @@ impl ScreenCapturer for XcapCapturer {
         self.monitor_idx = monitor_idx;
         self.prev_bgra.clear();
         self.last_dims = (0, 0);
+    }
+
+    fn capture_cursor(&mut self) -> Option<CursorSnapshot> {
+        let monitor = self.monitors.iter().find(|monitor| monitor.id == self.monitor_idx)?;
+        #[cfg(target_os = "linux")]
+        return self.cursor.as_mut()?.sample(monitor);
+        #[cfg(target_os = "macos")]
+        super::macos_cursor::sample(monitor, self.last_dims)
     }
 
     fn capture_next(&mut self, force_full: bool, _timeout_ms: u32) -> CaptureOutput {
@@ -121,6 +133,17 @@ impl ScreenCapturer for XcapCapturer {
             dirty_rects,
             force_full: full,
         })
+    }
+}
+
+pub(super) fn unpremultiply(pixel: &mut [u8]) {
+    let alpha = u16::from(pixel[3]);
+    if alpha == 0 {
+        pixel[..3].fill(0);
+    } else if alpha != 255 {
+        for channel in &mut pixel[..3] {
+            *channel = ((u16::from(*channel) * 255 + alpha / 2) / alpha).min(255) as u8;
+        }
     }
 }
 

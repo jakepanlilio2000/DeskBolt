@@ -23,10 +23,16 @@ mod desktop_common;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
+mod x11_cursor;
+#[cfg(target_os = "linux")]
+mod wayland_capture;
+#[cfg(target_os = "linux")]
 use linux as imp;
 
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+mod macos_cursor;
 #[cfg(target_os = "macos")]
 use macos as imp;
 

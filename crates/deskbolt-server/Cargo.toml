@@ -45,6 +45,9 @@ dxgi-capture-rs = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 xcap = { workspace = true }
+x11rb = { version = "0.13.2", features = ["xfixes"] }
+ashpd = { version = "0.14.3", default-features = false, features = ["async-io", "screencast"] }
+pipewire = "0.10.1"
 enigo = { workspace = true, features = ["x11rb", "wayland"] }
 libc = { workspace = true }
 
@@ -52,6 +55,10 @@ libc = { workspace = true }
 xcap = { workspace = true }
 enigo = { workspace = true }
 libc = { workspace = true }
+objc2 = "0.6.5"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSCursor", "NSGraphicsContext", "NSImage", "NSImageRep", "objc2-core-graphics"] }
+objc2-core-foundation = "0.3.2"
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["CGBitmapContext", "CGColorSpace", "CGContext", "CGEvent", "CGEventSource", "CGImage"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = { workspace = true }

@@ -1493,6 +1493,7 @@ dependencies = [
 name = "deskbolt-server"
 version = "0.1.0-beta1"
 dependencies = [
+ "ashpd",
  "cpal",
  "deskbolt-proto",
  "dxgi-capture-rs",
@@ -1501,6 +1502,11 @@ dependencies = [
  "enigo",
  "jni",
  "libc",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
+ "pipewire",
  "portable-pty",
  "ring",
  "rmcp",
@@ -1515,6 +1521,7 @@ dependencies = [
  "tracing-subscriber",
  "windows 0.62.2",
  "windows-service",
+ "x11rb",
  "xcap",
 ]
 
