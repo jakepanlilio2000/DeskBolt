@@ -220,11 +220,46 @@ pub enum InputMsg {
     ReleaseAllKeys,
 }
 
+pub const DEFAULT_CLIPBOARD_MAX_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_CLIPBOARD_BYTES: usize = crate::frame::MAX_FRAME_PAYLOAD - 64;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClipboardMsg {
+    Utf8Text(String),
+    PngImage(Vec<u8>),
+    Html(String),
+    FileDropList(Vec<String>),
+}
+
+impl ClipboardMsg {
+    pub fn payload_bytes(&self) -> usize {
+        match self {
+            Self::Utf8Text(text) | Self::Html(text) => text.len(),
+            Self::PngImage(png) => png.len(),
+            Self::FileDropList(paths) => paths.iter().fold(0usize, |bytes, path| {
+                bytes.saturating_add(8).saturating_add(path.len())
+            }),
+        }
+    }
+}
+
 /// Channel `0x04` bidirectional clipboard synchronization.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClipboardSync {
     SetText { seq: u64, utf8_text: String },
     Clear { seq: u64 },
+    SetData { seq: u64, data: ClipboardMsg },
+}
+
+impl ClipboardSync {
+    pub fn within_limit(&self, limit: usize) -> bool {
+        let bytes = match self {
+            Self::SetText { utf8_text, .. } => utf8_text.len(),
+            Self::Clear { .. } => 0,
+            Self::SetData { data, .. } => data.payload_bytes(),
+        };
+        bytes <= limit.min(MAX_CLIPBOARD_BYTES)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -636,7 +671,30 @@ pub enum IpcMsg {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::{decode_bincode, encode_bincode};
+    use crate::frame::{ChannelId, FLAG_NONE, decode_bincode, encode_bincode, pack_message, unpack_message};
+
+    #[test]
+    fn rich_clipboard_framing_and_limits() {
+        for data in [
+            ClipboardMsg::Utf8Text("naïve".into()),
+            ClipboardMsg::PngImage(b"\x89PNG\r\n\x1a\n".to_vec()),
+            ClipboardMsg::Html("<p>Résumé</p>".into()),
+            ClipboardMsg::FileDropList(vec!["/home/user/file.txt".into()]),
+        ] {
+            let size = data.payload_bytes();
+            let message = ClipboardSync::SetData { seq: 1, data };
+            assert!(message.within_limit(size));
+            assert!(!message.within_limit(size - 1));
+            let frame = pack_message(ChannelId::Clipboard, FLAG_NONE, &message, Some(1)).unwrap();
+            assert_eq!(unpack_message::<ClipboardSync>(&frame).unwrap(), message);
+        }
+
+        let oversized = ClipboardSync::SetData {
+            seq: 2,
+            data: ClipboardMsg::PngImage(vec![0; MAX_CLIPBOARD_BYTES + 1]),
+        };
+        assert!(!oversized.within_limit(usize::MAX));
+    }
 
     #[cfg(not(all(feature = "dev-mcp", not(target_os = "android"))))]
     #[test]

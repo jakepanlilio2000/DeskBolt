@@ -386,6 +386,7 @@ pub fn run_clipboard_loop(
                     *writer_last.lock().unwrap() = Some(String::new());
                     clear_local_clipboard();
                 }
+                ClipboardSync::SetData { .. } => {}
             }
         }
     });

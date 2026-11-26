@@ -1473,10 +1473,12 @@ dependencies = [
 name = "deskbolt-proto"
 version = "0.1.0-beta1"
 dependencies = [
+ "arboard",
  "argon2 0.5.3",
  "bincode",
  "cpal",
  "openh264",
+ "png",
  "rcgen",
  "ring",
  "rustls",

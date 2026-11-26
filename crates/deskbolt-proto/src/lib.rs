@@ -3,6 +3,8 @@ pub mod codec;
 pub mod error;
 pub mod frame;
 pub mod messages;
+#[cfg(not(target_os = "android"))]
+pub mod native_clipboard;
 pub mod tls;
 pub mod voice;
 
@@ -23,8 +25,9 @@ pub use frame::{
     write_frame_async, write_frame_sync,
 };
 pub use messages::{
-    ClipboardSync, CommsMsg, ControlMsg, DesktopState, DirtyTile, DiskStat, DriveEntry, FileEntry,
-    FileTransferMsg, InputMsg, IpcMsg, KeyEvent, MonitorInfo, MouseBtn, MoveRect, PointerEvent,
+    ClipboardMsg, ClipboardSync, CommsMsg, ControlMsg, DEFAULT_CLIPBOARD_MAX_BYTES, DesktopState,
+    DirtyTile, DiskStat, DriveEntry, FileEntry, FileTransferMsg, InputMsg, IpcMsg, KeyEvent,
+    MAX_CLIPBOARD_BYTES, MonitorInfo, MouseBtn, MoveRect, PointerEvent,
     PowerAction, PowerMsg, ProcessStat, SerialParity, ServiceOp, ServiceStat, ServiceStateKind,
     SessionMode, SpecialAction, SyncEntry, SysAdminMsg, SystemSnapshot, TerminalMsg, TransferDir,
     TunnelMsg, VideoMsg, VideoQualityMode,
