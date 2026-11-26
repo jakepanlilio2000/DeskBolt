@@ -3,6 +3,13 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+val releaseKeystore = providers.environmentVariable("ANDROID_KEYSTORE_FILE").orNull?.takeIf { it.isNotBlank() }
+val releaseStorePassword = providers.environmentVariable("ANDROID_KEYSTORE_PASSWORD").orNull?.takeIf { it.isNotBlank() }
+val releaseKeyAlias = providers.environmentVariable("ANDROID_KEY_ALIAS").orNull?.takeIf { it.isNotBlank() }
+val releaseKeyPassword = providers.environmentVariable("ANDROID_KEY_PASSWORD").orNull?.takeIf { it.isNotBlank() }
+val canSignRelease = listOf(releaseKeystore, releaseStorePassword, releaseKeyAlias, releaseKeyPassword).all { it != null }
+val unsignedPullRequest = providers.environmentVariable("GITHUB_EVENT_NAME").orNull == "pull_request"
+
 android {
     namespace = "com.stacksync.deskbolt"
     compileSdk = 35
@@ -18,10 +25,17 @@ android {
         }
     }
 
+    val releaseSigning = if (canSignRelease) signingConfigs.create("distribution") {
+        storeFile = file(checkNotNull(releaseKeystore))
+        storePassword = releaseStorePassword
+        keyAlias = releaseKeyAlias
+        keyPassword = releaseKeyPassword
+    } else null
+
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = releaseSigning
         }
     }
 
@@ -38,6 +52,15 @@ android {
         jniLibs {
             // Keep uncompressed 16 KB aligned .so files for Android 15/16 page-size compatibility
             useLegacyPackaging = false
+        }
+    }
+}
+
+tasks.matching { it.name == "packageRelease" }.configureEach {
+    inputs.property("unsignedPullRequest", unsignedPullRequest)
+    doFirst {
+        check(canSignRelease || unsignedPullRequest) {
+            "Release APKs require ANDROID_KEYSTORE_FILE, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, and ANDROID_KEY_PASSWORD."
         }
     }
 }

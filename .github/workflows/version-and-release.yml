@@ -7,8 +7,14 @@ on:
       - master
     tags:
       - "v*"
+  pull_request:
+    branches: [main, master]
   workflow_dispatch:
     inputs:
+      verify_only:
+        description: "Run checks without creating or publishing a release"
+        type: boolean
+        default: false
       release_type:
         description: "Version bump rule (leave auto to derive from commit message)"
         required: true
@@ -24,12 +30,24 @@ on:
 permissions:
   contents: write
 
+env:
+  LINUX_BUILD_PACKAGES: >-
+    libxcb1-dev libxcb-randr0-dev libxcb-render0-dev libxcb-shm0-dev
+    libx11-dev libxrandr-dev libdbus-1-dev libpipewire-0.3-dev
+    libwayland-dev libegl-dev libdrm-dev libgbm-dev libfontconfig1-dev
+    libxkbcommon-dev libxkbcommon-x11-dev libxcb-shape0-dev libxcb-xfixes0-dev
+    libasound2-dev libclang-dev clang nasm pkg-config
+
 jobs:
   verify:
     if: >-
       github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v') ||
       !contains(github.event.head_commit.message, '[skip ci]')
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: read
     env:
@@ -37,21 +55,75 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: actions/setup-python@v5
+        if: runner.os == 'Windows'
         with:
           python-version: "3.12"
       - name: Test release versioning and changelog generation
+        if: runner.os == 'Windows'
         run: python -m unittest scripts/test_bump_version.py scripts/test_update_changelog.py
       - name: Install assembler
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           choco install -y nasm
           "C:\Program Files\NASM" >> $env:GITHUB_PATH
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          read -r -a packages <<< "$LINUX_BUILD_PACKAGES"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "${packages[@]}"
       - name: Test the workspace with all features
         run: cargo test --workspace --all-features --locked
+      - name: Lint all workspace targets
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test icon generation
+        if: runner.os == 'Linux'
+        run: cargo test --manifest-path tools/render-icon/Cargo.toml --locked
+
+  android-signing:
+    if: github.event_name != 'pull_request' && !inputs.verify_only
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Require Android release signing secrets
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::$name is required to publish the Android release."
+              exit 1
+            fi
+          done
+
+  android-pr:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+      - name: Assemble an unsigned Android check APK
+        run: |
+          gradle -p android --no-daemon assembleRelease
+          test -s android/app/build/outputs/apk/release/app-release-unsigned.apk
 
   version-bump:
-    needs: [verify]
+    needs: [verify, android-signing]
     if: >-
       !startsWith(github.ref, 'refs/tags/') &&
       (github.event_name == 'workflow_dispatch' ||
@@ -101,10 +173,11 @@ jobs:
           git push --atomic origin "HEAD:refs/heads/${GITHUB_REF_NAME}" "refs/tags/${TAG}"
 
   build-matrix:
-    needs: [verify, version-bump]
+    needs: [verify, android-signing, version-bump]
     if: >-
       !cancelled() &&
       needs.verify.result == 'success' &&
+      needs.android-signing.result == 'success' &&
       (startsWith(github.ref, 'refs/tags/v') ||
        (needs.version-bump.result == 'success' && needs.version-bump.outputs.version != ''))
     strategy:
@@ -166,13 +239,9 @@ jobs:
       - name: Build Linux packages (.deb, .rpm, Arch .pkg.tar.zst, .tar.gz, AppImage)
         if: matrix.platform == 'linux'
         run: |
+          read -r -a packages <<< "$LINUX_BUILD_PACKAGES"
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libxcb1-dev libxcb-randr0-dev libxcb-render0-dev libxcb-shm0-dev \
-            libx11-dev libxrandr-dev libdbus-1-dev libpipewire-0.3-dev \
-            libwayland-dev libegl-dev libdrm-dev libgbm-dev libfontconfig1-dev \
-            libxkbcommon-dev libxkbcommon-x11-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libasound2-dev libclang-dev clang nasm pkg-config \
+          sudo apt-get install -y --no-install-recommends "${packages[@]}" \
             rpm zstd file desktop-file-utils squashfs-tools
           rustup update stable
           cargo install cargo-deb cargo-generate-rpm
@@ -300,7 +369,7 @@ jobs:
         with:
           gradle-version: "8.11.1"
 
-      - name: Build Android APK (16 KB page-aligned)
+      - name: Build Android native libraries (16 KB page-aligned)
         if: matrix.platform == 'android'
         run: |
           sudo apt-get update
@@ -328,8 +397,21 @@ jobs:
           cargo install cargo-ndk --version 4.1.2 --locked
           cargo ndk --target arm64-v8a --target x86_64 --platform 26 --output-dir android/app/src/main/jniLibs \
             build --release --package deskbolt-viewer --package deskbolt-server --no-default-features --locked
+      - name: Sign and verify the Android release APK
+        if: matrix.platform == 'android'
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          umask 077
+          export ANDROID_KEYSTORE_FILE="$(mktemp "$RUNNER_TEMP/deskbolt-signing.XXXXXX.jks")"
+          trap 'rm -f -- "$ANDROID_KEYSTORE_FILE"' EXIT
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$ANDROID_KEYSTORE_FILE"
           cd android
-          gradle assembleRelease -PdeskboltVersionName="${{ steps.rel.outputs.version }}"
+          gradle --no-daemon assembleRelease -PdeskboltVersionName="${{ steps.rel.outputs.version }}"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify app/build/outputs/apk/release/app-release.apk
           cp app/build/outputs/apk/release/app-release.apk "../DeskBolt-${{ steps.rel.outputs.tag }}-android.apk"
 
       - uses: actions/upload-artifact@v4
