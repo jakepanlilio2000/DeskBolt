@@ -288,7 +288,12 @@ impl DeskBoltViewerApp {
         let ctx_clone = ctx.clone();
         let repaint = Arc::new(move || ctx_clone.request_repaint());
         let host_id = target.host_id;
-        let sess = ViewerSession::start(id, target, &self.runtime, repaint);
+        let mut sess = ViewerSession::start(id, target, &self.runtime, repaint);
+        sess.system_audio_controls.volume.store(self.settings.system_audio_volume, std::sync::atomic::Ordering::Relaxed);
+        sess.system_audio_controls.muted.store(self.settings.system_audio_muted, std::sync::atomic::Ordering::Relaxed);
+        if self.settings.system_audio_default && sess.mode != SessionMode::FileTransfer {
+            sess.system_audio_on_connect = Some(self.settings.speaker_device.clone());
+        }
         sess.voice_controls.noise_gate_milli.store(
             (self.settings.noise_gate * 1000.0).round() as u32,
             std::sync::atomic::Ordering::Relaxed,
@@ -1367,6 +1372,23 @@ impl DeskBoltViewerApp {
                     if ui.button(if s.voice_active { "Voice (Active)" } else { "Voice" }).clicked() {
                         s.voice_open = !s.voice_open;
                     }
+                    ui.add_enabled_ui(!s.system_audio_pending && matches!(s.phase, ConnectionPhase::Connected), |ui| {
+                        use std::sync::atomic::Ordering::Relaxed;
+
+                        if ui.selectable_label(s.system_audio_active, "System Audio").clicked() {
+                            s.request_system_audio(self.settings.speaker_device.clone());
+                        }
+                        if s.system_audio_active {
+                            let mut volume = s.system_audio_controls.volume.load(Relaxed);
+                            let mut muted = s.system_audio_controls.muted.load(Relaxed);
+                            if ui.add(egui::Slider::new(&mut volume, 0..=100).suffix("%")).on_hover_text("System audio volume").changed() {
+                                s.system_audio_controls.volume.store(volume, Relaxed);
+                            }
+                            if ui.checkbox(&mut muted, "Mute").on_hover_text("Mute system audio").changed() {
+                                s.system_audio_controls.muted.store(muted, Relaxed);
+                            }
+                        }
+                    });
                     if ui.button("Message").clicked() {
                         s.popup_open = true;
                     }

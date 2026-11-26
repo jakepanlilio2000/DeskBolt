@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.stacksync.deskbolt.server</string>
+    <key>CFBundleName</key>
+    <string>DeskBolt Host</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>DeskBolt forwards desktop sound when system audio is enabled for a remote session.</string>
+</dict>
+</plist>

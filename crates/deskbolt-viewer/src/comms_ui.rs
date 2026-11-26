@@ -834,6 +834,15 @@ impl DeskBoltViewerApp {
                                 ui.label("Voice bitrate");
                                 ui.add(egui::Slider::new(&mut opt.draft.voice_bitrate_kbps, 24..=48).suffix(" kbps"));
                                 ui.end_row();
+                                ui.label("System Audio");
+                                ui.checkbox(&mut opt.draft.system_audio_default, "Play when a desktop session connects");
+                                ui.end_row();
+                                ui.label("System audio volume");
+                                ui.horizontal(|ui| {
+                                    ui.add(egui::Slider::new(&mut opt.draft.system_audio_volume, 0..=100).suffix("%"));
+                                    ui.checkbox(&mut opt.draft.system_audio_muted, "Mute");
+                                });
+                                ui.end_row();
                                 ui.label("Noise Gate Threshold:");
                                 ui.add(egui::Slider::new(&mut opt.draft.noise_gate, 0.0..=0.2));
                                 ui.end_row();
@@ -900,6 +909,10 @@ impl DeskBoltViewerApp {
                         if ui.button("Save").clicked() {
                             match self.db.save_settings(&opt.draft) {
                                 Ok(()) => {
+                                    for session in &self.sessions {
+                                        session.system_audio_controls.volume.store(opt.draft.system_audio_volume, Ordering::Relaxed);
+                                        session.system_audio_controls.muted.store(opt.draft.system_audio_muted, Ordering::Relaxed);
+                                    }
                                     self.settings = opt.draft.clone();
                                     self.apply_theme(ctx);
                                     self.status_line = "Viewer options saved.".into();

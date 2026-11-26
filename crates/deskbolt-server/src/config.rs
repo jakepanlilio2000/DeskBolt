@@ -64,6 +64,7 @@ pub struct FeaturePermissions {
     pub power_control: bool,
     pub text_chat: bool,
     pub voice_chat: bool,
+    pub system_audio: bool,
     pub send_message: bool,
     pub tunnels: bool,
 }
@@ -78,6 +79,7 @@ impl Default for FeaturePermissions {
             power_control: true,
             text_chat: true,
             voice_chat: true,
+            system_audio: false,
             send_message: true,
             tunnels: true,
         }
@@ -226,6 +228,7 @@ impl ServerConfig {
                 "allow_terminal" => cfg.permissions.terminal = parse_bool(v, ln)?,
                 "allow_power_control" => cfg.permissions.power_control = parse_bool(v, ln)?,
                 "allow_text_chat" => cfg.permissions.text_chat = parse_bool(v, ln)?,
+                "allow_system_audio" => cfg.permissions.system_audio = parse_bool(v, ln)?,
                 "allow_voice_chat" => cfg.permissions.voice_chat = parse_bool(v, ln)?,
                 "allow_send_message" => cfg.permissions.send_message = parse_bool(v, ln)?,
                 "allow_tunnels" => cfg.permissions.tunnels = parse_bool(v, ln)?,
@@ -288,6 +291,7 @@ impl ServerConfig {
              allow_power_control = {}\n\
              allow_text_chat = {}\n\
              allow_voice_chat = {}\n\
+             allow_system_audio = {}\n\
              allow_send_message = {}\n\
              allow_tunnels = {}\n\
              default_quality = \"{}\"\n\
@@ -321,6 +325,7 @@ impl ServerConfig {
             self.permissions.power_control,
             self.permissions.text_chat,
             self.permissions.voice_chat,
+            self.permissions.system_audio,
             self.permissions.send_message,
             self.permissions.tunnels,
             quality_to_str(self.default_quality),
@@ -974,6 +979,7 @@ mod tests {
         cfg.audit_log_path = Some(temp.join("audit.log"));
         cfg.permissions.power_control = false;
         cfg.permissions.voice_chat = false;
+        cfg.permissions.system_audio = true;
         cfg.default_quality = VideoQualityMode::CrispText;
         cfg.max_fps = 45;
         cfg.voice_bitrate_kbps = 44;
@@ -999,6 +1005,7 @@ mod tests {
         assert_eq!(reloaded.audit_log_path, Some(temp.join("audit.log")));
         assert!(!reloaded.permissions.power_control);
         assert!(!reloaded.permissions.voice_chat);
+        assert!(reloaded.permissions.system_audio);
         assert!(reloaded.permissions.text_chat);
         assert_eq!(reloaded.default_quality, VideoQualityMode::CrispText);
         assert_eq!(reloaded.max_fps, 45);

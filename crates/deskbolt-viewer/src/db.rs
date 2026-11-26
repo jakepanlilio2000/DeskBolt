@@ -368,6 +368,9 @@ pub struct ViewerSettings {
     pub mic_device: String,
     pub speaker_device: String,
     pub voice_bitrate_kbps: u32,
+    pub system_audio_default: bool,
+    pub system_audio_volume: u32,
+    pub system_audio_muted: bool,
     pub noise_gate: f32,
     pub ptt_hotkey: String,
     pub chat_sound: bool,
@@ -405,6 +408,9 @@ impl Default for ViewerSettings {
             mic_device: "Default".into(),
             speaker_device: "Default".into(),
             voice_bitrate_kbps: 32,
+            system_audio_default: false,
+            system_audio_volume: 100,
+            system_audio_muted: false,
             noise_gate: 0.015,
             ptt_hotkey: "V".into(),
             chat_sound: true,
@@ -946,6 +952,9 @@ impl PhonebookDb {
                 "multimonitor_mode" => s.multimonitor_mode = MultimonitorViewMode::from_key(&v),
                 "mic_device" => s.mic_device = v,
                 "speaker_device" => s.speaker_device = v,
+                "system_audio_default" => s.system_audio_default = v == "true",
+                "system_audio_volume" => s.system_audio_volume = v.parse::<u32>().unwrap_or(100).min(100),
+                "system_audio_muted" => s.system_audio_muted = v == "true",
                 "voice_bitrate_kbps" => s.voice_bitrate_kbps = v.parse::<u32>().unwrap_or(32).clamp(24, 48),
                 "noise_gate" => s.noise_gate = v.parse::<f32>().unwrap_or(0.015).clamp(0.0, 0.3),
                 "ptt_hotkey" => s.ptt_hotkey = v,
@@ -987,6 +996,9 @@ impl PhonebookDb {
             ("mic_device", s.mic_device.clone()),
             ("speaker_device", s.speaker_device.clone()),
             ("voice_bitrate_kbps", s.voice_bitrate_kbps.to_string()),
+            ("system_audio_default", s.system_audio_default.to_string()),
+            ("system_audio_volume", s.system_audio_volume.to_string()),
+            ("system_audio_muted", s.system_audio_muted.to_string()),
             ("noise_gate", format!("{:.4}", s.noise_gate)),
             ("ptt_hotkey", s.ptt_hotkey.clone()),
             ("chat_sound", i32::from(s.chat_sound).to_string()),
@@ -1475,6 +1487,9 @@ mod tests {
         settings.theme = ThemeChoice::Light;
         settings.auto_save_chat = true;
         settings.voice_bitrate_kbps = 42;
+        settings.system_audio_default = true;
+        settings.system_audio_volume = 47;
+        settings.system_audio_muted = true;
         settings.noise_gate = 0.04;
         settings.hotkey_fullscreen = "F10".into();
         settings.clipboard_max_bytes = 42_000;
@@ -1487,6 +1502,9 @@ mod tests {
         assert_eq!(reloaded.theme, ThemeChoice::Light);
         assert!(reloaded.auto_save_chat);
         assert_eq!(reloaded.voice_bitrate_kbps, 42);
+        assert!(reloaded.system_audio_default);
+        assert_eq!(reloaded.system_audio_volume, 47);
+        assert!(reloaded.system_audio_muted);
         assert!((reloaded.noise_gate - 0.04).abs() < 0.001);
         assert_eq!(reloaded.hotkey_fullscreen, "F10");
         assert_eq!(reloaded.clipboard_max_bytes, 42_000);

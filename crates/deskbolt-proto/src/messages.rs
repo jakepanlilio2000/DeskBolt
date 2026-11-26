@@ -640,6 +640,9 @@ pub enum CommsMsg {
     VoiceAccept,
     VoiceFrame(Vec<u8>),
     VoiceEnd,
+    SystemAudioOffer,
+    SystemAudioFrame(#[serde(deserialize_with = "crate::audio_codec::bounded_packet")] Vec<u8>),
+    SystemAudioStop,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -714,6 +717,11 @@ pub enum IpcMsg {
     },
     Shutdown,
     SetClipboardLimit(u32),
+    SystemAudioStart(u64),
+    SystemAudioStop(u64),
+    SystemAudioReady { viewer: u64, error: Option<String> },
+    SystemAudioFrame(#[serde(deserialize_with = "crate::audio_codec::bounded_packet")] Vec<u8>),
+    SystemAudioFailed(String),
 }
 
 #[cfg(test)]

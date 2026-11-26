@@ -239,6 +239,7 @@ pub enum SessionCommand {
         output_device: Option<String>,
     },
     StopVoice,
+    SetSystemAudio { enabled: bool, output_device: String },
     Disconnect,
 }
 
@@ -276,6 +277,7 @@ pub enum SessionUiEvent {
     SysAdmin(SysAdminMsg),
     Comms(CommsMsg),
     VoiceState { active: bool, status: String },
+    SystemAudioActive(bool),
     Power(PowerMsg),
 }
 
@@ -342,6 +344,10 @@ pub struct ViewerSession {
     pub voice_active: bool,
     pub voice_status: String,
     pub voice_controls: Arc<VoiceControls>,
+    pub system_audio_controls: Arc<deskbolt_proto::system_audio::SystemAudioControls>,
+    pub system_audio_active: bool,
+    pub system_audio_pending: bool,
+    pub system_audio_on_connect: Option<String>,
     pub power_open: bool,
     pub power_force: bool,
     pub power_delay_secs: u32,
@@ -371,9 +377,11 @@ impl ViewerSession {
         let rp = repaint_fn.clone();
         let target_c = target.clone();
         let vc_c = voice_controls.clone();
+        let system_audio_controls = Arc::new(deskbolt_proto::system_audio::SystemAudioControls::default());
+        let system_audio = system_audio_controls.clone();
 
         runtime.spawn(async move {
-            run_session_task(target_c, cmd_rx, ev_tx_c, lf, frame_seq, vc_c, rp).await;
+            run_session_task(target_c, cmd_rx, ev_tx_c, lf, frame_seq, (vc_c, system_audio), rp).await;
         });
 
         Self {
@@ -429,6 +437,10 @@ impl ViewerSession {
             voice_active: false,
             voice_status: "Idle".into(),
             voice_controls,
+            system_audio_controls,
+            system_audio_active: false,
+            system_audio_pending: false,
+            system_audio_on_connect: None,
             power_open: false,
             power_force: false,
             power_delay_secs: 0,
@@ -438,6 +450,19 @@ impl ViewerSession {
 
     pub fn send_cmd(&self, cmd: SessionCommand) {
         let _ = self.cmd_tx.try_send(cmd);
+    }
+
+    pub fn request_system_audio(&mut self, output_device: String) {
+        if self.system_audio_pending
+            || self.mode == SessionMode::FileTransfer
+            || !matches!(self.phase, ConnectionPhase::Connected)
+        {
+            return;
+        }
+        self.system_audio_pending = self.cmd_tx.try_send(SessionCommand::SetSystemAudio {
+            enabled: !self.system_audio_active,
+            output_device,
+        }).is_ok();
     }
 
     pub fn request_hash_scan(&mut self, root: String, exclude_globs: Vec<String>) -> bool {
@@ -464,10 +489,15 @@ impl ViewerSession {
                     if !matches!(p, ConnectionPhase::Connected) {
                         self.file_transfer.remote_hash_pending = false;
                         self.typing_clipboard = false;
+                        self.system_audio_active = false;
+                        self.system_audio_pending = false;
                         self.android_controls = false;
                         self.cursor = crate::cursor::CursorOverlay::default();
                     }
                     if matches!(p, ConnectionPhase::Connected) {
+                        if let Some(device) = self.system_audio_on_connect.take() {
+                            self.request_system_audio(device);
+                        }
                         if self.file_transfer.open {
                             self.send_cmd(SessionCommand::File(FileTransferMsg::ListRootsReq));
                         }
@@ -706,6 +736,10 @@ impl ViewerSession {
                     self.voice_active = active;
                     self.voice_status = status;
                 }
+                SessionUiEvent::SystemAudioActive(active) => {
+                    self.system_audio_active = active;
+                    self.system_audio_pending = false;
+                }
                 SessionUiEvent::Power(PowerMsg::PowerAck { accepted, message }) => {
                     self.power_status = if accepted {
                         message.clone()
@@ -740,9 +774,12 @@ async fn run_session_task(
     ev_tx: std::sync::mpsc::Sender<SessionUiEvent>,
     latest_frame: Arc<Mutex<Option<DecodedFrame>>>,
     frame_seq: Arc<AtomicU64>,
-    voice_controls: Arc<VoiceControls>,
+    audio_controls: (Arc<VoiceControls>, Arc<deskbolt_proto::system_audio::SystemAudioControls>),
     repaint: Arc<dyn Fn() + Send + Sync>,
 ) {
+    use deskbolt_proto::system_audio::SystemAudioPlayer;
+
+    let (voice_controls, system_audio_controls) = audio_controls;
     let ConnectTarget {
         host_id,
         title: _,
@@ -1096,6 +1133,10 @@ async fn run_session_task(
     let mut overwrite_policy = OverwritePolicy::Ask;
     let (voice_tx, mut voice_rx) = mpsc::channel::<Vec<u8>>(64);
     let mut voice_engine: Option<VoiceEngine> = None;
+    let mut system_audio_player: Option<SystemAudioPlayer> = None;
+    let mut system_audio_active = false;
+    let system_audio_timeout = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(system_audio_timeout);
 
     'session: loop {
         tokio::select! {
@@ -1118,6 +1159,14 @@ async fn run_session_task(
                 if let Ok(f) = pack_message(ChannelId::AuthControl, FLAG_NONE, &ControlMsg::Ping { timestamp_ms: ts }, None) {
                     let _ = write_frame_async(&mut writer, f.channel, f.flags, &f.payload).await;
                 }
+            }
+            _ = &mut system_audio_timeout, if system_audio_player.is_some() && !system_audio_active => {
+                system_audio_player = None;
+                let frame = pack_message(ChannelId::Comms, FLAG_NONE, &CommsMsg::SystemAudioStop, None)
+                    .expect("system audio stop has a fixed wire size");
+                let _ = write_frame_async(&mut writer, frame.channel, frame.flags, &frame.payload).await;
+                notify(SessionUiEvent::SystemAudioActive(false));
+                notify(SessionUiEvent::StatusBanner("The host did not start system audio.".into()));
             }
             Some(packet) = voice_rx.recv() => {
                 if let Ok(f) = pack_message(ChannelId::Comms, FLAG_NONE, &CommsMsg::VoiceFrame(packet), None) {
@@ -1346,6 +1395,34 @@ async fn run_session_task(
                             let _ = write_frame_async(&mut writer, f.channel, f.flags, &f.payload).await;
                         }
                     }
+                    SessionCommand::SetSystemAudio { enabled, output_device } => {
+                        let message = if enabled && mode != SessionMode::FileTransfer {
+                            match SystemAudioPlayer::start(Some(&output_device), system_audio_controls.clone()) {
+                                Ok(player) => {
+                                    system_audio_player = Some(player);
+                                    system_audio_timeout.as_mut().reset(
+                                        tokio::time::Instant::now() + Duration::from_secs(6),
+                                    );
+                                    CommsMsg::SystemAudioOffer
+                                }
+                                Err(error) => {
+                                    notify(SessionUiEvent::SystemAudioActive(false));
+                                    notify(SessionUiEvent::StatusBanner(format!("Could not play system audio: {error}")));
+                                    continue;
+                                }
+                            }
+                        } else {
+                            system_audio_player = None;
+                            system_audio_active = false;
+                            notify(SessionUiEvent::SystemAudioActive(false));
+                            CommsMsg::SystemAudioStop
+                        };
+                        let frame = pack_message(ChannelId::Comms, FLAG_NONE, &message, None)
+                            .expect("system audio negotiation has a fixed wire size");
+                        if write_frame_async(&mut writer, frame.channel, frame.flags, &frame.payload).await.is_err() {
+                            break 'session;
+                        }
+                    }
                     SessionCommand::QueueUpload { local_path, remote_path } => {
                         let id = next_transfer_id;
                         next_transfer_id += 1;
@@ -1518,6 +1595,22 @@ async fn run_session_task(
                                     CommsMsg::VoiceEnd => {
                                         voice_engine = None;
                                         notify(SessionUiEvent::Comms(CommsMsg::VoiceEnd));
+                                    }
+                                    CommsMsg::SystemAudioOffer => {
+                                        if system_audio_player.is_some() {
+                                            system_audio_active = true;
+                                            notify(SessionUiEvent::SystemAudioActive(true));
+                                        }
+                                    }
+                                    CommsMsg::SystemAudioFrame(packet) => {
+                                        if system_audio_active && let Some(player) = &mut system_audio_player {
+                                            player.push(&packet);
+                                        }
+                                    }
+                                    CommsMsg::SystemAudioStop => {
+                                        system_audio_player = None;
+                                        system_audio_active = false;
+                                        notify(SessionUiEvent::SystemAudioActive(false));
                                     }
                                     other => notify(SessionUiEvent::Comms(other)),
                                 }

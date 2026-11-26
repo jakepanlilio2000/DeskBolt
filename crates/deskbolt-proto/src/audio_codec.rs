@@ -9,7 +9,11 @@ pub struct AudioEncoder {
 
 impl AudioEncoder {
     pub fn new(channels: opus::Channels, kbps: u32) -> Result<Self, opus::Error> {
-        let mut encoder = opus::Encoder::new(AUDIO_RATE, channels, opus::Application::Voip)?;
+        let application = match channels {
+            opus::Channels::Mono => opus::Application::Voip,
+            opus::Channels::Stereo => opus::Application::Audio,
+        };
+        let mut encoder = opus::Encoder::new(AUDIO_RATE, channels, application)?;
         encoder.set_bitrate(opus::Bitrate::Bits((kbps * 1000) as i32))?;
         encoder.set_inband_fec(true)?;
         encoder.set_packet_loss_perc(10)?;
@@ -91,6 +95,42 @@ pub fn valid_audio_packet(packet: &[u8]) -> bool {
             opus::packet::get_nb_samples(&packet[4..], AUDIO_RATE),
             Ok(AUDIO_SAMPLES)
         )
+}
+
+pub(crate) fn bounded_packet<'de, D: serde::Deserializer<'de>>(
+    decoder: D,
+) -> Result<Vec<u8>, D::Error> {
+    struct PacketVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for PacketVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "an audio packet of 5 to {MAX_AUDIO_PACKET} bytes")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
+            use serde::de::Error;
+            if let Some(size) = seq.size_hint()
+                && !(5..=MAX_AUDIO_PACKET).contains(&size)
+            {
+                return Err(A::Error::invalid_length(size, &self));
+            }
+            let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or_default());
+            while let Some(byte) = seq.next_element()? {
+                if bytes.len() == MAX_AUDIO_PACKET {
+                    return Err(A::Error::invalid_length(bytes.len() + 1, &self));
+                }
+                bytes.push(byte);
+            }
+            if bytes.len() < 5 {
+                return Err(A::Error::invalid_length(bytes.len(), &self));
+            }
+            Ok(bytes)
+        }
+    }
+
+    decoder.deserialize_seq(PacketVisitor)
 }
 
 #[cfg(test)]

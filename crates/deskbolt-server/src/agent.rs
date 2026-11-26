@@ -196,6 +196,8 @@ fn run_agent_workers(
         thread::spawn(move || run_clipboard_loop(clip_rx, clip_ev, clip_stop))
     };
 
+    let mut audio_viewers = std::collections::HashSet::new();
+    let mut system_audio: Option<deskbolt_proto::system_audio::SystemAudioCapture> = None;
     while let Some(cmd) = cmd_rx.blocking_recv() {
         match cmd {
             IpcMsg::Input(inp) => {
@@ -240,6 +242,33 @@ fn run_agent_workers(
                 urgent,
             } => {
                 let _ = platform::show_desktop_popup(&title, &body, urgent);
+            }
+            IpcMsg::SystemAudioStart(viewer) => {
+                if system_audio.as_ref().is_some_and(|capture| capture.is_finished()) {
+                    system_audio = None;
+                    audio_viewers.clear();
+                }
+                let error = if system_audio.is_none() {
+                    let packets = ev_tx.clone();
+                    let errors = ev_tx.clone();
+                    match deskbolt_proto::system_audio::SystemAudioCapture::start(
+                        move |packet| { let _ = packets.try_send(IpcMsg::SystemAudioFrame(packet)); },
+                        move |error| { let _ = errors.try_send(IpcMsg::SystemAudioFailed(error)); },
+                    ) {
+                        Ok(capture) => { system_audio = Some(capture); None }
+                        Err(error) => Some(error),
+                    }
+                } else { None };
+                if error.is_none() {
+                    audio_viewers.insert(viewer);
+                }
+                let _ = ev_tx.blocking_send(IpcMsg::SystemAudioReady { viewer, error });
+            }
+            IpcMsg::SystemAudioStop(viewer) => {
+                audio_viewers.remove(&viewer);
+                if audio_viewers.is_empty() {
+                    system_audio = None;
+                }
             }
             IpcMsg::Shutdown => break,
             _ => {}

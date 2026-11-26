@@ -644,6 +644,7 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
     let mut sys_handler = SysAdminHandler::new();
     let (voice_tx, mut voice_rx) = mpsc::channel::<Vec<u8>>(64);
     let mut voice_engine: Option<VoiceEngine> = None;
+    let mut system_audio = SystemAudioState::Idle;
 
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(128);
     let wake_agent = hub.to_agent_tx.clone();
@@ -760,6 +761,43 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
             ev = agent_rx.recv(), if *mode != SessionMode::FileTransfer => {
                 match ev {
                     Ok(msg) => {
+                        match msg.as_ref() {
+                            IpcMsg::SystemAudioReady { viewer, error } if *viewer == conn_id => {
+                                if system_audio == SystemAudioState::Pending {
+                                    if let Some(error) = error {
+                                        system_audio = SystemAudioState::Idle;
+                                        send_control_error(&out_tx, &format!("System audio unavailable: {error}"));
+                                        send_system_audio(&out_tx, CommsMsg::SystemAudioStop).await;
+                                    } else {
+                                        system_audio = SystemAudioState::Active;
+                                        send_system_audio(&out_tx, CommsMsg::SystemAudioOffer).await;
+                                    }
+                                }
+                                continue;
+                            }
+                            IpcMsg::SystemAudioFrame(packet) => {
+                                if system_audio == SystemAudioState::Active
+                                    && let Ok(frame) = pack_message(ChannelId::Comms, FLAG_NONE, &CommsMsg::SystemAudioFrame(packet.clone()), None)
+                                {
+                                    let _ = out_tx.try_send(frame);
+                                }
+                                continue;
+                            }
+                            IpcMsg::SystemAudioFailed(error) => {
+                                if system_audio != SystemAudioState::Idle {
+                                    system_audio = SystemAudioState::Idle;
+                                    let _ = hub.to_agent_tx.try_send(IpcMsg::SystemAudioStop(conn_id));
+                                    send_control_error(&out_tx, &format!("System audio stopped: {error}"));
+                                    send_system_audio(&out_tx, CommsMsg::SystemAudioStop).await;
+                                }
+                                continue;
+                            }
+                            IpcMsg::AgentReady { .. } if system_audio != SystemAudioState::Idle => {
+                                system_audio = SystemAudioState::Idle;
+                                send_system_audio(&out_tx, CommsMsg::SystemAudioStop).await;
+                            }
+                            _ => {}
+                        }
                         if let IpcMsg::Clipboard(clipboard) = msg.as_ref()
                             && (*mode != SessionMode::FullControl || !clipboard.within_limit(policy.clipboard_max_bytes))
                         {
@@ -807,6 +845,7 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                             &sys_tx,
                             &mut voice_engine,
                             &voice_tx,
+                            &mut system_audio,
                         ).await {
                             if e == "client requested disconnect" {
                                 break Ok(());
@@ -820,6 +859,9 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
         }
     };
 
+    if system_audio != SystemAudioState::Idle {
+        let _ = hub.to_agent_tx.send(IpcMsg::SystemAudioStop(conn_id)).await;
+    }
     drop(voice_engine);
     term_handler.cleanup_all();
     tun_handler.cleanup_all().await;
@@ -827,6 +869,19 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
     drop(out_tx);
     let _ = writer_task.await;
     result
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SystemAudioState {
+    Idle,
+    Pending,
+    Active,
+}
+
+async fn send_system_audio(out: &mpsc::Sender<Frame>, message: CommsMsg) {
+    if let Ok(frame) = pack_message(ChannelId::Comms, FLAG_NONE, &message, None) {
+        let _ = out.send(frame).await;
+    }
 }
 
 fn ipc_to_wire_frame(msg: &IpcMsg) -> Option<Frame> {
@@ -913,6 +968,7 @@ async fn dispatch_client_frame(
     sys_tx: &mpsc::Sender<SysAdminMsg>,
     voice_engine: &mut Option<VoiceEngine>,
     voice_tx: &mpsc::Sender<Vec<u8>>,
+    system_audio: &mut SystemAudioState,
 ) -> Result<(), String> {
     match frame.channel {
         ChannelId::AuthControl => {
@@ -986,6 +1042,11 @@ async fn dispatch_client_frame(
                             }
                         } else {
                             *mode = next_mode;
+                        }
+                        if *mode == SessionMode::FileTransfer && *system_audio != SystemAudioState::Idle {
+                            *system_audio = SystemAudioState::Idle;
+                            let _ = hub.to_agent_tx.send(IpcMsg::SystemAudioStop(conn_id)).await;
+                            send_system_audio(out_tx, CommsMsg::SystemAudioStop).await;
                         }
                     }
                 }
@@ -1214,6 +1275,25 @@ async fn dispatch_client_frame(
                         let _ = out_tx.send(f).await;
                     }
                 }
+                CommsMsg::SystemAudioOffer => {
+                    if *mode == SessionMode::FileTransfer || !policy.permissions.system_audio {
+                        send_control_error(out_tx, "The host has disabled system audio for this session.");
+                        send_system_audio(out_tx, CommsMsg::SystemAudioStop).await;
+                    } else if *system_audio == SystemAudioState::Idle {
+                        if hub.to_agent_tx.try_send(IpcMsg::SystemAudioStart(conn_id)).is_ok() {
+                            *system_audio = SystemAudioState::Pending;
+                        } else {
+                            send_control_error(out_tx, "Could not reach the host audio service.");
+                            send_system_audio(out_tx, CommsMsg::SystemAudioStop).await;
+                        }
+                    }
+                }
+                CommsMsg::SystemAudioStop => {
+                    if *system_audio != SystemAudioState::Idle {
+                        *system_audio = SystemAudioState::Idle;
+                        let _ = hub.to_agent_tx.send(IpcMsg::SystemAudioStop(conn_id)).await;
+                    }
+                }
                 CommsMsg::VoiceOffer { sample_rate, channels } => {
                     if sample_rate != deskbolt_proto::VOICE_SAMPLE_RATE || channels != 1 {
                         send_control_error(out_tx, "The host requires 48 kHz mono voice.");
@@ -1399,6 +1479,82 @@ mod tests {
             }
             shutdown_tx.send(true).unwrap();
             server_task.await.unwrap().unwrap();
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn system_audio_requires_a_permitted_desktop_session() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let identity = generate_self_signed_cert(&[]).unwrap();
+            let salt = [0x48; SALT_LEN];
+            let password = b"LoopbackAudio#1";
+            for (allow, mode) in [
+                (false, SessionMode::ViewOnly),
+                (true, SessionMode::FileTransfer),
+                (true, SessionMode::ViewOnly),
+            ] {
+                let cred = Arc::new(StoredCredential {
+                    salt,
+                    m_kib: 1024,
+                    t_cost: 1,
+                    p_cost: 1,
+                    auth_key: derive_auth_key(password, &salt, 1024, 1, 1).unwrap(),
+                });
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let (hub, mut agent_commands) = test_hub();
+                let agent_events = hub.from_agent_tx.clone();
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let mut policy = ServerPolicy::for_test(false);
+                policy.permissions.system_audio = allow;
+                let server = tokio::spawn(serve_listener_with_policy(
+                    listener, identity.cert_der.clone(), identity.key_der.clone(), cred,
+                    hub, false, policy, Duration::from_secs(2), shutdown_rx,
+                ));
+                let (mut tls, granted) =
+                    test_auth_connect(addr, identity.fingerprint, password, mode).await;
+                assert_eq!(granted, mode);
+                let offer = pack_message(ChannelId::Comms, FLAG_NONE, &CommsMsg::SystemAudioOffer, None).unwrap();
+                write_frame_async(&mut tls, offer.channel, offer.flags, &offer.payload).await.unwrap();
+
+                let permitted = allow && mode != SessionMode::FileTransfer;
+                let packet = vec![0, 0, 0, 0, 0xf8, 0xff, 0xfe];
+                if permitted {
+                    let viewer = loop {
+                        if let IpcMsg::SystemAudioStart(viewer) = agent_commands.recv().await.unwrap() {
+                            break viewer;
+                        }
+                    };
+                    agent_events.send(Arc::new(IpcMsg::SystemAudioReady { viewer, error: None })).unwrap();
+                    agent_events.send(Arc::new(IpcMsg::SystemAudioFrame(packet.clone()))).unwrap();
+                }
+                loop {
+                    let frame = read_frame_async(&mut tls).await.unwrap().unwrap();
+                    if frame.channel != ChannelId::Comms {
+                        continue;
+                    }
+                    match unpack_message::<CommsMsg>(&frame).unwrap() {
+                        CommsMsg::SystemAudioStop if !permitted => {
+                            while let Ok(command) = agent_commands.try_recv() {
+                                assert!(!matches!(command, IpcMsg::SystemAudioStart(_)));
+                            }
+                            break;
+                        }
+                        CommsMsg::SystemAudioOffer if permitted => {}
+                        CommsMsg::SystemAudioFrame(bytes) if permitted => {
+                            assert_eq!(bytes, packet);
+                            break;
+                        }
+                        other => panic!("unexpected desktop audio message {other:?}"),
+                    }
+                }
+                drop(tls);
+                if permitted {
+                    while !matches!(agent_commands.recv().await.unwrap(), IpcMsg::SystemAudioStop(_)) {}
+                }
+                shutdown_tx.send(true).unwrap();
+                server.await.unwrap().unwrap();
+            }
         }).await.unwrap();
     }
 
