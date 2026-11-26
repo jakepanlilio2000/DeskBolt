@@ -1194,6 +1194,7 @@ async fn run_session_task(
     let mut frames = AsyncFrameReader::default();
     let mut ft_client = FileClientQueue::new();
     let mut hash_scan: Option<HashScan> = None;
+    let mut video_recovery: HashMap<u8, Instant> = HashMap::new();
     let mut next_transfer_id: u64 = 1;
     let mut quick_edit_pending: Option<String> = None;
     let mut quick_edit_uploads: HashMap<u64, (String, PathBuf)> = HashMap::new();
@@ -1563,8 +1564,23 @@ async fn run_session_task(
                             if let Ok(v) = unpack_message::<VideoMsg>(&frame) {
                                 if matches!(v, VideoMsg::CursorUpdate { .. }) {
                                     notify(SessionUiEvent::Cursor(v));
-                                } else {
-                                    let _ = vid_tx.try_send((v, Instant::now()));
+                                } else if let Err(std::sync::mpsc::TrySendError::Full((missed, _))) =
+                                    vid_tx.try_send((v, Instant::now()))
+                                {
+                                    let id = match missed {
+                                        VideoMsg::TileBatch { monitor_id, .. } | VideoMsg::H264Frame { monitor_id, .. }
+                                            | VideoMsg::EncodedFrame { monitor_id, .. } => monitor_id,
+                                        VideoMsg::CursorUpdate { .. } => continue,
+                                    };
+                                    if video_recovery.get(&id).is_none_or(|t| t.elapsed() >= Duration::from_millis(500))
+                                        && let Ok(frame) = pack_message(
+                                            ChannelId::AuthControl, FLAG_URGENT,
+                                            &ControlMsg::KeyframeRequest { monitor_id: id }, None,
+                                        )
+                                    {
+                                        video_recovery.insert(id, Instant::now());
+                                        let _ = write_frame_async(&mut writer, frame.channel, frame.flags, &frame.payload).await;
+                                    }
                                 }
                             }
                         }

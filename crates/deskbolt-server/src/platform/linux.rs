@@ -94,6 +94,7 @@ struct LinuxInputEvent {
 struct UinputInjector {
     file: File,
     depressed: HashSet<u16>,
+    desktop: Option<(i32, i32, i32, i32)>,
 }
 
 impl UinputInjector {
@@ -157,6 +158,7 @@ impl UinputInjector {
         Ok(Self {
             file,
             depressed: HashSet::new(),
+            desktop: None,
         })
     }
 
@@ -191,12 +193,25 @@ impl Drop for UinputInjector {
     }
 }
 
+fn monitor_extent(monitors: &[MonitorInfo]) -> Option<(i32,i32,i32,i32)> {
+    let left = monitors.iter().map(|monitor| monitor.left).min()?;
+    let top = monitors.iter().map(|monitor| monitor.top).min()?;
+    let right = monitors.iter().map(|monitor| i64::from(monitor.left) + i64::from(monitor.width)).max()?;
+    let bottom = monitors.iter().map(|monitor| i64::from(monitor.top) + i64::from(monitor.height)).max()?;
+    Some((left, top, i32::try_from(right - i64::from(left)).ok()?, i32::try_from(bottom - i64::from(top)).ok()?))
+}
+
 impl InputInjector for UinputInjector {
-    fn inject_pointer(&mut self, ev: PointerEvent, _mon: &MonitorInfo) {
+    fn update_monitor_layout(&mut self, monitors: &[MonitorInfo]) {
+        self.desktop = monitor_extent(monitors);
+    }
+
+    fn inject_pointer(&mut self, ev: PointerEvent, mon: &MonitorInfo) {
+        let (left, top, width, height) = self.desktop.unwrap_or((mon.left, mon.top, mon.width as i32, mon.height as i32));
+        let absolute = |x, y| crate::agent::map_norm_to_virtual_desktop(x, y, mon, left, top, width, height);
         match ev {
             PointerEvent::MoveAbs { norm_x, norm_y } => {
-                let ax = (norm_x.clamp(0.0, 1.0) * 65535.0).round() as i32;
-                let ay = (norm_y.clamp(0.0, 1.0) * 65535.0).round() as i32;
+                let (ax, ay) = absolute(norm_x, norm_y);
                 self.emit(EV_ABS, ABS_X, ax);
                 self.emit(EV_ABS, ABS_Y, ay);
                 self.sync();
@@ -207,8 +222,7 @@ impl InputInjector for UinputInjector {
                 norm_x,
                 norm_y,
             } => {
-                let ax = (norm_x.clamp(0.0, 1.0) * 65535.0).round() as i32;
-                let ay = (norm_y.clamp(0.0, 1.0) * 65535.0).round() as i32;
+                let (ax, ay) = absolute(norm_x, norm_y);
                 self.emit(EV_ABS, ABS_X, ax);
                 self.emit(EV_ABS, ABS_Y, ay);
                 let code = match button {
@@ -262,7 +276,8 @@ impl InputInjector for NoopInjector {
 }
 
 pub fn create_capturer(monitor_idx: u8) -> Result<Box<dyn ScreenCapturer>, String> {
-    if super::wayland_capture::is_wayland() {
+    let wayland = super::wayland_capture::is_wayland();
+    if wayland {
         match super::wayland_capture::WaylandCapturer::new(monitor_idx, enumerate_monitors().is_empty()) {
             Ok(capture) => return Ok(Box::new(capture)),
             Err(error) => warn!("Screen stream unavailable: {error}"),
@@ -270,6 +285,7 @@ pub fn create_capturer(monitor_idx: u8) -> Result<Box<dyn ScreenCapturer>, Strin
     }
     match XcapCapturer::new(monitor_idx) {
         Ok(capture) => Ok(Box::new(capture)),
+        Err(error) if wayland => Err(error),
         Err(_) => Ok(Box::new(super::x11_framebuffer::X11Framebuffer::open()?)),
     }
 }

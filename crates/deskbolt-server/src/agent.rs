@@ -1090,12 +1090,16 @@ fn input_loop(
                         height: 1080,
                         dpi_scale: 1.0,
                     });
+                injector.update_monitor_layout(&mons);
                 drop(mons);
                 injector.inject_pointer(ev, &mon);
             }
             InputMsg::MonitorPointer { monitor_id, event } => {
-                let monitor = shared.monitors.lock().unwrap().iter().find(|m| m.id == monitor_id).cloned();
+                let monitors = shared.monitors.lock().unwrap();
+                let monitor = monitors.iter().find(|m| m.id == monitor_id).cloned();
                 if let Some(monitor) = monitor {
+                    injector.update_monitor_layout(&monitors);
+                    drop(monitors);
                     injector.inject_pointer(event, &monitor);
                 }
             }

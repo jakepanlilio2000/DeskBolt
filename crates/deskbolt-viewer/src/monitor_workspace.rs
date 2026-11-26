@@ -25,12 +25,19 @@ pub(crate) struct Workspace {
 
 impl Workspace {
     #[cfg(not(target_os = "android"))]
-    pub fn toggle_windows(&mut self, monitors: &[MonitorInfo]) {
+    pub fn toggle_windows(
+        &mut self,
+        monitors: &[MonitorInfo],
+        sender: &mpsc::Sender<SessionCommand>,
+    ) {
         if self.popouts.is_empty() {
             for monitor in monitors.iter().take(MAX_SURFACES) {
                 self.popouts.insert(monitor.id, Arc::new(Popout::default()));
             }
         } else {
+            for window in self.popouts.values() {
+                window.canvas.lock().unwrap().release_pointer(sender);
+            }
             self.popouts.clear();
         }
     }
@@ -228,16 +235,18 @@ impl Canvas {
         Some(layout.canvas)
     }
 
+    fn release_pointer(&mut self, sender: &mpsc::Sender<SessionCommand>) {
+        for (index, state) in self.pressed.iter_mut().enumerate() {
+            if let Some(hit) = state.take() {
+                hit.send(sender, button_event(index, false, hit));
+            }
+        }
+    }
+
     fn route_input(&mut self, ui: &Ui, layout: &Layout, sender: &mpsc::Sender<SessionCommand>) {
         let (events, focused) = ui.input(|i| (i.events.clone(), i.focused));
         if !focused {
-            if self.pressed.iter().any(Option::is_some) {
-                for (index, state) in self.pressed.iter_mut().enumerate() {
-                    if let Some(hit) = state.take() {
-                        hit.send(sender, button_event(index, false, hit));
-                    }
-                }
-            }
+            self.release_pointer(sender);
             if events
                 .iter()
                 .any(|event| matches!(event, Event::WindowFocused(false)))
@@ -387,6 +396,7 @@ pub(crate) fn show_windows(ctx: &Context, session: &mut ViewerSession, show_curs
             if ui.input(|i| i.viewport().close_requested()) {
                 popout.closed.store(true, Ordering::Relaxed);
                 if controllable {
+                    popout.canvas.lock().unwrap().release_pointer(&sender);
                     let _ = sender.try_send(SessionCommand::Input(InputMsg::ReleaseAllKeys));
                 }
                 origin.request_repaint_of(egui::ViewportId::ROOT);
@@ -494,6 +504,31 @@ mod tests {
             is_primary: id == 1,
             dpi_scale: 1.0,
         }
+    }
+
+    #[test]
+    fn closing_display_releases_pointer_on_its_last_monitor() {
+        let (sender, mut commands) = mpsc::channel(2);
+        let mut canvas = Canvas::default();
+        canvas.pressed[0] = Some(Hit {
+            monitor: 5,
+            x: 0.5,
+            y: 0.75,
+        });
+        canvas.release_pointer(&sender);
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            SessionCommand::Input(InputMsg::MonitorPointer {
+                monitor_id: 5,
+                event: PointerEvent::Button {
+                    button: MouseBtn::Left,
+                    down: false,
+                    ..
+                },
+            })
+        ));
+        canvas.release_pointer(&sender);
+        assert!(commands.try_recv().is_err());
     }
 
     #[test]

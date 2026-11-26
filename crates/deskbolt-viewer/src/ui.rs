@@ -1447,7 +1447,7 @@ impl DeskBoltViewerApp {
                             if s.workspace.has_windows() {
                                 s.send_cmd(SessionCommand::Input(InputMsg::ReleaseAllKeys));
                             }
-                            s.workspace.toggle_windows(&s.monitors);
+                            s.workspace.toggle_windows(&s.monitors, &s.cmd_tx);
                         }
                         s.workspace.synchronize(&s.monitors, &s.cmd_tx);
                         if s.workspace.stitched {

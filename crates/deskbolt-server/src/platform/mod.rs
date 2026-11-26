@@ -84,6 +84,7 @@ pub trait ScreenCapturer: Send {
 /// Platform keyboard and mouse injection interface.
 pub trait InputInjector: Send {
     fn sync_desktop(&mut self) {}
+    fn update_monitor_layout(&mut self, _monitors: &[MonitorInfo]) {}
     fn inject_pointer(&mut self, ev: PointerEvent, active_mon: &MonitorInfo);
     fn inject_key(&mut self, ev: KeyEvent);
     fn inject_unicode(&mut self, _ch: char) {}
