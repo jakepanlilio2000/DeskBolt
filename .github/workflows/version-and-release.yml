@@ -36,7 +36,7 @@ env:
     libx11-dev libxrandr-dev libdbus-1-dev libpipewire-0.3-dev
     libwayland-dev libegl-dev libdrm-dev libgbm-dev libfontconfig1-dev
     libxkbcommon-dev libxkbcommon-x11-dev libxcb-shape0-dev libxcb-xfixes0-dev
-    libasound2-dev libclang-dev clang nasm pkg-config
+    libasound2-dev libclang-dev clang cmake nasm pkg-config
 
 jobs:
   verify:
@@ -70,15 +70,22 @@ jobs:
         run: |
           choco install -y nasm
           "C:\Program Files\NASM" >> $env:GITHUB_PATH
+          if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+            choco install -y cmake
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            "C:\Program Files\CMake\bin" >> $env:GITHUB_PATH
+          }
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
         run: |
           read -r -a packages <<< "$LINUX_BUILD_PACKAGES"
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends "${packages[@]}"
-      - name: Install macOS assembler
+      - name: Install macOS build tools
         if: runner.os == 'macOS'
-        run: command -v nasm >/dev/null || brew install nasm
+        run: |
+          command -v nasm >/dev/null || brew install nasm
+          command -v cmake >/dev/null || brew install cmake
       - name: Test the workspace with all features
         run: cargo test --workspace --all-features --locked
       - name: Lint all workspace targets
@@ -219,6 +226,11 @@ jobs:
         run: |
           choco install -y nasm
           $env:PATH = "C:\Program Files\NASM;" + $env:PATH
+          if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+            choco install -y cmake
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $env:PATH = "C:\Program Files\CMake\bin;" + $env:PATH
+          }
           if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
             if (Test-Path "C:\Program Files (x86)\NSIS\makensis.exe") {
               $env:PATH = "C:\Program Files (x86)\NSIS;" + $env:PATH
@@ -295,6 +307,7 @@ jobs:
           depend = libxkbcommon-x11
           depend = libglvnd
           depend = alsa-lib
+          depend = libpipewire
           EOF
           tar -C "${ARCH_ROOT}" --zstd -cf "dist/linux-out/deskbolt-${ARCH_VER}-1-x86_64.pkg.tar.zst" .PKGINFO usr
 
@@ -322,7 +335,8 @@ jobs:
       - name: Build macOS Universal .dmg
         if: matrix.platform == 'macos'
         run: |
-          brew install nasm
+          command -v nasm >/dev/null || brew install nasm
+          command -v cmake >/dev/null || brew install cmake
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
           cargo build --release --target aarch64-apple-darwin --workspace --no-default-features --locked
           cargo build --release --target x86_64-apple-darwin --workspace --no-default-features --locked
@@ -376,7 +390,7 @@ jobs:
         if: matrix.platform == 'android'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends nasm clang unzip
+          sudo apt-get install -y --no-install-recommends nasm clang cmake unzip
           export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           export ANDROID_SDK_ROOT="${ANDROID_HOME}"
           sudo chown -R "$USER:$USER" "${ANDROID_HOME}" || true

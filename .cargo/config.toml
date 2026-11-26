@@ -1,6 +1,8 @@
 [env]
 LIBOPUS_NO_PKG = "1"
 CMAKE_POLICY_VERSION_MINIMUM = "3.5"
+CMAKE_TOOLCHAIN_FILE_aarch64_linux_android = { value = ".cargo/android-audio-toolchain.cmake", relative = true }
+CMAKE_TOOLCHAIN_FILE_x86_64_linux_android = { value = ".cargo/android-audio-toolchain.cmake", relative = true }
 
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
