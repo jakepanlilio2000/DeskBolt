@@ -22,10 +22,12 @@ Self-hosted remote desktop, file transfer, and system administration for Windows
 - **Terminal access.** Open an interactive host shell, connect to SSH and serial devices, reuse command snippets, and run a command on multiple saved hosts.
 - **Files and logs.** Browse and transfer files, resume interrupted copies, compare directories with exclusion rules, edit remote text files, and follow live logs. Transfers use SHA-256 verification.
 - **Network and system administration.** Forward TCP ports, troubleshoot connectivity, and inspect remote systems, processes, and services.
-- **Session communications.** Exchange text messages, send desktop alerts, and talk over voice chat.
+- **Session communications.** Exchange text messages, send desktop alerts, and talk with echo cancellation and noise suppression. Use **System Audio** in the session toolbar to hear host playback with its own volume and mute controls.
 - **Power and hardware control.** Restart or shut down an authorized host, send Wake-on-LAN, or use the BIOS console and network boot on compatible hardware.
 
 ## Quick Start
+
+System audio is off by default. Enable **Allow System Audio Forwarding** in the host settings, then select **System Audio** in the Viewer toolbar. Set playback defaults under **Tools → Options → Audio & Chat**. Linux requires a compatible desktop audio service in the active session. On macOS 14.6 or later, grant system audio recording permission and select an output device without a microphone.
 
 Install the **Host** on the computer you want to reach and the **Viewer** on the device you will use to connect. Set a host password, then add the host's IP address or DNS name in the viewer. Allow inbound TCP port **4899** on the host firewall if you use the default port.
 
@@ -118,12 +120,12 @@ TLS 1.3 carries multiplexed frames with a six-byte header. A big-endian 32-bit p
 | `0x06` | Host terminal and serial streams |
 | `0x07` | Forward and reverse TCP tunnels |
 | `0x08` | System, process, and service administration |
-| `0x09` | Text chat, desktop alerts, and voice |
+| `0x09` | Text chat, desktop alerts, voice, and system audio |
 | `0x0A` | Host power actions |
 
 ### Build from Source
 
-Use the stable Rust toolchain and install NASM. On Linux, install the native development dependencies listed in the [Linux build job](.github/workflows/version-and-release.yml).
+Use the stable Rust toolchain and install CMake and NASM. On Linux, install the native development dependencies listed in the [Linux build job](.github/workflows/version-and-release.yml).
 
 ```bash
 cargo test --workspace --all-features --locked
