@@ -6,8 +6,8 @@ pkgdesc="Native self-hosted remote desktop server and viewer"
 arch=('x86_64')
 url="https://github.com/jakepanlilio2000/DeskBolt"
 license=('MPL-2.0')
-depends=('glibc' 'libxcb' 'libxrandr' 'dbus' 'libxkbcommon' 'libxkbcommon-x11' 'libglvnd')
-makedepends=('rust' 'cargo' 'clang' 'nasm' 'pipewire')
+depends=('glibc' 'libxcb' 'libxrandr' 'dbus' 'libxkbcommon' 'libxkbcommon-x11' 'libglvnd' 'alsa-lib' 'libpipewire')
+makedepends=('rust' 'cargo' 'clang' 'cmake' 'nasm' 'pipewire')
 
 build() {
   cd "${startdir}/../.."
