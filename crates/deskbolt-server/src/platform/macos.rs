@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicBool;
 
 use deskbolt_proto::{ClipboardSync, IpcMsg, KeyEvent, MonitorInfo, PointerEvent};
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::desktop_common::{
     EnigoInjector, XcapCapturer, enumerate_xcap_monitors, unix_read_password_masked,
