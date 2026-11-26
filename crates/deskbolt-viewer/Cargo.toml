@@ -1,0 +1,70 @@
+[package]
+name = "deskbolt-viewer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "DeskBolt native remote desktop viewer and file transfer client."
+
+[lib]
+name = "deskbolt_viewer_lib"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "deskbolt-viewer"
+path = "src/main.rs"
+
+[dependencies]
+deskbolt-proto = { path = "../deskbolt-proto" }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+rusqlite = { workspace = true }
+ring = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+vt100 = { workspace = true }
+russh = { workspace = true }
+russh-sftp = { workspace = true }
+surge-ping = { workspace = true }
+hickory-resolver = { workspace = true }
+cpal = { workspace = true }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+serialport = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+arboard = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { workspace = true }
+eframe = { workspace = true, features = ["android-game-activity"] }
+
+[package.metadata.deb]
+maintainer = "StackSync Solutions <jakepanlilio2000>"
+section = "net"
+priority = "optional"
+depends = "$auto, libc6, libx11-6, libxcb1, libxkbcommon0, libxkbcommon-x11-0, libegl1"
+assets = [
+    ["target/release/deskbolt-viewer", "usr/bin/", "755"],
+    ["../../packaging/linux/deskbolt-viewer.desktop", "usr/share/applications/deskbolt-viewer.desktop", "644"],
+    ["../../LICENSE", "usr/share/doc/deskbolt-viewer/copyright", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/deskbolt-viewer", dest = "/usr/bin/deskbolt-viewer", mode = "0755" },
+    { source = "../../packaging/linux/deskbolt-viewer.desktop", dest = "/usr/share/applications/deskbolt-viewer.desktop", mode = "0644" },
+    { source = "../../LICENSE", dest = "/usr/share/licenses/deskbolt-viewer/LICENSE", mode = "0644" },
+]
+
+[lints]
+workspace = true
