@@ -222,7 +222,10 @@ pub fn platform_video_decoders() -> VideoCapabilities {
     #[cfg(target_os = "windows")]
     return crate::mf_video::decoders();
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    return crate::vt_video::decoders();
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     VideoCapabilities::default()
 }
 
@@ -233,6 +236,12 @@ pub fn platform_video_encoder(
     #[cfg(target_os = "windows")]
     if VideoCodec::HARDWARE.contains(&codec) {
         return crate::mf_video::Encoder::open(codec, input)
+            .ok()
+            .map(|encoder| Box::new(encoder) as _);
+    }
+    #[cfg(target_os = "macos")]
+    if matches!(codec, VideoCodec::H264Hw | VideoCodec::HevcHw) {
+        return crate::vt_video::Encoder::open(codec, input)
             .ok()
             .map(|encoder| Box::new(encoder) as _);
     }
@@ -248,6 +257,12 @@ pub fn platform_video_decoder(
     #[cfg(target_os = "windows")]
     if VideoCodec::HARDWARE.contains(&codec) {
         return crate::mf_video::Decoder::open(codec, u32::from(width), u32::from(height))
+            .ok()
+            .map(|decoder| Box::new(decoder) as _);
+    }
+    #[cfg(target_os = "macos")]
+    if matches!(codec, VideoCodec::H264Hw | VideoCodec::HevcHw) {
+        return crate::vt_video::Decoder::open(codec, width, height)
             .ok()
             .map(|decoder| Box::new(decoder) as _);
     }

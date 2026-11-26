@@ -17,6 +17,8 @@ pub mod voice;
 pub mod video_pipeline;
 #[cfg(target_os = "windows")]
 mod mf_video;
+#[cfg(target_os = "macos")]
+mod vt_video;
 
 pub use auth::{
     ARGON2_M_KIB, ARGON2_P_COST, ARGON2_T_COST, IpRateLimiter, NONCE_LEN, SALT_LEN,
