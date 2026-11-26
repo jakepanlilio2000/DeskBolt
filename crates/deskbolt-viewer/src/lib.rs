@@ -8,6 +8,7 @@ pub mod session;
 pub mod sftp_sync;
 pub mod shortcuts;
 pub mod terminal;
+mod typing;
 pub mod ui;
 
 use deskbolt_proto::SessionMode;

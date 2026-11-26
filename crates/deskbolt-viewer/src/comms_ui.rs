@@ -793,6 +793,12 @@ impl DeskBoltViewerApp {
                                 ui.add(egui::DragValue::new(&mut opt.draft.clipboard_max_bytes)
                                     .range(0..=deskbolt_proto::MAX_CLIPBOARD_BYTES).speed(1024));
                                 ui.end_row();
+                                #[cfg(not(target_os = "android"))]
+                                {
+                                    ui.label("Clipboard typing delay (ms)");
+                                    ui.add(egui::DragValue::new(&mut opt.draft.clipboard_key_delay_ms).range(1..=1000));
+                                    ui.end_row();
+                                }
                                 ui.label("Multi-Monitor Mode:");
                                 egui::ComboBox::from_id_salt("opt_multimon")
                                     .selected_text(opt.draft.multimonitor_mode.label())
@@ -846,6 +852,12 @@ impl DeskBoltViewerApp {
                                 ui.label("Send Ctrl+Alt+Del:");
                                 ui.text_edit_singleline(&mut opt.draft.hotkey_cad);
                                 ui.end_row();
+                                #[cfg(not(target_os = "android"))]
+                                {
+                                    ui.label("Type Clipboard");
+                                    ui.text_edit_singleline(&mut opt.draft.hotkey_type_clipboard);
+                                    ui.end_row();
+                                }
                                 ui.label("Next Monitor:");
                                 ui.text_edit_singleline(&mut opt.draft.hotkey_next_monitor);
                                 ui.end_row();

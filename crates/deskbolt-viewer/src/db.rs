@@ -362,6 +362,8 @@ pub struct ViewerSettings {
     pub sys_keys_mode: SystemKeysMode,
     pub remote_cursor_sync: bool,
     pub clipboard_max_bytes: usize,
+    pub clipboard_key_delay_ms: u16,
+    pub hotkey_type_clipboard: String,
     pub multimonitor_mode: MultimonitorViewMode,
     pub mic_device: String,
     pub speaker_device: String,
@@ -396,6 +398,8 @@ impl Default for ViewerSettings {
             sys_keys_mode: SystemKeysMode::Focused,
             remote_cursor_sync: true,
             clipboard_max_bytes: DEFAULT_CLIPBOARD_MAX_BYTES,
+            clipboard_key_delay_ms: 10,
+            hotkey_type_clipboard: "Ctrl+Shift+V".into(),
             multimonitor_mode: MultimonitorViewMode::Switch,
             mic_device: "Default".into(),
             speaker_device: "Default".into(),
@@ -935,6 +939,8 @@ impl PhonebookDb {
                     s.clipboard_max_bytes = v.parse().unwrap_or(DEFAULT_CLIPBOARD_MAX_BYTES)
                         .min(MAX_CLIPBOARD_BYTES);
                 }
+                "clipboard_key_delay_ms" => s.clipboard_key_delay_ms = v.parse().unwrap_or(10).clamp(1, 1000),
+                "hotkey_type_clipboard" => s.hotkey_type_clipboard = v,
                 "multimonitor_mode" => s.multimonitor_mode = MultimonitorViewMode::from_key(&v),
                 "mic_device" => s.mic_device = v,
                 "speaker_device" => s.speaker_device = v,
@@ -972,6 +978,8 @@ impl PhonebookDb {
             ("sys_keys_mode", s.sys_keys_mode.as_str().into()),
             ("remote_cursor_sync", i32::from(s.remote_cursor_sync).to_string()),
             ("clipboard_max_bytes", s.clipboard_max_bytes.to_string()),
+            ("clipboard_key_delay_ms", s.clipboard_key_delay_ms.to_string()),
+            ("hotkey_type_clipboard", s.hotkey_type_clipboard.clone()),
             ("multimonitor_mode", s.multimonitor_mode.as_str().into()),
             ("mic_device", s.mic_device.clone()),
             ("speaker_device", s.speaker_device.clone()),
@@ -1465,6 +1473,8 @@ mod tests {
         settings.noise_gate = 0.04;
         settings.hotkey_fullscreen = "F10".into();
         settings.clipboard_max_bytes = 42_000;
+        settings.clipboard_key_delay_ms = 25;
+        settings.hotkey_type_clipboard = "Alt+F9".into();
         db.save_settings(&settings).unwrap();
         let reloaded = db.load_settings();
         assert_eq!(reloaded.scale_mode, ScaleMode::OneToOne);
@@ -1474,5 +1484,7 @@ mod tests {
         assert!((reloaded.noise_gate - 0.04).abs() < 0.001);
         assert_eq!(reloaded.hotkey_fullscreen, "F10");
         assert_eq!(reloaded.clipboard_max_bytes, 42_000);
+        assert_eq!(reloaded.clipboard_key_delay_ms, 25);
+        assert_eq!(reloaded.hotkey_type_clipboard, "Alt+F9");
     }
 }

@@ -214,6 +214,10 @@ impl InputInjector for EnigoInjector {
             }
         }
     }
+
+    fn inject_unicode(&mut self, ch: char) {
+        let _ = self.enigo.text(ch.encode_utf8(&mut [0; 4]));
+    }
 }
 
 pub fn monitor_pixel_coords(norm_x: f32, norm_y: f32, mon: &MonitorInfo) -> (i32, i32) {

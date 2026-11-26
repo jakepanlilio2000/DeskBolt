@@ -208,6 +208,8 @@ pub enum SessionCommand {
     SubmitPassword(String),
     CancelConnect,
     Input(InputMsg),
+    TypeClipboard { text: String, delay_ms: u16 },
+    StopTyping,
     Control(ControlMsg),
     Clipboard(ClipboardSync),
     File(FileTransferMsg),
@@ -250,6 +252,7 @@ pub enum SessionUiEvent {
     RttUpdated(u64),
     StatusBanner(String),
     RemoteClipboard(ClipboardSync),
+    TypingChanged(bool),
     FileRoots(Vec<DriveEntry>),
     FileDirList { path: String, entries: Vec<FileEntry>, error: Option<String> },
     FileActionResult { ok: bool, error: Option<String> },
@@ -290,6 +293,7 @@ pub struct ViewerSession {
     pub fit_scale: bool,
     pub capture_system_keys: bool,
     pub auto_clipboard: bool,
+    pub typing_clipboard: bool,
     pub headless_admin: bool,
     pub phase: ConnectionPhase,
     pub monitors: Vec<MonitorInfo>,
@@ -371,6 +375,7 @@ impl ViewerSession {
             fit_scale: true,
             capture_system_keys: false,
             auto_clipboard: true,
+            typing_clipboard: false,
             headless_admin: false,
             phase: ConnectionPhase::Connecting,
             monitors: Vec::new(),
@@ -429,6 +434,9 @@ impl ViewerSession {
             match ev {
                 SessionUiEvent::PhaseChanged(p) => {
                     self.phase = p.clone();
+                    if !matches!(p, ConnectionPhase::Connected) {
+                        self.typing_clipboard = false;
+                    }
                     if matches!(p, ConnectionPhase::Connected) {
                         if self.file_transfer.open {
                             self.send_cmd(SessionCommand::File(FileTransferMsg::ListRootsReq));
@@ -464,6 +472,7 @@ impl ViewerSession {
                         clip_to_copy = Some(message);
                     }
                 }
+                SessionUiEvent::TypingChanged(active) => self.typing_clipboard = active,
                 SessionUiEvent::FileRoots(roots) => {
                     let need_initial_dir = self.file_transfer.remote_path.is_empty();
                     if need_initial_dir && let Some(first) = roots.first() {
@@ -1047,12 +1056,28 @@ async fn run_session_task(
         Duration::from_secs(10),
     );
     let mut upload_tick = tokio::time::interval(Duration::from_millis(15));
+    let mut typing = VecDeque::new();
+    let mut typing_tick = tokio::time::interval(Duration::from_millis(10));
     let mut overwrite_policy = OverwritePolicy::Ask;
     let (voice_tx, mut voice_rx) = mpsc::channel::<Vec<u8>>(64);
     let mut voice_engine: Option<VoiceEngine> = None;
 
-    loop {
+    'session: loop {
         tokio::select! {
+            _ = typing_tick.tick(), if !typing.is_empty() => {
+                if let Some(ch) = typing.pop_front() {
+                    for key in crate::typing::character_events(ch) {
+                        if let Ok(frame) = pack_message(ChannelId::Input, FLAG_URGENT, &key, None)
+                            && write_frame_async(&mut writer, frame.channel, frame.flags, &frame.payload).await.is_err()
+                        {
+                            break 'session;
+                        }
+                    }
+                }
+                if typing.is_empty() {
+                    notify(SessionUiEvent::TypingChanged(false));
+                }
+            }
             _ = ping_tick.tick() => {
                 let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
                 if let Ok(f) = pack_message(ChannelId::AuthControl, FLAG_NONE, &ControlMsg::Ping { timestamp_ms: ts }, None) {
@@ -1096,13 +1121,40 @@ async fn run_session_task(
                         break;
                     }
                     SessionCommand::Input(inp) => {
+                        if !typing.is_empty()
+                            && matches!(inp, InputMsg::ReleaseAllKeys | InputMsg::Key(deskbolt_proto::KeyEvent { down: true, .. })
+                                | InputMsg::Pointer(deskbolt_proto::PointerEvent::Button { down: true, .. }))
+                        {
+                            typing.clear();
+                            notify(SessionUiEvent::TypingChanged(false));
+                        }
                         if let Ok(f) = pack_message(ChannelId::Input, FLAG_URGENT, &inp, None)
                             && write_frame_async(&mut writer, f.channel, f.flags, &f.payload).await.is_err()
                         {
                             break;
                         }
                     }
+                    SessionCommand::TypeClipboard { text, delay_ms } => {
+                        if let Ok(frame) = pack_message(ChannelId::Input, FLAG_URGENT, &InputMsg::ReleaseAllKeys, None)
+                            && write_frame_async(&mut writer, frame.channel, frame.flags, &frame.payload).await.is_err()
+                        {
+                            break;
+                        }
+                        typing = text.replace("\r\n", "\n").chars().collect();
+                        let interval = Duration::from_millis(u64::from(delay_ms.clamp(1, 1000)));
+                        typing_tick = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+                        typing_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                        notify(SessionUiEvent::TypingChanged(!typing.is_empty()));
+                    }
+                    SessionCommand::StopTyping => {
+                        typing.clear();
+                        notify(SessionUiEvent::TypingChanged(false));
+                    }
                     SessionCommand::Control(ctrl) => {
+                        if matches!(ctrl, ControlMsg::SessionModeSwitch { mode } if mode != SessionMode::FullControl) {
+                            typing.clear();
+                            notify(SessionUiEvent::TypingChanged(false));
+                        }
                         if let Ok(f) = pack_message(ChannelId::AuthControl, FLAG_URGENT, &ctrl, None)
                             && write_frame_async(&mut writer, f.channel, f.flags, &f.payload).await.is_err()
                         {

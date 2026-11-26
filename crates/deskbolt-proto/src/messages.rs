@@ -218,6 +218,7 @@ pub enum InputMsg {
     Pointer(PointerEvent),
     Key(KeyEvent),
     ReleaseAllKeys,
+    Unicode(char),
 }
 
 pub const DEFAULT_CLIPBOARD_MAX_BYTES: usize = 2 * 1024 * 1024;

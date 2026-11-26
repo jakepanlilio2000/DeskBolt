@@ -30,6 +30,7 @@ use crate::session::{
 };
 use crate::sftp_sync::is_quick_edit_ext;
 use crate::shortcuts::create_desktop_shortcut;
+use crate::typing::TypingHotkey;
 
 pub struct DeskBoltViewerApp {
     pub(crate) db: PhonebookDb,
@@ -305,6 +306,11 @@ impl DeskBoltViewerApp {
         let mut pins_to_save = Vec::new();
         for s in &mut self.sessions {
             let (pin_opt, clip_opt) = s.poll_events();
+            if s.typing_clipboard
+                && (self.active_tab_id != Some(s.id) || !_ctx.input(|input| input.focused))
+            {
+                s.send_cmd(SessionCommand::StopTyping);
+            }
             if let Some(pin_info) = pin_opt {
                 pins_to_save.push(pin_info);
             }
@@ -1412,6 +1418,12 @@ impl DeskBoltViewerApp {
                             ui.close();
                         }
                     });
+                    #[cfg(not(target_os = "android"))]
+                    if is_full && matches!(s.phase, ConnectionPhase::Connected)
+                        && ui.button(if s.typing_clipboard { "Stop Typing" } else { "Type Clipboard" }).clicked()
+                    {
+                        toggle_clipboard_typing(s, &mut self.clipboard, &self.settings);
+                    }
                     ui.separator();
                     let cur_scale = self
                         .session_scales
@@ -1504,6 +1516,19 @@ impl DeskBoltViewerApp {
                         };
 
                         // Session hotkeys from ViewerSettings
+                        let typing_hotkey = TypingHotkey::parse(&self.settings.hotkey_type_clipboard);
+                        #[cfg(not(target_os = "android"))]
+                        if s.mode == SessionMode::FullControl
+                            && (self.hook.take_typing_request() || typing_hotkey.is_some_and(|key| {
+                                ui.input(|input| input.focused && input.events.iter().any(|event| {
+                                    matches!(event, egui::Event::Key { key: pressed, pressed: true, repeat: false, modifiers, .. }
+                                        if *pressed == key.key && modifiers.ctrl == key.ctrl
+                                            && modifiers.alt == key.alt && modifiers.shift == key.shift)
+                                }))
+                            }))
+                        {
+                            toggle_clipboard_typing(s, &mut self.clipboard, &self.settings);
+                        }
                         if hotkey_triggered(ui, &self.settings.hotkey_mute_mic) {
                             let prev = s.voice_controls.muted.load(std::sync::atomic::Ordering::Relaxed);
                             s.voice_controls.muted.store(!prev, std::sync::atomic::Ordering::Relaxed);
@@ -1699,6 +1724,10 @@ impl DeskBoltViewerApp {
                                         let events = ui.input(|i| i.events.clone());
                                         for ev in events {
                                             if let egui::Event::Key { key, pressed, repeat: false, .. } = ev
+                                                && !matches!(ev, egui::Event::Key { modifiers, .. } if typing_hotkey.is_some_and(|hotkey| {
+                                                    key == hotkey.key && modifiers.ctrl == hotkey.ctrl
+                                                        && modifiers.alt == hotkey.alt && modifiers.shift == hotkey.shift
+                                                }))
                                                 && let Some(ke) = egui_key_to_key_event(key, pressed)
                                             {
                                                 s.send_cmd(SessionCommand::Input(InputMsg::Key(ke)));
@@ -1827,6 +1856,7 @@ impl DeskBoltViewerApp {
                 }
             });
 
+            self.hook.set_typing_shortcut(TypingHotkey::parse(&self.settings.hotkey_type_clipboard), ui.ctx());
             if !self.hook.update_state(hook_allowed, hook_tx)
                 && let Some(s) = self.sessions.iter_mut().find(|s| s.id == active_id)
                 && s.capture_system_keys
@@ -2323,6 +2353,28 @@ fn render_overwrite_modal(ctx: &Context, s: &mut ViewerSession, prompt: &Overwri
                 }
             });
         });
+}
+
+#[cfg(not(target_os = "android"))]
+fn toggle_clipboard_typing(
+    session: &mut ViewerSession,
+    clipboard: &mut Option<NativeClipboard>,
+    settings: &ViewerSettings,
+) {
+    if session.typing_clipboard {
+        session.send_cmd(SessionCommand::StopTyping);
+        return;
+    }
+    if clipboard.is_none() {
+        *clipboard = NativeClipboard::open();
+    }
+    if let Some(text) = clipboard.as_mut().and_then(|c| c.text(settings.clipboard_max_bytes))
+        && !text.is_empty()
+    {
+        session.send_cmd(SessionCommand::TypeClipboard { text, delay_ms: settings.clipboard_key_delay_ms });
+    } else {
+        session.status_banner = "Clipboard text is empty, unavailable, or exceeds the size limit.".into();
+    }
 }
 
 fn forward_input_sender(

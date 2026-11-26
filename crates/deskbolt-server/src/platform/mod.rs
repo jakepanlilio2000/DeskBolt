@@ -70,6 +70,7 @@ pub trait InputInjector: Send {
     fn sync_desktop(&mut self) {}
     fn inject_pointer(&mut self, ev: PointerEvent, active_mon: &MonitorInfo);
     fn inject_key(&mut self, ev: KeyEvent);
+    fn inject_unicode(&mut self, _ch: char) {}
     fn release_all_keys(&mut self);
 }
 

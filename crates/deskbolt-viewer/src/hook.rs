@@ -10,6 +10,7 @@ use deskbolt_proto::KeyEvent;
 #[cfg(target_os = "windows")]
 use deskbolt_proto::InputMsg;
 use tokio::sync::mpsc;
+use crate::typing::TypingHotkey;
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
 #[cfg(target_os = "windows")]
@@ -30,6 +31,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 pub struct ModifierState {
     pub ctrl: bool,
     pub alt: bool,
+    pub shift: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +59,7 @@ pub fn translate_ll_key(
     match vk_code {
         0x11 | 0xA2 | 0xA3 => mods.ctrl = down,
         0x12 | 0xA4 | 0xA5 => mods.alt = down,
+        0x10 | 0xA0 | 0xA1 => mods.shift = down,
         0x24 if down && mods.ctrl && mods.alt => {
             mods.ctrl = false;
             mods.alt = false;
@@ -181,6 +184,9 @@ struct HookShared {
     escaped: AtomicBool,
     sender: Mutex<Option<mpsc::Sender<InputMsg>>>,
     mods: Mutex<ModifierState>,
+    typing_shortcut: Mutex<Option<(TypingHotkey, egui::Context)>>,
+    typing_key: AtomicU32,
+    typing_request: AtomicBool,
     self_pid: u32,
 }
 
@@ -211,6 +217,9 @@ impl KeyboardHookController {
             escaped: AtomicBool::new(false),
             sender: Mutex::new(None),
             mods: Mutex::new(ModifierState::default()),
+            typing_shortcut: Mutex::new(None),
+            typing_key: AtomicU32::new(0),
+            typing_request: AtomicBool::new(false),
             self_pid: std::process::id(),
         });
         *HOOK_SHARED.lock().unwrap() = Some(shared.clone());
@@ -264,6 +273,10 @@ impl KeyboardHookController {
             *self.shared.sender.lock().unwrap() = None;
             return false;
         }
+        if !should_capture {
+            self.shared.typing_key.store(0, Ordering::Relaxed);
+            self.shared.typing_request.store(false, Ordering::Relaxed);
+        }
         *self.shared.sender.lock().unwrap() = tx;
         self.shared.active.store(should_capture, Ordering::SeqCst);
         should_capture
@@ -275,6 +288,22 @@ impl KeyboardHookController {
         _should_capture: bool,
         _tx: Option<mpsc::Sender<deskbolt_proto::InputMsg>>,
     ) -> bool {
+        false
+    }
+
+    pub fn set_typing_shortcut(&self, shortcut: Option<TypingHotkey>, ctx: &egui::Context) {
+        #[cfg(target_os = "windows")]
+        {
+            *self.shared.typing_shortcut.lock().unwrap() = shortcut.map(|hotkey| (hotkey, ctx.clone()));
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = (shortcut, ctx);
+    }
+
+    pub fn take_typing_request(&self) -> bool {
+        #[cfg(target_os = "windows")]
+        return self.shared.typing_request.swap(false, Ordering::Relaxed);
+        #[cfg(not(target_os = "windows"))]
         false
     }
 }
@@ -313,6 +342,23 @@ unsafe extern "system" fn ll_keyboard_proc(code: i32, wparam: WPARAM, lparam: LP
                 match translate_ll_key(kb.vkCode, kb.scanCode, kb.flags.0, wparam.0 as u32, &mut mods)
                 {
                     HookDecision::Forward(ev) => {
+                        let vk = u32::from(ev.vk_code);
+                        if shared.typing_key.load(Ordering::Relaxed) == vk && vk != 0 {
+                            if !ev.down {
+                                shared.typing_key.store(0, Ordering::Relaxed);
+                            }
+                            return LRESULT(1);
+                        }
+                        if ev.down
+                            && let Some((shortcut, ctx)) = shared.typing_shortcut.lock().unwrap().as_ref()
+                            && mods.ctrl == shortcut.ctrl && mods.alt == shortcut.alt && mods.shift == shortcut.shift
+                            && egui_key_to_key_event(shortcut.key, true).is_some_and(|key| key.vk_code == ev.vk_code)
+                        {
+                            shared.typing_key.store(vk, Ordering::Relaxed);
+                            shared.typing_request.store(true, Ordering::Relaxed);
+                            ctx.request_repaint();
+                            return LRESULT(1);
+                        }
                         if let Some(tx) = shared.sender.lock().unwrap().as_ref() {
                             let _ = tx.try_send(InputMsg::Key(ev));
                         }

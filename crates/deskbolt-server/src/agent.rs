@@ -756,6 +756,8 @@ fn input_loop(
             }
             InputMsg::Key(ev) => injector.inject_key(ev),
             InputMsg::ReleaseAllKeys => injector.release_all_keys(),
+            InputMsg::Unicode(ch) if !ch.is_control() => injector.inject_unicode(ch),
+            InputMsg::Unicode(_) => {}
         }
     }
     injector.release_all_keys();
