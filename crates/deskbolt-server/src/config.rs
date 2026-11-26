@@ -578,11 +578,13 @@ impl ServerPolicy {
         }
     }
 
+    #[cfg(any(test, all(feature = "dev-mcp", not(target_os = "android"))))]
     pub(crate) fn os_prompts_enabled(&self) -> bool {
-        #[cfg(any(test, all(feature = "dev-mcp", not(target_os = "android"))))]
-        if self.suppress_os_prompts {
-            return false;
-        }
+        !self.suppress_os_prompts
+    }
+
+    #[cfg(not(any(test, all(feature = "dev-mcp", not(target_os = "android")))))]
+    pub(crate) fn os_prompts_enabled(&self) -> bool {
         true
     }
 
