@@ -252,6 +252,7 @@ pub enum SessionUiEvent {
     RttUpdated(u64),
     StatusBanner(String),
     RemoteClipboard(ClipboardSync),
+    Cursor(VideoMsg),
     TypingChanged(bool),
     FileRoots(Vec<DriveEntry>),
     FileDirList { path: String, entries: Vec<FileEntry>, error: Option<String> },
@@ -303,6 +304,7 @@ pub struct ViewerSession {
     pub cmd_tx: mpsc::Sender<SessionCommand>,
     pub event_rx: std::sync::mpsc::Receiver<SessionUiEvent>,
     pub latest_frame: Arc<Mutex<Option<DecodedFrame>>>,
+    pub(crate) cursor: crate::cursor::CursorOverlay,
     pub file_transfer: FileTransferState,
     pub quick_edit: Option<QuickEditBuffer>,
     pub log_tail: Option<LogTailBuffer>,
@@ -385,6 +387,7 @@ impl ViewerSession {
             cmd_tx,
             event_rx: ev_rx,
             latest_frame,
+            cursor: crate::cursor::CursorOverlay::default(),
             file_transfer: ft,
             quick_edit: None,
             log_tail: None,
@@ -436,6 +439,7 @@ impl ViewerSession {
                     self.phase = p.clone();
                     if !matches!(p, ConnectionPhase::Connected) {
                         self.typing_clipboard = false;
+                        self.cursor = crate::cursor::CursorOverlay::default();
                     }
                     if matches!(p, ConnectionPhase::Connected) {
                         if self.file_transfer.open {
@@ -473,6 +477,7 @@ impl ViewerSession {
                     }
                 }
                 SessionUiEvent::TypingChanged(active) => self.typing_clipboard = active,
+                SessionUiEvent::Cursor(update) => self.cursor.update(update),
                 SessionUiEvent::FileRoots(roots) => {
                     let need_initial_dir = self.file_transfer.remote_path.is_empty();
                     if need_initial_dir && let Some(first) = roots.first() {
@@ -1352,7 +1357,11 @@ async fn run_session_task(
                     Ok(Some(frame)) => match frame.channel {
                         ChannelId::VideoTiles => {
                             if let Ok(v) = unpack_message::<VideoMsg>(&frame) {
-                                let _ = vid_tx.try_send(v);
+                                if matches!(v, VideoMsg::CursorUpdate { .. }) {
+                                    notify(SessionUiEvent::Cursor(v));
+                                } else {
+                                    let _ = vid_tx.try_send(v);
+                                }
                             }
                         }
                         ChannelId::AuthControl => {

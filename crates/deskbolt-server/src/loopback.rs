@@ -318,6 +318,7 @@ async fn check_auth_and_desktop() -> Check {
     let mut client = host.connect().await?;
 
     let video = VideoMsg::CursorUpdate {
+        monitor_id: 0,
         visible: true,
         x: 10,
         y: 20,

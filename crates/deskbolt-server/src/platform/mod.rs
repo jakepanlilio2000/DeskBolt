@@ -2,7 +2,7 @@ use std::net::IpAddr;
 use std::path::Path;
 
 use deskbolt_proto::{
-    DesktopState, KeyEvent, MonitorInfo, MoveRect, PointerEvent, PowerAction,
+    CursorSnapshot, DesktopState, KeyEvent, MonitorInfo, MoveRect, PointerEvent, PowerAction,
     SessionMode,
 };
 use tokio::sync::watch;
@@ -12,6 +12,8 @@ pub use desktop_dir::desktop_dir;
 
 #[cfg(target_os = "windows")]
 mod windows;
+#[cfg(target_os = "windows")]
+mod windows_cursor;
 #[cfg(target_os = "windows")]
 use windows as imp;
 
@@ -60,6 +62,9 @@ pub trait ScreenCapturer: Send {
     fn monitors(&self) -> Vec<MonitorInfo>;
     fn set_monitor(&mut self, monitor_idx: u8);
     fn capture_next(&mut self, force_full: bool, timeout_ms: u32) -> CaptureOutput;
+    fn capture_cursor(&mut self) -> Option<CursorSnapshot> {
+        None
+    }
     fn current_desktop_name(&self) -> String {
         "Default".to_string()
     }

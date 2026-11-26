@@ -1596,6 +1596,19 @@ impl DeskBoltViewerApp {
                                     Color32::WHITE,
                                 );
 
+                                if self.settings.remote_cursor_sync {
+                                    let local = if s.mode == SessionMode::FullControl && response.hovered() {
+                                        ui.input(|input| input.pointer.hover_pos().filter(|_| input.focused))
+                                    } else {
+                                        None
+                                    };
+                                    if s.cursor.paint(ui, display_rect, (s.active_monitor_id, frame.width, frame.height), local)
+                                        && local.is_some()
+                                    {
+                                        ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+                                    }
+                                }
+
                                 if s.mode == SessionMode::FullControl {
                                     let canvas = display_rect.intersect(ui.clip_rect());
                                     let files = ui.input_mut(|input| {

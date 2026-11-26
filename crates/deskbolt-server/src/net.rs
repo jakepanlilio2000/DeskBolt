@@ -587,6 +587,7 @@ impl OutboundQueues {
             ChannelId::Tunnel | ChannelId::SysAdmin => {
                 self.aux.push_back(frame);
             }
+            ChannelId::VideoTiles if frame.flags & FLAG_URGENT != 0 => self.high.push_back(frame),
             ChannelId::VideoTiles => {
                 if self.video.len() >= MAX_VIDEO_QUEUE {
                     // Drop oldest stale video frame and request fresh keyframe recovery
@@ -751,8 +752,15 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                         {
                             continue;
                         }
+                        if !policy.capture_cursor && matches!(msg.as_ref(), IpcMsg::Video(VideoMsg::CursorUpdate { .. })) {
+                            continue;
+                        }
                         if let Some(frame) = ipc_to_wire_frame(&msg) {
-                            let _ = out_tx.try_send(frame);
+                            if frame.channel == ChannelId::VideoTiles && frame.flags & FLAG_URGENT != 0 {
+                                let _ = out_tx.send(frame).await;
+                            } else {
+                                let _ = out_tx.try_send(frame);
+                            }
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -862,6 +870,7 @@ fn ipc_to_wire_frame(msg: &IpcMsg) -> Option<Frame> {
             let flags = match v {
                 VideoMsg::H264Frame { is_keyframe: true, .. }
                 | VideoMsg::TileBatch { is_full_refresh: true, .. } => FLAG_KEYFRAME,
+                VideoMsg::CursorUpdate { .. } => FLAG_URGENT,
                 _ => FLAG_NONE,
             };
             pack_message(ChannelId::VideoTiles, flags, v, None).ok()

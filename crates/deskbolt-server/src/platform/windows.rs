@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use deskbolt_proto::{
-    DesktopState, KeyEvent, MonitorInfo, MouseBtn, MoveRect, PointerEvent,
+    CursorSnapshot, DesktopState, KeyEvent, MonitorInfo, MouseBtn, MoveRect, PointerEvent,
 };
 use dxgi_capture_rs::{CaptureError, DXGIManager, FrameMetadata};
 use tracing::{info, warn};
@@ -30,6 +30,7 @@ use crate::service;
 use crate::win32_util;
 
 use super::{CaptureOutput, InputInjector, RawCapturedFrame, ScreenCapturer};
+use super::windows_cursor::WindowsCursor;
 
 pub struct WinDxgiCapturer {
     manager: DXGIManager,
@@ -37,6 +38,8 @@ pub struct WinDxgiCapturer {
     monitors: Vec<MonitorInfo>,
     desktop_name: String,
     last_dims: (u32, u32),
+    cursor: WindowsCursor,
+    embedded_cursor: bool,
 }
 
 impl ScreenCapturer for WinDxgiCapturer {
@@ -48,15 +51,27 @@ impl ScreenCapturer for WinDxgiCapturer {
         self.monitor_idx = monitor_idx;
         self.manager.set_capture_source_index(monitor_idx as usize);
         self.last_dims = (0, 0);
+        self.embedded_cursor = false;
     }
 
     fn current_desktop_name(&self) -> String {
         self.desktop_name.clone()
     }
 
+    fn capture_cursor(&mut self) -> Option<CursorSnapshot> {
+        if self.embedded_cursor {
+            return None;
+        }
+        let monitor = self.monitors.iter().find(|monitor| monitor.id == self.monitor_idx)?;
+        self.cursor.sample(monitor)
+    }
+
     fn capture_next(&mut self, force_full: bool, _timeout_ms: u32) -> CaptureOutput {
         match self.manager.capture_frame_components_with_metadata() {
             Ok((bgra, (w, h), meta)) => {
+                if meta.has_mouse_updates() {
+                    self.embedded_cursor = !meta.pointer_visible;
+                }
                 let w32 = w as u32;
                 let h32 = h as u32;
                 let dims_changed = (w32, h32) != self.last_dims && w32 > 0 && h32 > 0;
@@ -123,6 +138,8 @@ pub fn create_capturer(monitor_idx: u8) -> Result<Box<dyn ScreenCapturer>, Strin
         monitors: win32_util::enumerate_dxgi_monitors(),
         desktop_name,
         last_dims: (0, 0),
+        cursor: WindowsCursor::default(),
+        embedded_cursor: false,
     }))
 }
 

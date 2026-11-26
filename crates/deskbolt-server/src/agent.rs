@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use deskbolt_proto::{
-    DesktopState, DirtyTile, H264VideoEncoder, InputMsg, IpcMsg, MonitorInfo, TileRect, VideoMsg,
+    CursorDelta, DesktopState, DirtyTile, H264VideoEncoder, InputMsg, IpcMsg, MonitorInfo, TileRect, VideoMsg,
     VideoQualityMode, encode_dirty_tile,
 };
 #[cfg(target_os = "windows")]
@@ -127,6 +127,7 @@ struct SharedAgentState {
     bitrate_kbps: Mutex<u32>,
     force_keyframe: AtomicBool,
     desktop_switched: AtomicBool,
+    capture_cursor: AtomicBool,
 }
 
 struct LatestRawSlot {
@@ -154,6 +155,7 @@ fn run_agent_workers(
         bitrate_kbps: Mutex::new(4000),
         force_keyframe: AtomicBool::new(true),
         desktop_switched: AtomicBool::new(true),
+        capture_cursor: AtomicBool::new(true),
     });
 
     let _ = ev_tx.blocking_send(IpcMsg::AgentReady {
@@ -223,7 +225,9 @@ fn run_agent_workers(
             IpcMsg::SetCurtainMode(enabled) => {
                 let _ = platform::set_curtain_mode(enabled);
             }
-            IpcMsg::SetCaptureCursor(_) => {}
+            IpcMsg::SetCaptureCursor(enabled) => {
+                shared.capture_cursor.store(enabled, Ordering::Relaxed);
+            }
             IpcMsg::ShowPopup {
                 title,
                 body,
@@ -305,6 +309,7 @@ fn capture_loop(
     let mut current_mon_idx: u8 = *shared.active_monitor.lock().unwrap();
     let mut last_dims: (u32, u32) = (0, 0);
     let mut need_full = true;
+    let mut cursor_delta = CursorDelta::default();
 
     while !stop.load(Ordering::SeqCst) {
         let wanted_mon = *shared.active_monitor.lock().unwrap();
@@ -349,7 +354,20 @@ fn capture_loop(
             }
 
             let force_kf = shared.force_keyframe.swap(false, Ordering::SeqCst);
-            match cap.capture_next(need_full || force_kf, 33) {
+            let output = cap.capture_next(need_full || force_kf, 33);
+            let cursor = if shared.capture_cursor.load(Ordering::Relaxed)
+                && matches!(output, CaptureOutput::Frame(_) | CaptureOutput::Timeout)
+            {
+                cap.capture_cursor()
+            } else {
+                None
+            };
+            if let Some(update) = cursor_delta.update(current_mon_idx, cursor, force_kf)
+                && ev_tx.blocking_send(IpcMsg::Video(update)).is_err()
+            {
+                break;
+            }
+            match output {
                 CaptureOutput::Frame(raw) => {
                     if (raw.width, raw.height) != last_dims && raw.width > 0 && raw.height > 0 {
                         last_dims = (raw.width, raw.height);

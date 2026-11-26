@@ -164,6 +164,7 @@ pub enum VideoMsg {
         tiles: Vec<DirtyTile>,
     },
     CursorUpdate {
+        monitor_id: u8,
         visible: bool,
         x: i16,
         y: i16,

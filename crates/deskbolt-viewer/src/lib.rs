@@ -1,5 +1,6 @@
 pub mod admin_ui;
 pub mod comms_ui;
+mod cursor;
 pub mod db;
 pub mod hook;
 pub mod net_tools;
