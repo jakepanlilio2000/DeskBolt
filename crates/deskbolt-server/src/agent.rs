@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
     Arc, Condvar, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -132,13 +132,14 @@ struct SharedAgentState {
     bitrate_kbps: Mutex<u32>,
     congestion: Mutex<HashMap<u64, (u8, Instant)>>,
     decoder_support: Mutex<HashMap<u64, VideoCapabilities>>,
+    all_displays: AtomicBool,
     force_keyframe: AtomicBool,
     desktop_switched: AtomicBool,
     capture_cursor: AtomicBool,
 }
 
 struct LatestRawSlot {
-    data: Mutex<Option<RawCapturedFrame>>,
+    data: Mutex<VecDeque<RawCapturedFrame>>,
     cv: Condvar,
 }
 
@@ -161,7 +162,8 @@ fn run_agent_workers(
         target_fps: Mutex::new(30),
         bitrate_kbps: Mutex::new(4000),
         congestion: Mutex::new(HashMap::new()),
-        decoder_support: Mutex::new(HashMap::new()),
+    decoder_support: Mutex::new(HashMap::new()),
+        all_displays: AtomicBool::new(false),
         force_keyframe: AtomicBool::new(true),
         desktop_switched: AtomicBool::new(true),
         capture_cursor: AtomicBool::new(true),
@@ -174,7 +176,7 @@ fn run_agent_workers(
     });
 
     let slot = Arc::new(LatestRawSlot {
-        data: Mutex::new(None),
+        data: Mutex::new(VecDeque::new()),
         cv: Condvar::new(),
     });
 
@@ -206,6 +208,7 @@ fn run_agent_workers(
     };
 
     let mut audio_viewers = std::collections::HashSet::new();
+    let mut workspace_viewers = HashSet::new();
     let mut system_audio: Option<deskbolt_proto::system_audio::SystemAudioCapture> = None;
     while let Some(cmd) = cmd_rx.blocking_recv() {
         match cmd {
@@ -229,6 +232,13 @@ fn run_agent_workers(
                 *shared.target_fps.lock().unwrap() = target_fps.clamp(15, 120);
                 *shared.bitrate_kbps.lock().unwrap() = h264_bitrate_kbps.max(250);
                 shared.force_keyframe.store(true, Ordering::SeqCst);
+            }
+            IpcMsg::MonitorWorkspace { viewer, enabled } => {
+                let changed = if enabled { workspace_viewers.insert(viewer) } else { workspace_viewers.remove(&viewer) };
+                shared.all_displays.store(!workspace_viewers.is_empty(), Ordering::Relaxed);
+                if changed {
+                    shared.force_keyframe.store(true, Ordering::Relaxed);
+                }
             }
             IpcMsg::VideoDecoderSupport { viewer, capabilities } => {
                 let mut viewers = shared.decoder_support.lock().unwrap();
@@ -373,6 +383,7 @@ fn capture_loop(
     let mut need_full = true;
     let mut cursor_delta = CursorDelta::default();
     let mut last_level = 0;
+    let mut secondary: HashMap<u8, SecondaryCapture> = HashMap::new();
 
     while !stop.load(Ordering::SeqCst) {
         let wanted_mon = *shared.active_monitor.lock().unwrap();
@@ -428,6 +439,7 @@ fn capture_loop(
         if let Some(cap) = capturer.as_mut() {
             let active = *shared.active_monitor.lock().unwrap();
             if active != current_mon_idx {
+                secondary.remove(&active);
                 cap.set_monitor(active);
                 current_mon_idx = active;
                 need_full = true;
@@ -470,9 +482,7 @@ fn capture_loop(
                         });
                     }
                     need_full = false;
-                    let mut guard = slot.data.lock().unwrap();
-                    *guard = Some(raw);
-                    slot.cv.notify_one();
+                    slot.publish(raw);
                 }
                 CaptureOutput::Timeout => {}
                 CaptureOutput::DesktopSwitched { state, name } => {
@@ -488,6 +498,7 @@ fn capture_loop(
                         desktop_name: name,
                     });
                     capturer = None;
+                    secondary.clear();
                     need_full = true;
                 }
                 CaptureOutput::Reacquire(_) => {
@@ -496,11 +507,72 @@ fn capture_loop(
                     thread::sleep(Duration::from_millis(50));
                 }
             }
+            if shared.all_displays.load(Ordering::Relaxed) {
+                let monitors = shared.monitors.lock().unwrap().clone();
+                secondary.retain(|id, _| *id != active && monitors.iter().any(|m| m.id == *id));
+                for monitor in monitors.into_iter().filter(|monitor| monitor.id != active) {
+                    let track = secondary.entry(monitor.id).or_default();
+                    track.capture(monitor.id, force_kf, &slot, &ev_tx, shared.capture_cursor.load(Ordering::Relaxed));
+                }
+            } else if !secondary.is_empty() {
+                secondary.clear();
+                slot.data.lock().unwrap().retain(|frame| frame.monitor_id == active);
+            }
         }
 
         let elapsed = loop_start.elapsed();
         if elapsed < frame_interval {
             thread::sleep(frame_interval - elapsed);
+        }
+    }
+}
+
+impl LatestRawSlot {
+    fn publish(&self, mut frame: RawCapturedFrame) {
+        let mut pending = self.data.lock().unwrap();
+        if let Some(position) = pending.iter().position(|data| data.monitor_id == frame.monitor_id) {
+            pending.remove(position);
+            frame.force_full = true;
+        }
+        pending.push_back(frame);
+        self.cv.notify_one();
+    }
+}
+
+#[derive(Default)]
+struct SecondaryCapture {
+    capturer: Option<Box<dyn ScreenCapturer>>,
+    cursor: CursorDelta,
+    retry: Option<Instant>,
+    refresh: bool,
+}
+
+impl SecondaryCapture {
+    fn capture(&mut self, id: u8, force: bool, slot: &LatestRawSlot, events: &mpsc::Sender<IpcMsg>, cursor_enabled: bool) {
+        if self.capturer.is_none() {
+            if self.retry.is_some_and(|at| at.elapsed() < Duration::from_secs(2)) {
+                return;
+            }
+            self.retry = Some(Instant::now());
+            self.capturer = platform::create_capturer(id).ok();
+            self.refresh = true;
+        }
+        let Some(capturer) = &mut self.capturer else { return };
+        self.refresh |= force;
+        let output = capturer.capture_next(self.refresh, 1);
+        if cursor_enabled && matches!(output, CaptureOutput::Frame(_) | CaptureOutput::Timeout)
+            && let Some(update) = self.cursor.update(id, capturer.capture_cursor(), force)
+        {
+            let _ = events.blocking_send(IpcMsg::Video(update));
+        }
+        match output {
+            CaptureOutput::Frame(mut frame) if frame.monitor_id == id => {
+                frame.force_full |= self.refresh;
+                self.refresh = false;
+                slot.publish(frame);
+            }
+            CaptureOutput::Reacquire(_) | CaptureOutput::DesktopSwitched { .. } => self.capturer = None,
+            _ => {}
         }
     }
 }
@@ -537,13 +609,13 @@ fn encode_loop(
     while !stop.load(Ordering::SeqCst) {
         let frame_opt = {
             let mut guard = slot.data.lock().unwrap();
-            while guard.is_none() && !stop.load(Ordering::SeqCst) {
+            while guard.is_empty() && !stop.load(Ordering::SeqCst) {
                 let (g, timeout_res) = slot
                     .cv
                     .wait_timeout(guard, Duration::from_millis(250))
                     .unwrap();
                 guard = g;
-                if timeout_res.timed_out() && guard.is_none() {
+                if timeout_res.timed_out() && guard.is_empty() {
                     if auto_tracker.on_idle_tick()
                         && let Some((mon, w, h, ref bgra)) = last_frame_cache
                     {
@@ -564,7 +636,7 @@ fn encode_loop(
                     break;
                 }
             }
-            guard.take()
+            guard.pop_front()
         };
 
         let Some(raw) = frame_opt else {
@@ -574,6 +646,23 @@ fn encode_loop(
             continue;
         }
 
+        let selected = *shared.active_monitor.lock().unwrap();
+        if raw.monitor_id != selected {
+            if shared.all_displays.load(Ordering::Relaxed) {
+                seq += 1;
+                let input = VideoInput {
+                    bgra: &raw.bgra, width: raw.width, height: raw.height, monitor: raw.monitor_id,
+                    sequence: seq, timestamp_us: now_micros(), bitrate: 0, fps: 0,
+                    refresh: raw.force_full, dirty_rects: &raw.dirty_rects, moves: &raw.move_rects,
+                };
+                if let Ok(Some(frame)) = ZstdVideo.encode(input)
+                    && ev_tx.blocking_send(IpcMsg::Video(frame)).is_err()
+                {
+                    break;
+                }
+            }
+            continue;
+        }
         let quality = *shared.quality_mode.lock().unwrap();
         let (fps, bitrate, downscale) = adaptive_quality(
             shared.congestion_level(), *shared.target_fps.lock().unwrap(), *shared.bitrate_kbps.lock().unwrap(),
@@ -855,6 +944,12 @@ fn input_loop(
                     });
                 drop(mons);
                 injector.inject_pointer(ev, &mon);
+            }
+            InputMsg::MonitorPointer { monitor_id, event } => {
+                let monitor = shared.monitors.lock().unwrap().iter().find(|m| m.id == monitor_id).cloned();
+                if let Some(monitor) = monitor {
+                    injector.inject_pointer(event, &monitor);
+                }
             }
             InputMsg::Key(ev) => injector.inject_key(ev),
             InputMsg::ReleaseAllKeys => injector.release_all_keys(),

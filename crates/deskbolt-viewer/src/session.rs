@@ -297,6 +297,16 @@ pub struct ConnectTarget {
     pub pinned_fingerprint: Option<String>,
 }
 
+pub(crate) type MonitorFrames = Arc<Mutex<HashMap<u8, Arc<DecodedFrame>>>>;
+pub(crate) type MonitorCursors = Arc<Mutex<HashMap<u8, crate::cursor::CursorOverlay>>>;
+type LatestVideo = Arc<Mutex<Option<Arc<DecodedFrame>>>>;
+
+#[derive(Clone, Default)]
+struct VideoSurfaces {
+    latest_frame: LatestVideo,
+    monitors: MonitorFrames,
+}
+
 type SharedVideoStats = Arc<Mutex<crate::quality_hud::VideoQualityStats>>;
 
 /// Live connection handle shared between UI tabs and background Tokio networking.
@@ -322,8 +332,10 @@ pub struct ViewerSession {
     pub last_rtt_ms: Option<u64>,
     pub cmd_tx: mpsc::Sender<SessionCommand>,
     pub event_rx: std::sync::mpsc::Receiver<SessionUiEvent>,
-    pub latest_frame: Arc<Mutex<Option<DecodedFrame>>>,
-    pub(crate) cursor: crate::cursor::CursorOverlay,
+    pub latest_frame: LatestVideo,
+    pub(crate) monitor_frames: MonitorFrames,
+    pub(crate) cursors: MonitorCursors,
+    pub(crate) workspace: crate::monitor_workspace::Workspace,
     pub file_transfer: FileTransferState,
     pub quick_edit: Option<QuickEditBuffer>,
     pub log_tail: Option<LogTailBuffer>,
@@ -371,7 +383,8 @@ impl ViewerSession {
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (ev_tx, ev_rx) = std::sync::mpsc::channel();
-        let latest_frame = Arc::new(Mutex::new(None));
+        let surfaces = VideoSurfaces::default();
+        let decode_surfaces = surfaces.clone();
         let frame_seq = Arc::new(AtomicU64::new(0));
         let video_stats = Arc::new(Mutex::new(crate::quality_hud::VideoQualityStats::default()));
         let task_stats = video_stats.clone();
@@ -382,7 +395,7 @@ impl ViewerSession {
             ft.open = true;
         }
 
-        let lf = latest_frame.clone();
+        let lf = decode_surfaces;
         let ev_tx_c = ev_tx.clone();
         let rp = repaint_fn.clone();
         let target_c = target.clone();
@@ -416,8 +429,10 @@ impl ViewerSession {
             last_rtt_ms: None,
             cmd_tx,
             event_rx: ev_rx,
-            latest_frame,
-            cursor: crate::cursor::CursorOverlay::default(),
+            latest_frame: surfaces.latest_frame,
+            monitor_frames: surfaces.monitors,
+            cursors: Arc::default(),
+            workspace: crate::monitor_workspace::Workspace::default(),
             file_transfer: ft,
             quick_edit: None,
             log_tail: None,
@@ -504,7 +519,9 @@ impl ViewerSession {
                         self.system_audio_active = false;
                         self.system_audio_pending = false;
                         self.android_controls = false;
-                        self.cursor = crate::cursor::CursorOverlay::default();
+                        self.cursors.lock().unwrap().clear();
+                        self.monitor_frames.lock().unwrap().clear();
+                        self.workspace = crate::monitor_workspace::Workspace::default();
                     }
                     if matches!(p, ConnectionPhase::Connected) {
                         if let Some(device) = self.system_audio_on_connect.take() {
@@ -532,8 +549,14 @@ impl ViewerSession {
                     pin_to_save = Some((host_id, fingerprint));
                 }
                 SessionUiEvent::MonitorsUpdated { monitors, active_id } => {
+                    if !monitors.iter().any(|monitor| monitor.id == self.active_monitor_id)
+                        || self.monitors.is_empty() || !self.workspace.subscribed()
+                    {
+                        self.active_monitor_id = active_id;
+                    }
                     self.monitors = monitors;
-                    self.active_monitor_id = active_id;
+                    self.monitor_frames.lock().unwrap().retain(|id, _| self.monitors.iter().any(|m| m.id == *id));
+                    self.cursors.lock().unwrap().retain(|id, _| self.monitors.iter().any(|m| m.id == *id));
                 }
                 SessionUiEvent::RttUpdated(ms) => {
                     self.last_rtt_ms = Some(ms);
@@ -546,7 +569,13 @@ impl ViewerSession {
                 }
                 SessionUiEvent::TypingChanged(active) => self.typing_clipboard = active,
                 SessionUiEvent::AndroidControls => self.android_controls = true,
-                SessionUiEvent::Cursor(update) => self.cursor.update(update),
+                SessionUiEvent::Cursor(update) => {
+                    if let VideoMsg::CursorUpdate { monitor_id, .. } = &update
+                        && self.monitors.iter().any(|monitor| monitor.id == *monitor_id)
+                    {
+                        self.cursors.lock().unwrap().entry(*monitor_id).or_default().update(update);
+                    }
+                }
                 SessionUiEvent::FileRoots(roots) => {
                     let need_initial_dir = self.file_transfer.remote_path.is_empty();
                     if need_initial_dir && let Some(first) = roots.first() {
@@ -784,7 +813,7 @@ async fn run_session_task(
     target: ConnectTarget,
     mut cmd_rx: mpsc::Receiver<SessionCommand>,
     ev_tx: std::sync::mpsc::Sender<SessionUiEvent>,
-    latest_frame: Arc<Mutex<Option<DecodedFrame>>>,
+    surfaces: VideoSurfaces,
     video: (Arc<AtomicU64>, SharedVideoStats),
     audio_controls: (Arc<VoiceControls>, Arc<deskbolt_proto::system_audio::SystemAudioControls>),
     repaint: Arc<dyn Fn() + Send + Sync>,
@@ -1124,7 +1153,7 @@ async fn run_session_task(
     // Spawn dedicated video decode worker thread
     let (vid_tx, vid_rx) = std::sync::mpsc::sync_channel::<(VideoMsg, Instant)>(4);
     let (ack_tx, mut ack_rx) = mpsc::channel::<Frame>(16);
-    let dec_latest = latest_frame;
+    let dec_latest = surfaces;
     let dec_seq = frame_seq;
     let dec_repaint = repaint.clone();
     let dec_stats = video_stats.clone();
@@ -2011,9 +2040,23 @@ async fn wait_password(cmd_rx: &mut mpsc::Receiver<SessionCommand>) -> Option<St
     None
 }
 
+struct NativeDecoder {
+    spec: (VideoCodec, u16, u16),
+    decoder: Box<dyn VideoDecoder>,
+}
+
+#[derive(Default)]
+struct MonitorDecoder {
+    native: Option<NativeDecoder>,
+    h264: Option<H264VideoDecoder>,
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
 fn run_decode_worker(
     rx: std::sync::mpsc::Receiver<(VideoMsg, Instant)>,
-    latest_frame: Arc<Mutex<Option<DecodedFrame>>>,
+    surfaces: VideoSurfaces,
     frame_seq: Arc<AtomicU64>,
     ack_tx: mpsc::Sender<Frame>,
     repaint: Arc<dyn Fn() + Send + Sync>,
@@ -2021,24 +2064,35 @@ fn run_decode_worker(
 ) {
     let (stats, supported) = video;
     let mut capabilities = *supported.borrow();
-    let mut h264 = H264VideoDecoder::new().ok();
-    struct NativeDecoder {
-        spec: (VideoCodec, u16, u16),
-        decoder: Box<dyn VideoDecoder>,
-    }
-    let mut native: Option<NativeDecoder> = None;
-    let mut rgba_buf = Vec::new();
-    let mut buf_w = 0u32;
-    let mut buf_h = 0u32;
+    let mut monitors: HashMap<u8, MonitorDecoder> = HashMap::new();
 
     while let Ok((msg, queued_at)) = rx.recv() {
         let decode_start = Instant::now();
-        let (seq, codec) = match &msg {
-            VideoMsg::TileBatch { frame_seq, .. } => (*frame_seq, VideoCodec::ZstdTiles),
-            VideoMsg::H264Frame { frame_seq, .. } => (*frame_seq, VideoCodec::H264Sw),
-            VideoMsg::EncodedFrame { frame_seq, codec, .. } => (*frame_seq, *codec),
+        let (id, seq, codec, reset) = match &msg {
+            VideoMsg::TileBatch { monitor_id, frame_seq, is_full_refresh, .. } =>
+                (*monitor_id, *frame_seq, VideoCodec::ZstdTiles, *is_full_refresh),
+            VideoMsg::H264Frame { monitor_id, frame_seq, is_keyframe, .. } =>
+                (*monitor_id, *frame_seq, VideoCodec::H264Sw, *is_keyframe),
+            VideoMsg::EncodedFrame { monitor_id, frame_seq, codec, is_keyframe, .. } =>
+                (*monitor_id, *frame_seq, *codec, *is_keyframe),
             VideoMsg::CursorUpdate { .. } => continue,
         };
+        if !monitors.contains_key(&id) {
+            if !reset {
+                continue;
+            }
+            if monitors.len() >= crate::monitor_workspace::MAX_SURFACES {
+                let mut displayed = surfaces.monitors.lock().unwrap();
+                let oldest = monitors.keys().copied()
+                    .min_by_key(|id| displayed.get(id).map_or(0, |frame| frame.seq));
+                if let Some(oldest) = oldest {
+                    displayed.remove(&oldest);
+                    monitors.remove(&oldest);
+                }
+            }
+        }
+        let MonitorDecoder { native, h264, rgba, width: buf_w, height: buf_h } =
+            monitors.entry(id).or_default();
         let mut actual = codec;
         let mut updated = false;
         if let VideoMsg::EncodedFrame { width, height, codec, .. } = &msg
@@ -2047,14 +2101,14 @@ fn run_decode_worker(
         {
             let spec = (*codec, *width, *height);
             if native.as_ref().is_none_or(|active| active.spec != spec) {
-                native = platform_video_decoder(*codec, *width, *height).map(|decoder| NativeDecoder { spec, decoder });
+                *native = platform_video_decoder(*codec, *width, *height).map(|decoder| NativeDecoder { spec, decoder });
             }
             if let Some(Ok(rendered)) = native.as_mut().map(|active| {
-                active.decoder.decode(&msg, &mut rgba_buf, &mut buf_w, &mut buf_h)
+                active.decoder.decode(&msg, rgba, buf_w, buf_h)
             }) {
                 updated = rendered;
             } else {
-                native = None;
+                *native = None;
                 capabilities.remove(*codec);
                 supported.send_replace(capabilities);
             }
@@ -2062,32 +2116,32 @@ fn run_decode_worker(
         if !updated {
             updated = match codec {
                 VideoCodec::ZstdTiles => {
-                    native = None;
-                    ZstdVideo.decode(&msg, &mut rgba_buf, &mut buf_w, &mut buf_h).unwrap_or(false)
+                    *native = None;
+                    ZstdVideo.decode(&msg, rgba, buf_w, buf_h).unwrap_or(false)
                 }
                 VideoCodec::H264Sw | VideoCodec::H264Hw if codec == VideoCodec::H264Sw
                     || !capabilities.includes(VideoCodec::H264Hw) =>
                 {
-                    native = None;
+                    *native = None;
                     actual = VideoCodec::H264Sw;
+                    if h264.is_none() {
+                        *h264 = H264VideoDecoder::new().ok();
+                    }
                     h264.as_mut().is_some_and(|decoder| {
-                        decoder.decode(&msg, &mut rgba_buf, &mut buf_w, &mut buf_h).unwrap_or(false)
+                        decoder.decode(&msg, rgba, buf_w, buf_h).unwrap_or(false)
                     })
                 }
                 _ => false,
             };
         }
 
-        if updated && buf_w > 0 && buf_h > 0 {
+        if updated && *buf_w > 0 && *buf_h > 0 {
             let latency = decode_start.elapsed().as_millis().min(u128::from(u16::MAX)) as u16;
             stats.lock().unwrap().decoded(seq, actual.label(), latency);
             let next_seq = frame_seq.fetch_add(1, Ordering::SeqCst) + 1;
-            *latest_frame.lock().unwrap() = Some(DecodedFrame {
-                seq: next_seq,
-                width: buf_w,
-                height: buf_h,
-                rgba: rgba_buf.clone(),
-            });
+            let frame = Arc::new(DecodedFrame { seq: next_seq, width: *buf_w, height: *buf_h, rgba: rgba.clone() });
+            surfaces.monitors.lock().unwrap().insert(id, frame.clone());
+            *surfaces.latest_frame.lock().unwrap() = Some(frame);
             repaint();
 
             let decode_ms = queued_at.elapsed().as_millis().min(u16::MAX as u128) as u16;

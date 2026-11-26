@@ -121,6 +121,7 @@ pub enum ControlMsg {
     },
     AndroidControls,
     VideoCapabilities(crate::video_pipeline::VideoCapabilities),
+    MonitorWorkspace { enabled: bool },
 }
 
 /// Screen region copied from `(src_x, src_y)` to `(dst_x, dst_y)` before dirty tiles paint.
@@ -234,6 +235,7 @@ pub enum InputMsg {
     ReleaseAllKeys,
     Unicode(char),
     DeviceAction(DeviceAction),
+    MonitorPointer { monitor_id: u8, event: PointerEvent },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -736,6 +738,7 @@ pub enum IpcMsg {
     SystemAudioFailed(String),
     VideoCongestion { viewer: u64, level: u8 },
     VideoDecoderSupport { viewer: u64, capabilities: Option<crate::video_pipeline::VideoCapabilities> },
+    MonitorWorkspace { viewer: u64, enabled: bool },
 }
 
 #[cfg(test)]

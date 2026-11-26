@@ -736,6 +736,9 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                 let _ = hub.to_agent_tx.try_send(IpcMsg::VideoDecoderSupport {
                     viewer: conn_id, capabilities: Some(video_feedback.decoders),
                 });
+                if video_feedback.monitor_workspace {
+                    let _ = hub.to_agent_tx.try_send(IpcMsg::MonitorWorkspace { viewer: conn_id, enabled: true });
+                }
                 let nonce = video_feedback.begin_probe();
                 if let Ok(frame) = pack_message(ChannelId::AuthControl, FLAG_URGENT, &ControlMsg::Ping { timestamp_ms: nonce }, None) {
                     let _ = out_tx.try_send(frame);
@@ -900,6 +903,9 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
     if *mode != SessionMode::FileTransfer {
         let _ = hub.to_agent_tx.send(IpcMsg::VideoDecoderSupport { viewer: conn_id, capabilities: None }).await;
     }
+    if video_feedback.monitor_workspace {
+        let _ = hub.to_agent_tx.send(IpcMsg::MonitorWorkspace { viewer: conn_id, enabled: false }).await;
+    }
     if video_feedback.level > 0 {
         let _ = hub.to_agent_tx.try_send(IpcMsg::VideoCongestion { viewer: conn_id, level: 0 });
     }
@@ -915,6 +921,7 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
 #[derive(Default)]
 struct VideoFeedback {
     decoders: VideoCapabilities,
+    monitor_workspace: bool,
     probe: Option<(u64, Instant)>,
     next_probe: u64,
     rtt: Option<(u64, Instant)>,
@@ -1097,6 +1104,10 @@ async fn dispatch_client_frame(
                     if let Some(level) = video_feedback.acknowledge(last_seq, decode_ms, Instant::now()) {
                         let _ = hub.to_agent_tx.try_send(IpcMsg::VideoCongestion { viewer: conn_id, level });
                     }
+                }
+                ControlMsg::MonitorWorkspace { enabled } if *mode != SessionMode::FileTransfer => {
+                    video_feedback.monitor_workspace = enabled;
+                    let _ = hub.to_agent_tx.send(IpcMsg::MonitorWorkspace { viewer: conn_id, enabled }).await;
                 }
                 ControlMsg::MonitorSelect { monitor_id } if *mode != SessionMode::FileTransfer => {
                     let _ = hub.to_agent_tx.try_send(IpcMsg::MonitorSelect { monitor_id });

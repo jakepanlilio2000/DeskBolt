@@ -379,6 +379,9 @@ impl eframe::App for DeskBoltViewerApp {
         }
 
         self.poll_all_sessions(&ctx);
+        for session in &mut self.sessions {
+            crate::monitor_workspace::show_windows(&ctx, session, self.settings.remote_cursor_sync);
+        }
         self.poll_admin_background(&ctx);
 
         #[cfg(target_os = "android")]
@@ -1411,20 +1414,32 @@ impl DeskBoltViewerApp {
                             .monitors
                             .iter()
                             .find(|m| m.id == s.active_monitor_id)
-                            .map(|m| format!("Display {} ({}x{})", m.id + 1, m.width, m.height))
-                            .unwrap_or_else(|| format!("Display {}", s.active_monitor_id + 1));
+                            .map(|m| format!("Display {} ({}x{})", u16::from(m.id) + 1, m.width, m.height))
+                            .unwrap_or_else(|| format!("Display {}", u16::from(s.active_monitor_id) + 1));
+                        let cur_label = if s.workspace.stitched { "All Screens".into() } else { cur_label };
                         egui::ComboBox::from_id_salt("monitor_select")
                             .selected_text(cur_label)
                             .show_ui(ui, |ui| {
+                                if ui.selectable_label(s.workspace.stitched, "All Screens").clicked() {
+                                    s.workspace.stitched = true;
+                                }
                                 for m in &s.monitors {
-                                    let text = format!("Display {} ({}x{})", m.id + 1, m.width, m.height);
-                                    if ui.selectable_value(&mut s.active_monitor_id, m.id, text).clicked() {
-                                        s.send_cmd(SessionCommand::Control(ControlMsg::MonitorSelect {
-                                            monitor_id: m.id,
-                                        }));
+                                    let text = format!("Display {} ({}x{})", u16::from(m.id) + 1, m.width, m.height);
+                                    if ui.selectable_label(!s.workspace.stitched && s.active_monitor_id == m.id, text).clicked() {
+                                        s.workspace.stitched = false;
+                                        s.active_monitor_id = m.id;
+                                        s.send_cmd(SessionCommand::Control(ControlMsg::MonitorSelect { monitor_id: m.id }));
                                     }
                                 }
                             });
+                        #[cfg(not(target_os = "android"))]
+                        if ui.selectable_label(s.workspace.has_windows(), "Pop Out Displays").clicked() {
+                            if s.workspace.has_windows() {
+                                s.send_cmd(SessionCommand::Input(InputMsg::ReleaseAllKeys));
+                            }
+                            s.workspace.toggle_windows(&s.monitors);
+                        }
+                        s.workspace.synchronize(&s.monitors, &s.cmd_tx);
                     }
                     if s.android_controls && is_full {
                         use deskbolt_proto::DeviceAction;
@@ -1534,7 +1549,11 @@ impl DeskBoltViewerApp {
                 let s = &mut self.sessions[idx];
                 match &s.phase {
                     ConnectionPhase::Connected => {
-                        let latest_opt = s.latest_frame.lock().unwrap().clone();
+                        if s.workspace.stitched {
+                            crate::monitor_workspace::paint_stitched(ui, s, self.settings.remote_cursor_sync);
+                            return;
+                        }
+                        let latest_opt = s.monitor_frames.lock().unwrap().get(&s.active_monitor_id).cloned();
                         let Some(frame) = latest_opt else {
                             ui.centered_and_justified(|ui| {
                                 ui.label("Waiting for host display...");
@@ -1655,7 +1674,8 @@ impl DeskBoltViewerApp {
                                     } else {
                                         None
                                     };
-                                    if s.cursor.paint(ui, display_rect, s.active_monitor_id, &frame, native_size, local)
+                                    if let Some(cursor) = s.cursors.lock().unwrap().get_mut(&s.active_monitor_id)
+                                        && cursor.paint(ui, display_rect, s.active_monitor_id, &frame, native_size, local)
                                         && local.is_some()
                                     {
                                         ui.ctx().set_cursor_icon(egui::CursorIcon::None);

@@ -1,6 +1,7 @@
 pub mod admin_ui;
 pub mod comms_ui;
 mod cursor;
+mod monitor_workspace;
 mod quality_hud;
 pub mod db;
 pub mod hook;
