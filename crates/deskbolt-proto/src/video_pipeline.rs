@@ -218,6 +218,43 @@ pub fn preferred_motion(
         .unwrap_or(VideoCodec::H264Sw)
 }
 
+pub fn platform_video_decoders() -> VideoCapabilities {
+    #[cfg(target_os = "windows")]
+    return crate::mf_video::decoders();
+
+    #[cfg(not(target_os = "windows"))]
+    VideoCapabilities::default()
+}
+
+pub fn platform_video_encoder(
+    codec: VideoCodec,
+    input: VideoInput<'_>,
+) -> Option<Box<dyn VideoEncoder>> {
+    #[cfg(target_os = "windows")]
+    if VideoCodec::HARDWARE.contains(&codec) {
+        return crate::mf_video::Encoder::open(codec, input)
+            .ok()
+            .map(|encoder| Box::new(encoder) as _);
+    }
+    let _ = (codec, input);
+    None
+}
+
+pub fn platform_video_decoder(
+    codec: VideoCodec,
+    width: u16,
+    height: u16,
+) -> Option<Box<dyn VideoDecoder>> {
+    #[cfg(target_os = "windows")]
+    if VideoCodec::HARDWARE.contains(&codec) {
+        return crate::mf_video::Decoder::open(codec, u32::from(width), u32::from(height))
+            .ok()
+            .map(|decoder| Box::new(decoder) as _);
+    }
+    let _ = (codec, width, height);
+    None
+}
+
 /// Coalesces dirty rectangles and slices oversized rects into Zstd level-3 `DirtyTile`s.
 pub fn dirty_rects_to_tiles(
     bgra: &[u8],

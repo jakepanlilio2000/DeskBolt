@@ -15,6 +15,8 @@ pub mod native_clipboard;
 pub mod tls;
 pub mod voice;
 pub mod video_pipeline;
+#[cfg(target_os = "windows")]
+mod mf_video;
 
 pub use auth::{
     ARGON2_M_KIB, ARGON2_P_COST, ARGON2_T_COST, IpRateLimiter, NONCE_LEN, SALT_LEN,

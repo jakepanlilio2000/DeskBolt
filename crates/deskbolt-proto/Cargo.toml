@@ -23,6 +23,9 @@ opus = "0.3"
 audiopus_sys = { version = "0.2.2", features = ["static"] }
 nnnoiseless = { version = "0.5", default-features = false }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true, features = ["Win32_Media_MediaFoundation", "Win32_System_Variant"] }
+
 [target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))'.dependencies]
 arboard = { workspace = true }
 png = "0.18"

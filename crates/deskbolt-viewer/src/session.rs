@@ -1,4 +1,7 @@
-use deskbolt_proto::video_pipeline::{VideoCodec, VideoDecoder, ZstdVideo};
+use deskbolt_proto::video_pipeline::{
+    VideoCapabilities, VideoCodec, VideoDecoder, ZstdVideo, platform_video_decoder,
+    platform_video_decoders,
+};
 use deskbolt_proto::partial_file::{DEFAULT_PART_TTL_HOURS, PartialFile, offer, resume_source};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -805,6 +808,11 @@ async fn run_session_task(
     };
     let notify = |ev: SessionUiEvent| notifier.send(ev);
 
+    let video_decoders = if mode == SessionMode::FileTransfer {
+        VideoCapabilities::default()
+    } else {
+        tokio::task::spawn_blocking(platform_video_decoders).await.unwrap_or_default()
+    };
     let mut expected_pin = pinned_fp_str.as_deref().and_then(|s| parse_fingerprint(s).ok());
     let addr = format!("{host}:{port}");
 
@@ -923,7 +931,7 @@ async fn run_session_task(
                 client_nonce: c_nonce,
                 requested_mode: mode,
                 client_name: std::env::var("COMPUTERNAME").unwrap_or_else(|_| "DeskBoltViewer".into()),
-                video_decoders: Default::default(),
+                video_decoders,
             },
             None,
         ) else {
@@ -1120,8 +1128,9 @@ async fn run_session_task(
     let dec_seq = frame_seq;
     let dec_repaint = repaint.clone();
     let dec_stats = video_stats.clone();
+    let (cap_tx, mut cap_rx) = tokio::sync::watch::channel(video_decoders);
     let dec_handle = thread::spawn(move || {
-        run_decode_worker(vid_rx, dec_latest, dec_seq, ack_tx, dec_repaint, dec_stats);
+        run_decode_worker(vid_rx, dec_latest, dec_seq, ack_tx, dec_repaint, (dec_stats, cap_tx));
     });
 
     let (mut reader, mut writer) = tokio::io::split(tls);
@@ -1179,6 +1188,14 @@ async fn run_session_task(
                 let _ = write_frame_async(&mut writer, frame.channel, frame.flags, &frame.payload).await;
                 notify(SessionUiEvent::SystemAudioActive(false));
                 notify(SessionUiEvent::StatusBanner("The host did not start system audio.".into()));
+            }
+            Ok(()) = cap_rx.changed() => {
+                let capabilities = *cap_rx.borrow_and_update();
+                if let Ok(frame) = pack_message(
+                    ChannelId::AuthControl, FLAG_URGENT, &ControlMsg::VideoCapabilities(capabilities), None,
+                ) && write_frame_async(&mut writer, frame.channel, frame.flags, &frame.payload).await.is_err() {
+                    break 'session;
+                }
             }
             Some(packet) = voice_rx.recv() => {
                 if let Ok(f) = pack_message(ChannelId::Comms, FLAG_NONE, &CommsMsg::VoiceFrame(packet), None) {
@@ -2000,9 +2017,16 @@ fn run_decode_worker(
     frame_seq: Arc<AtomicU64>,
     ack_tx: mpsc::Sender<Frame>,
     repaint: Arc<dyn Fn() + Send + Sync>,
-    stats: SharedVideoStats,
+    video: (SharedVideoStats, tokio::sync::watch::Sender<VideoCapabilities>),
 ) {
+    let (stats, supported) = video;
+    let mut capabilities = *supported.borrow();
     let mut h264 = H264VideoDecoder::new().ok();
+    struct NativeDecoder {
+        spec: (VideoCodec, u16, u16),
+        decoder: Box<dyn VideoDecoder>,
+    }
+    let mut native: Option<NativeDecoder> = None;
     let mut rgba_buf = Vec::new();
     let mut buf_w = 0u32;
     let mut buf_h = 0u32;
@@ -2015,17 +2039,47 @@ fn run_decode_worker(
             VideoMsg::EncodedFrame { frame_seq, codec, .. } => (*frame_seq, *codec),
             VideoMsg::CursorUpdate { .. } => continue,
         };
-        let updated = match codec {
-            VideoCodec::ZstdTiles => ZstdVideo.decode(&msg, &mut rgba_buf, &mut buf_w, &mut buf_h).unwrap_or(false),
-            VideoCodec::H264Sw | VideoCodec::H264Hw => h264.as_mut().is_some_and(|decoder| {
-                decoder.decode(&msg, &mut rgba_buf, &mut buf_w, &mut buf_h).unwrap_or(false)
-            }),
-            VideoCodec::HevcHw | VideoCodec::Av1Hw => false,
-        };
+        let mut actual = codec;
+        let mut updated = false;
+        if let VideoMsg::EncodedFrame { width, height, codec, .. } = &msg
+            && VideoCodec::HARDWARE.contains(codec)
+            && capabilities.includes(*codec)
+        {
+            let spec = (*codec, *width, *height);
+            if native.as_ref().is_none_or(|active| active.spec != spec) {
+                native = platform_video_decoder(*codec, *width, *height).map(|decoder| NativeDecoder { spec, decoder });
+            }
+            if let Some(Ok(rendered)) = native.as_mut().map(|active| {
+                active.decoder.decode(&msg, &mut rgba_buf, &mut buf_w, &mut buf_h)
+            }) {
+                updated = rendered;
+            } else {
+                native = None;
+                capabilities.remove(*codec);
+                supported.send_replace(capabilities);
+            }
+        }
+        if !updated {
+            updated = match codec {
+                VideoCodec::ZstdTiles => {
+                    native = None;
+                    ZstdVideo.decode(&msg, &mut rgba_buf, &mut buf_w, &mut buf_h).unwrap_or(false)
+                }
+                VideoCodec::H264Sw | VideoCodec::H264Hw if codec == VideoCodec::H264Sw
+                    || !capabilities.includes(VideoCodec::H264Hw) =>
+                {
+                    native = None;
+                    actual = VideoCodec::H264Sw;
+                    h264.as_mut().is_some_and(|decoder| {
+                        decoder.decode(&msg, &mut rgba_buf, &mut buf_w, &mut buf_h).unwrap_or(false)
+                    })
+                }
+                _ => false,
+            };
+        }
 
         if updated && buf_w > 0 && buf_h > 0 {
             let latency = decode_start.elapsed().as_millis().min(u128::from(u16::MAX)) as u16;
-            let actual = if codec == VideoCodec::H264Hw { VideoCodec::H264Sw } else { codec };
             stats.lock().unwrap().decoded(seq, actual.label(), latency);
             let next_seq = frame_seq.fetch_add(1, Ordering::SeqCst) + 1;
             *latest_frame.lock().unwrap() = Some(DecodedFrame {

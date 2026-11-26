@@ -4,7 +4,10 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
-use deskbolt_proto::video_pipeline::{VideoCapabilities, VideoEncoder, VideoInput, ZstdVideo};
+use deskbolt_proto::video_pipeline::{
+    VideoCapabilities, VideoCodec, VideoEncoder, VideoInput, ZstdVideo, platform_video_encoder,
+    preferred_motion,
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use deskbolt_proto::{
@@ -523,7 +526,9 @@ fn encode_loop(
     stop: Arc<AtomicBool>,
 ) {
     let mut seq: u64 = 0;
-    let mut h264: Option<H264VideoEncoder> = None;
+    let mut encoder: Option<Box<dyn VideoEncoder>> = None;
+    let mut format = None;
+    let mut viable = VideoCapabilities::default();
     let mut auto_tracker = AutoModeTracker::new();
     let mut sent_motion = false;
     let mut scaled = Vec::new();
@@ -621,12 +626,42 @@ fn encode_loop(
                 (motion.width, motion.height) = scale_motion_frame(input.bgra, input.width, input.height, &mut scaled);
                 motion.bgra = &scaled;
             }
+            let caps = shared.common_decoders();
+            let config = (caps, motion.width, motion.height, motion.fps, motion.bitrate);
+            if format != Some(config) {
+                encoder = None;
+                format = Some(config);
+                viable = caps;
+            }
             let result = (|| {
-                let encoder = match h264.as_mut() {
-                    Some(encoder) => encoder,
-                    None => h264.insert(H264VideoEncoder::new(motion.width, motion.height, bitrate, f32::from(fps))?),
-                };
-                encoder.encode(motion)
+                if encoder.is_none() {
+                    preferred_motion(viable, |codec| {
+                        encoder = platform_video_encoder(codec, motion);
+                        if encoder.is_none() {
+                            viable.remove(codec);
+                        }
+                        encoder.is_some()
+                    });
+                    motion.refresh = true;
+                }
+                if let Some(active) = encoder.as_mut() {
+                    match active.encode(motion) {
+                        Ok(frame) => return Ok(frame),
+                        Err(error) if active.codec() != VideoCodec::H264Sw => {
+                            warn!("Accelerated video unavailable: {error}");
+                            viable.remove(active.codec());
+                            encoder = None;
+                            motion.refresh = true;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                if encoder.is_none() {
+                    encoder = Some(Box::new(H264VideoEncoder::new(
+                        motion.width, motion.height, bitrate, f32::from(fps),
+                    )?));
+                }
+                encoder.as_mut().unwrap().encode(motion)
             })();
             match result {
                 Ok(Some(msg)) => {
@@ -636,10 +671,13 @@ fn encode_loop(
                     sent_motion = true;
                     continue;
                 }
-                Ok(None) => continue,
+                Ok(None) => {
+                    seq -= 1;
+                    continue;
+                }
                 Err(error) => {
                     warn!("Motion encoding failed: {error}");
-                    h264 = None;
+                    encoder = None;
                 }
             }
         }
@@ -655,6 +693,11 @@ fn encode_loop(
 }
 
 impl SharedAgentState {
+    fn common_decoders(&self) -> VideoCapabilities {
+        self.decoder_support.lock().unwrap().values().copied()
+            .reduce(VideoCapabilities::intersect).unwrap_or_default()
+    }
+
     fn congestion_level(&self) -> u8 {
         let mut viewers = self.congestion.lock().unwrap();
         viewers.retain(|_, (_, time)| time.elapsed() < Duration::from_secs(8));
