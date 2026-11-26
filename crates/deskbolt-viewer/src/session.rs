@@ -293,8 +293,12 @@ pub struct ConnectTarget {
     pub pinned_fingerprint: Option<String>,
 }
 
+type SharedVideoStats = Arc<Mutex<crate::quality_hud::VideoQualityStats>>;
+
 /// Live connection handle shared between UI tabs and background Tokio networking.
 pub struct ViewerSession {
+    pub quality_hud: bool,
+    pub video_stats: SharedVideoStats,
     pub id: u64,
     pub title: String,
     pub host: String,
@@ -365,6 +369,8 @@ impl ViewerSession {
         let (ev_tx, ev_rx) = std::sync::mpsc::channel();
         let latest_frame = Arc::new(Mutex::new(None));
         let frame_seq = Arc::new(AtomicU64::new(0));
+        let video_stats = Arc::new(Mutex::new(crate::quality_hud::VideoQualityStats::default()));
+        let task_stats = video_stats.clone();
         let voice_controls = Arc::new(VoiceControls::default());
 
         let mut ft = FileTransferState::new();
@@ -381,11 +387,13 @@ impl ViewerSession {
         let system_audio = system_audio_controls.clone();
 
         runtime.spawn(async move {
-            run_session_task(target_c, cmd_rx, ev_tx_c, lf, frame_seq, (vc_c, system_audio), rp).await;
+            run_session_task(target_c, cmd_rx, ev_tx_c, lf, (frame_seq, task_stats), (vc_c, system_audio), rp).await;
         });
 
         Self {
             id,
+            quality_hud: false,
+            video_stats,
             title: target.title,
             host: target.host,
             port: target.port,
@@ -773,13 +781,14 @@ async fn run_session_task(
     mut cmd_rx: mpsc::Receiver<SessionCommand>,
     ev_tx: std::sync::mpsc::Sender<SessionUiEvent>,
     latest_frame: Arc<Mutex<Option<DecodedFrame>>>,
-    frame_seq: Arc<AtomicU64>,
+    video: (Arc<AtomicU64>, SharedVideoStats),
     audio_controls: (Arc<VoiceControls>, Arc<deskbolt_proto::system_audio::SystemAudioControls>),
     repaint: Arc<dyn Fn() + Send + Sync>,
 ) {
     use deskbolt_proto::system_audio::SystemAudioPlayer;
 
     let (voice_controls, system_audio_controls) = audio_controls;
+    let (frame_seq, video_stats) = video;
     let ConnectTarget {
         host_id,
         title: _,
@@ -1108,8 +1117,9 @@ async fn run_session_task(
     let dec_latest = latest_frame;
     let dec_seq = frame_seq;
     let dec_repaint = repaint.clone();
+    let dec_stats = video_stats.clone();
     let dec_handle = thread::spawn(move || {
-        run_decode_worker(vid_rx, dec_latest, dec_seq, ack_tx, dec_repaint);
+        run_decode_worker(vid_rx, dec_latest, dec_seq, ack_tx, dec_repaint, dec_stats);
     });
 
     let (mut reader, mut writer) = tokio::io::split(tls);
@@ -1462,6 +1472,11 @@ async fn run_session_task(
                 }
             }
             frame_res = frames.read(&mut reader) => {
+                if let Ok(Some(frame)) = &frame_res {
+                    video_stats.lock().unwrap().record_bytes(
+                        frame.payload.len() + deskbolt_proto::frame::HEADER_LEN, Instant::now(),
+                    );
+                }
                 match frame_res {
                     Ok(None) => {
                         notify(SessionUiEvent::PhaseChanged(ConnectionPhase::Disconnected("Host closed connection.".into())));
@@ -1983,6 +1998,7 @@ fn run_decode_worker(
     frame_seq: Arc<AtomicU64>,
     ack_tx: mpsc::Sender<Frame>,
     repaint: Arc<dyn Fn() + Send + Sync>,
+    stats: SharedVideoStats,
 ) {
     let mut h264 = H264VideoDecoder::new().ok();
     let mut rgba_buf = Vec::new();
@@ -1990,10 +2006,11 @@ fn run_decode_worker(
     let mut buf_h = 0u32;
 
     while let Ok((msg, queued_at)) = rx.recv() {
-        let (seq, updated) = match &msg {
+        let decode_start = Instant::now();
+        let (seq, updated, codec) = match &msg {
             VideoMsg::TileBatch { frame_seq: s, .. } => {
                 let ok = apply_tile_batch_rgba(&msg, &mut rgba_buf, &mut buf_w, &mut buf_h).is_ok();
-                (*s, ok)
+                (*s, ok, "Zstd 4:4:4")
             }
             VideoMsg::H264Frame {
                 frame_seq: s,
@@ -2013,15 +2030,17 @@ fn run_decode_worker(
                             &mut buf_h,
                         )
                         .unwrap_or(false);
-                    (*s, produced)
+                    (*s, produced, "H.264 SW")
                 } else {
-                    (*s, false)
+                    (*s, false, "H.264 SW")
                 }
             }
-            VideoMsg::CursorUpdate { .. } => (0, false),
+            VideoMsg::CursorUpdate { .. } => (0, false, ""),
         };
 
         if updated && buf_w > 0 && buf_h > 0 {
+            let latency = decode_start.elapsed().as_millis().min(u128::from(u16::MAX)) as u16;
+            stats.lock().unwrap().decoded(seq, codec, latency);
             let next_seq = frame_seq.fetch_add(1, Ordering::SeqCst) + 1;
             *latest_frame.lock().unwrap() = Some(DecodedFrame {
                 seq: next_seq,

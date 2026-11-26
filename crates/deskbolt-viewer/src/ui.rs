@@ -1389,6 +1389,9 @@ impl DeskBoltViewerApp {
                             }
                         }
                     });
+                    if ui.selectable_label(s.quality_hud, "Quality HUD").clicked() {
+                        s.quality_hud = !s.quality_hud;
+                    }
                     if ui.button("Message").clicked() {
                         s.popup_open = true;
                     }
@@ -1639,6 +1642,13 @@ impl DeskBoltViewerApp {
                                     Color32::WHITE,
                                 );
 
+                                {
+                                    let mut stats = s.video_stats.lock().unwrap();
+                                    stats.record_render(frame.seq, std::time::Instant::now());
+                                    if s.quality_hud {
+                                        stats.paint(ui, display_rect.intersect(ui.clip_rect()), s.last_rtt_ms);
+                                    }
+                                }
                                 if self.settings.remote_cursor_sync {
                                     let local = if s.mode == SessionMode::FullControl && response.hovered() {
                                         ui.input(|input| input.pointer.hover_pos().filter(|_| input.focused))
