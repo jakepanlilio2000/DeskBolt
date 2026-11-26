@@ -237,7 +237,11 @@ jobs:
           exec "${HERE}/usr/bin/deskbolt-viewer" "$@"
           EOF
           chmod 755 "${APPDIR}/AppRun"
-          printf '\211PNG\r\n\032\n\000\000\000\rIHDR\000\000\000\001\000\000\000\001\010\006\000\000\000\037\025\304\211\000\000\000\nIDATx\234c\000\001\000\000\005\000\001\r\n-\264\000\000\000\000IEND\256B`\202' > "${APPDIR}/deskbolt.png"
+          cargo run --locked --manifest-path tools/render-icon/Cargo.toml -- dist/icons
+          install -Dm644 dist/icons/deskbolt-256.png "${APPDIR}/deskbolt.png"
+          for size in 256 512; do
+            install -Dm644 "dist/icons/deskbolt-${size}.png" "${APPDIR}/usr/share/icons/hicolor/${size}x${size}/apps/deskbolt.png"
+          done
           sed -i 's/^Exec=.*/Exec=deskbolt-viewer\nIcon=deskbolt/' "${APPDIR}/deskbolt-viewer.desktop"
           curl -fsSL -o appimagetool "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
           chmod +x appimagetool
