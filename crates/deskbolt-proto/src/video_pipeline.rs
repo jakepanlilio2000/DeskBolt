@@ -228,7 +228,15 @@ pub fn platform_video_decoders() -> VideoCapabilities {
     #[cfg(target_os = "linux")]
     return crate::va_video::decoders();
 
-    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "android")]
+    return crate::android_video::decoders();
+
+    #[cfg(not(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "android"
+    )))]
     VideoCapabilities::default()
 }
 
@@ -251,7 +259,14 @@ pub fn platform_video_encoder(
     #[cfg(target_os = "linux")]
     if VideoCodec::HARDWARE.contains(&codec) {
         return crate::va_video::Encoder::open(codec, input)
-            .ok().map(|encoder| Box::new(encoder) as _);
+            .ok()
+            .map(|encoder| Box::new(encoder) as _);
+    }
+    #[cfg(target_os = "android")]
+    if VideoCodec::HARDWARE.contains(&codec) {
+        return crate::android_video::Encoder::open(codec, input)
+            .ok()
+            .map(|encoder| Box::new(encoder) as _);
     }
     let _ = (codec, input);
     None
@@ -277,10 +292,22 @@ pub fn platform_video_decoder(
     #[cfg(target_os = "linux")]
     if VideoCodec::HARDWARE.contains(&codec) {
         return crate::va_video::Decoder::open(codec, width, height)
-            .ok().map(|decoder| Box::new(decoder) as _);
+            .ok()
+            .map(|decoder| Box::new(decoder) as _);
+    }
+    #[cfg(target_os = "android")]
+    if VideoCodec::HARDWARE.contains(&codec) {
+        return crate::android_video::Decoder::open(codec, width, height)
+            .ok()
+            .map(|decoder| Box::new(decoder) as _);
     }
     let _ = (codec, width, height);
     None
+}
+
+#[cfg(target_os = "android")]
+pub fn register_android_hardware_codecs(codecs: &str) {
+    crate::android_video::register(codecs);
 }
 
 /// Coalesces dirty rectangles and slices oversized rects into Zstd level-3 `DirtyTile`s.

@@ -21,6 +21,10 @@ mod mf_video;
 mod vt_video;
 #[cfg(target_os = "linux")]
 mod va_video;
+#[cfg(target_os = "android")]
+mod android_video;
+#[cfg(any(target_os = "windows", target_os = "android"))]
+mod yuv_video;
 
 pub use auth::{
     ARGON2_M_KIB, ARGON2_P_COST, ARGON2_T_COST, IpRateLimiter, NONCE_LEN, SALT_LEN,

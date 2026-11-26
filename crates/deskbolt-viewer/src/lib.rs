@@ -164,3 +164,18 @@ mod tests {
         assert!(parse_viewer_cli_args(&["--mode".into(), "full".into()]).is_none());
     }
 }
+
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_stacksync_deskbolt_MainActivity_nativeSetVideoCodecs<'caller>(
+    mut env: jni::EnvUnowned<'caller>,
+    _activity: jni::objects::JObject<'caller>,
+    codecs: jni::objects::JString<'caller>,
+) {
+    env.with_env(|_| -> Result<(), jni::errors::Error> {
+        deskbolt_proto::video_pipeline::register_android_hardware_codecs(&codecs.to_string());
+        Ok(())
+    })
+    .resolve::<jni::errors::ThrowRuntimeExAndDefault>();
+}

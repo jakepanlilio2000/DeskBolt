@@ -307,6 +307,19 @@ impl InputInjector for AndroidA11yInjector {
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn Java_com_stacksync_deskbolt_DeskBoltHostBridge_nativeSetVideoCodecs<'caller>(
+    mut env: EnvUnowned<'caller>,
+    _bridge: JObject<'caller>,
+    codecs: JString<'caller>,
+) {
+    env.with_env(|_| -> Result<(), jni::errors::Error> {
+        deskbolt_proto::video_pipeline::register_android_hardware_codecs(&codecs.to_string());
+        Ok(())
+    })
+    .resolve::<jni::errors::ThrowRuntimeExAndDefault>();
+}
+
+#[unsafe(no_mangle)]
 pub extern "system" fn Java_com_stacksync_deskbolt_DeskBoltHostBridge_nativeOnFrameRgba<'caller>(
     mut unowned_env: EnvUnowned<'caller>,
     _class: JClass<'caller>,

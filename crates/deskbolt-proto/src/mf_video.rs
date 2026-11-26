@@ -577,7 +577,15 @@ impl VideoDecoder for Decoder {
         let (stored_w, stored_h) = ((size >> 32) as usize, size as u32 as usize);
         let stride = unsafe { format.GetUINT32(&MF_MT_DEFAULT_STRIDE) }
             .map_or(stored_w, |stride| stride as usize);
-        if !copy_nv12_rgba(&data, w, h, stored_h, stride, rgba) {
+        let surface = crate::yuv_video::Yuv420 {
+            pixels: &data,
+            width: w,
+            height: h,
+            stored_height: stored_h,
+            stride,
+            planar: false,
+        };
+        if !surface.write_rgba(rgba) {
             return Err(ProtoError::Codec(
                 "The accelerated decoder returned an invalid pixel buffer.".into(),
             ));
@@ -585,51 +593,5 @@ impl VideoDecoder for Decoder {
         *width = w as u32;
         *height = h as u32;
         Ok(true)
-    }
-}
-
-fn copy_nv12_rgba(
-    data: &[u8],
-    width: usize,
-    height: usize,
-    stored_height: usize,
-    stride: usize,
-    rgba: &mut Vec<u8>,
-) -> bool {
-    if width > stride || height > stored_height || stored_height > 8192 || stride > 16384 {
-        return false;
-    }
-    let uv = stride * stored_height;
-    if data.len() < uv + stride * height.div_ceil(2) {
-        return false;
-    }
-    rgba.resize(width * height * 4, 255);
-    for (row, pixels) in rgba.chunks_exact_mut(width * 4).enumerate() {
-        for (column, pixel) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-            let y = (i32::from(data[row * stride + column]) - 16).max(0) * 298;
-            let chroma = uv + row / 2 * stride + (column & !1);
-            let u = i32::from(data[chroma]) - 128;
-            let v = i32::from(data[chroma + 1]) - 128;
-            let byte = |value: i32| ((value + 128) >> 8).clamp(0, 255) as u8;
-            pixel.copy_from_slice(&[
-                byte(y + 409 * v),
-                byte(y - 100 * u - 208 * v),
-                byte(y + 516 * u),
-                255,
-            ]);
-        }
-    }
-    true
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn nv12_conversion_honors_stride_and_rejects_a_truncated_surface() {
-        let source = [235, 16, 0, 0, 16, 235, 0, 0, 128, 128, 0, 0];
-        let mut rgba = Vec::new();
-        assert!(super::copy_nv12_rgba(&source, 2, 2, 2, 4, &mut rgba));
-        assert_eq!(&rgba[..8], &[255, 255, 255, 255, 0, 0, 0, 255]);
-        assert!(!super::copy_nv12_rgba(&source[..9], 2, 2, 2, 4, &mut rgba));
     }
 }

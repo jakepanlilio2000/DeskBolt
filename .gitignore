@@ -112,6 +112,7 @@ config.toml
 
 # Android Gradle, NDK & Signing Keys
 /android/.gradle/
+/android/.kotlin/
 /android/build/
 /android/app/build/
 /android/.cxx/

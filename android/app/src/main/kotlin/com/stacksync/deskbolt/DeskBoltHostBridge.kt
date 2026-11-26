@@ -27,7 +27,10 @@ object DeskBoltHostBridge {
     var refreshClipboard: (() -> Unit)? = null
     init {
         System.loadLibrary("deskbolt_server_lib")
+        nativeSetVideoCodecs(DeskBoltVideoCodecs.hardwareBuffers())
     }
+
+    private external fun nativeSetVideoCodecs(codecs: String)
 
     external fun nativeOnFrameRgba(rgba: ByteArray, width: Int, height: Int)
     external fun nativeOnClipboardText(text: String, html: String?)
