@@ -11,7 +11,7 @@ makedepends=('rust' 'cargo' 'clang' 'nasm' 'pipewire')
 
 build() {
   cd "${startdir}/../.."
-  cargo build --release --workspace --locked
+  cargo build --release --workspace --no-default-features --locked
 }
 
 package() {
