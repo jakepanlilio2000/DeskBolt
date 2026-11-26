@@ -1,0 +1,14 @@
+[Unit]
+Description=DeskBolt Remote Host
+After=network-online.target graphical.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/deskbolt-server --service
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

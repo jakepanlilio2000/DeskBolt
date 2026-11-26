@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=DeskBolt Viewer
+Comment=Self-hosted native remote desktop viewer and file transfer client
+Exec=/usr/bin/deskbolt-viewer
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=remote;desktop;ssh;terminal;sftp;
+StartupNotify=true
