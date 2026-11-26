@@ -1,0 +1,23 @@
+[package]
+name = "deskbolt-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+openh264 = { workspace = true }
+zstd = { workspace = true }
+rcgen = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+argon2 = { workspace = true }
+ring = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+cpal = { workspace = true }
+
+[lints]
+workspace = true
