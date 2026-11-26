@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "graphify": {
+      "command": "python",
+      "args": ["-m", "graphify.serve", "graphify-out/graph.json"]
+    },
+    "headroom": {
+      "command": "headroom",
+      "args": ["mcp", "serve"],
+      "env": { "HEADROOM_OFFLINE": "1" }
+    },
+    "deskbolt-dev": {
+      "command": "./target/debug/deskbolt-viewer",
+      "args": ["--mcp"]
+    }
+  }
+}

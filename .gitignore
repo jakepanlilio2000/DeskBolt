@@ -47,6 +47,8 @@ core.*
 /.ponytail/
 /.agents/
 /.agent/
+/.antigravity/*
+!/.antigravity/mcp_config.json
 /.claude/
 /.cursor/
 /.windsurf/
