@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0-beta2"
+version = "0.1.0-beta3"
 edition = "2024"
 license = "MPL-2.0"
 authors = ["StackSync Solutions <jakepanlilio2000>"]
