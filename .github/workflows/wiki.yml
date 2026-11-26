@@ -1,0 +1,63 @@
+name: DeskBolt Wiki
+
+on:
+  push:
+    branches: [main, master]
+  workflow_run:
+    workflows: [DeskBolt Release Pipeline]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: deskbolt-wiki
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: >-
+      (github.event_name != 'push' || github.ref_name == github.event.repository.default_branch) &&
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    env:
+      HEADROOM_OFFLINE: "1"
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Find the latest published release
+        id: release
+        run: |
+          tag=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq 'map(select(.draft == false and .published_at != null)) | sort_by(.published_at) | last | .tag_name // empty')
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify wiki rendering
+        run: python3 -m unittest discover -s scripts -p test_render_wiki.py
+
+      - name: Publish wiki pages
+        if: steps.release.outputs.tag != ''
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          wiki="$RUNNER_TEMP/wiki"
+          gh auth setup-git --hostname github.com
+          git clone "$url.wiki.git" "$wiki"
+          python3 scripts/render_wiki.py --tag "$RELEASE_TAG" --url "$url" --output "$wiki"
+          git -C "$wiki" add -- Home.md Setup-and-Controls.md Release-History.md
+          if git -C "$wiki" diff --cached --quiet; then
+            echo "Wiki is up to date."
+            exit 0
+          fi
+          git -C "$wiki" -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -m 'docs(wiki): sync DeskBolt setup and release history'
+          git -C "$wiki" push origin HEAD
