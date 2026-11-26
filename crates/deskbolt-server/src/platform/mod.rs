@@ -255,6 +255,9 @@ pub fn prompt_connection_confirmation(
 }
 
 pub(crate) mod display_mode;
+pub(crate) mod local_input_lock;
+#[cfg(target_os = "windows")]
+mod windows_curtain;
 
 pub fn set_curtain_mode(enabled: bool) -> Result<(), String> {
     imp::set_curtain_mode(enabled)

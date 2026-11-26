@@ -338,6 +338,8 @@ pub struct ViewerSession {
     pub(crate) cursors: MonitorCursors,
     pub(crate) workspace: crate::monitor_workspace::Workspace,
     pub(crate) window_match: crate::monitor_workspace::WindowMatch,
+    pub(crate) privacy_curtain: bool,
+    pub(crate) local_input_lock: bool,
     pub file_transfer: FileTransferState,
     pub quick_edit: Option<QuickEditBuffer>,
     pub log_tail: Option<LogTailBuffer>,
@@ -436,6 +438,8 @@ impl ViewerSession {
             cursors: Arc::default(),
             workspace: crate::monitor_workspace::Workspace::default(),
             window_match: crate::monitor_workspace::WindowMatch::default(),
+            privacy_curtain: false,
+            local_input_lock: false,
             file_transfer: ft,
             quick_edit: None,
             log_tail: None,
@@ -526,6 +530,8 @@ impl ViewerSession {
                         self.monitor_frames.lock().unwrap().clear();
                         self.workspace = crate::monitor_workspace::Workspace::default();
                         self.window_match = crate::monitor_workspace::WindowMatch::default();
+                        self.privacy_curtain = false;
+                        self.local_input_lock = false;
                     }
                     if matches!(p, ConnectionPhase::Connected) {
                         if let Some(device) = self.system_audio_on_connect.take() {
@@ -550,6 +556,8 @@ impl ViewerSession {
                     self.mode = m;
                     if m != SessionMode::FullControl {
                         self.window_match.refused();
+                        self.privacy_curtain = false;
+                        self.local_input_lock = false;
                     }
                 }
                 SessionUiEvent::PinAccepted { host_id, fingerprint } => {
@@ -572,6 +580,13 @@ impl ViewerSession {
                 SessionUiEvent::DesktopAction { action, accepted, message } => {
                     if !accepted && matches!(action, deskbolt_proto::SpecialAction::SetDisplayMode { .. }) {
                         self.window_match.refused();
+                    }
+                    if accepted {
+                        match action {
+                            deskbolt_proto::SpecialAction::PrivacyCurtain { enabled } => self.privacy_curtain = enabled,
+                            deskbolt_proto::SpecialAction::LockLocalInput { enabled } => self.local_input_lock = enabled,
+                            _ => {}
+                        }
                     }
                     self.status_banner = message;
                 }

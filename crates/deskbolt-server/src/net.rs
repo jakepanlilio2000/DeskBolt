@@ -24,8 +24,6 @@ use tracing::{info, warn};
 use crate::config::{ServerConfig, ServerPolicy, evaluate_ip_access, log_audit_event};
 use crate::files::FileSessionHandler;
 use crate::ipc::{AgentHub, ViewerActivity};
-#[cfg(target_os = "windows")]
-use crate::platform::set_curtain_mode;
 use crate::platform::{execute_power_action, prompt_connection_confirmation, show_desktop_popup, trigger_send_sas};
 use crate::sysadmin::{SysAdminHandler, execute_broadcast_command};
 use crate::terminal::TerminalSessionHandler;
@@ -301,7 +299,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             .try_send(IpcMsg::SetCaptureCursor(policy.capture_cursor));
         let _ = hub.to_agent_tx.try_send(IpcMsg::SetClipboardLimit(policy.clipboard_max_bytes as u32));
         if mode == SessionMode::FullControl && policy.curtain_on_control && policy.os_prompts_enabled() {
-            let _ = hub.to_agent_tx.send(IpcMsg::SetCurtainMode(true)).await;
+            let _ = hub.to_agent_tx.send(IpcMsg::PolicyCurtain { viewer: conn_id, enabled: true }).await;
         }
     }
 
@@ -325,9 +323,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         if mode == SessionMode::FullControl {
             let _ = hub.to_agent_tx.try_send(IpcMsg::Input(InputMsg::ReleaseAllKeys));
             if policy.curtain_on_control && policy.os_prompts_enabled() {
-                let _ = hub.to_agent_tx.send(IpcMsg::SetCurtainMode(false)).await;
-                #[cfg(target_os = "windows")]
-                let _ = set_curtain_mode(false);
+                let _ = hub.to_agent_tx.send(IpcMsg::PolicyCurtain { viewer: conn_id, enabled: false }).await;
             }
         }
         let _ = hub.viewer_wake_tx.send(ViewerActivity::Disconnected);
@@ -1150,7 +1146,7 @@ async fn dispatch_client_frame(
                         if *mode == SessionMode::FullControl && next_mode == SessionMode::ViewOnly {
                             let _ = hub.to_agent_tx.try_send(IpcMsg::Input(InputMsg::ReleaseAllKeys));
                             if policy.curtain_on_control && policy.os_prompts_enabled() {
-                                let _ = hub.to_agent_tx.send(IpcMsg::SetCurtainMode(false)).await;
+                                let _ = hub.to_agent_tx.send(IpcMsg::PolicyCurtain { viewer: conn_id, enabled: false }).await;
                             }
                             if video_feedback.desktop_settings_used {
                                 let _ = hub.to_agent_tx.send(IpcMsg::ReleaseDesktopSettings(conn_id)).await;
@@ -1167,7 +1163,7 @@ async fn dispatch_client_frame(
                                     return Ok(());
                                 }
                                 if policy.curtain_on_control && policy.os_prompts_enabled() {
-                                    let _ = hub.to_agent_tx.send(IpcMsg::SetCurtainMode(true)).await;
+                                    let _ = hub.to_agent_tx.send(IpcMsg::PolicyCurtain { viewer: conn_id, enabled: true }).await;
                                 }
                                 *mode = next_mode;
                             } else if let Ok(err) = pack_message(
@@ -1231,10 +1227,17 @@ async fn dispatch_client_frame(
                         SpecialAction::ReleaseAllKeys => {
                             let _ = hub.to_agent_tx.try_send(IpcMsg::Input(InputMsg::ReleaseAllKeys));
                         }
-                        SpecialAction::SetDisplayMode { .. } | SpecialAction::RestoreDisplayMode => {
-                            let permission = policy.permissions.display_mode && policy.os_prompts_enabled();
-                            let failure = if !permission {
-                                Some("Changing display modes is disabled by the host.")
+                        SpecialAction::SetDisplayMode { .. } | SpecialAction::RestoreDisplayMode
+                            | SpecialAction::PrivacyCurtain { .. } | SpecialAction::LockLocalInput { .. } => {
+                            let (permission, denial) = match action {
+                                SpecialAction::PrivacyCurtain { .. } =>
+                                    (policy.permissions.privacy_curtain, "The privacy curtain is disabled by the host."),
+                                SpecialAction::LockLocalInput { .. } =>
+                                    (policy.permissions.local_input_lock, "Locking local input is disabled by the host."),
+                                _ => (policy.permissions.display_mode, "Changing display modes is disabled by the host."),
+                            };
+                            let failure = if !permission || !policy.os_prompts_enabled() {
+                                Some(denial)
                             } else if hub.to_agent_tx.try_send(IpcMsg::DesktopAction { viewer: conn_id, action }).is_err() {
                                 Some("The host desktop is temporarily unavailable.")
                             } else {

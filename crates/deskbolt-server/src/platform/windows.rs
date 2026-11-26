@@ -621,23 +621,7 @@ fn enable_shutdown_privilege() -> Result<(), String> {
 }
 
 pub fn set_curtain_mode(enabled: bool) -> Result<(), String> {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        HWND_BROADCAST, SC_MONITORPOWER, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SYSCOMMAND,
-    };
-    let power_state: isize = if enabled { 2 } else { -1 };
-    let mut unused = 0usize;
-    unsafe {
-        let _ = SendMessageTimeoutW(
-            HWND_BROADCAST,
-            WM_SYSCOMMAND,
-            WPARAM(SC_MONITORPOWER as usize),
-            LPARAM(power_state),
-            SMTO_ABORTIFHUNG,
-            250,
-            Some(&mut unused),
-        );
-    }
-    Ok(())
+    super::windows_curtain::set(enabled)
 }
 
 pub fn set_os_autostart(enabled: bool) -> Result<(), String> {

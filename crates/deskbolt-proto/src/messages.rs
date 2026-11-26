@@ -47,6 +47,8 @@ pub enum SpecialAction {
     ReleaseAllKeys,
     SetDisplayMode { monitor_id: u8, width: u16, height: u16, refresh_hz: u16 },
     RestoreDisplayMode,
+    PrivacyCurtain { enabled: bool },
+    LockLocalInput { enabled: bool },
 }
 
 /// Channel `0x01` authentication, session lifecycle, and control messages.
@@ -725,7 +727,7 @@ pub enum IpcMsg {
     KeyframeRequest {
         monitor_id: u8,
     },
-    SetCurtainMode(bool),
+    PolicyCurtain { viewer: u64, enabled: bool },
     SetCaptureCursor(bool),
     ShowPopup {
         title: String,
@@ -754,6 +756,8 @@ mod tests {
         for action in [
             SpecialAction::SetDisplayMode { monitor_id: 4, width: 1600, height: 900, refresh_hz: 60 },
             SpecialAction::RestoreDisplayMode,
+            SpecialAction::PrivacyCurtain { enabled: true },
+            SpecialAction::LockLocalInput { enabled: false },
         ] {
             let message = ControlMsg::SpecialAction(action);
             let frame = pack_message(ChannelId::AuthControl, FLAG_NONE, &message, None).unwrap();

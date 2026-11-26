@@ -6,6 +6,7 @@ mod win32_util;
 pub mod agent;
 pub mod config;
 mod display_modes;
+mod privacy;
 pub mod files;
 pub mod ipc;
 #[cfg(all(feature = "dev-mcp", not(target_os = "android")))]

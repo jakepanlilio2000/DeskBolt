@@ -229,6 +229,8 @@ impl eframe::App for ServerSettingsApp {
                         ui.checkbox(&mut self.cfg.permissions.voice_chat, "Allow Bidirectional Voice Chat");
                         ui.checkbox(&mut self.cfg.permissions.system_audio, "Allow System Audio Forwarding");
                         ui.checkbox(&mut self.cfg.permissions.display_mode, "Allow Temporary Display Mode Changes");
+                        ui.checkbox(&mut self.cfg.permissions.privacy_curtain, "Allow Viewer to Blank the Host Screen");
+                        ui.checkbox(&mut self.cfg.permissions.local_input_lock, "Allow Viewer to Lock Local Input");
                         ui.checkbox(&mut self.cfg.permissions.send_message, "Allow Remote Desktop Popup Messages");
                         ui.checkbox(&mut self.cfg.permissions.tunnels, "Allow Encrypted Port Tunnels");
                     }

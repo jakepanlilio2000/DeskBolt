@@ -1403,6 +1403,16 @@ impl DeskBoltViewerApp {
                     }
                     ui.separator();
                     ui.add_enabled_ui(is_full, |ui| {
+                        if ui.selectable_label(s.privacy_curtain, "Blank Remote Screen").clicked() {
+                            s.send_cmd(SessionCommand::Control(ControlMsg::SpecialAction(
+                                SpecialAction::PrivacyCurtain { enabled: !s.privacy_curtain },
+                            )));
+                        }
+                        if ui.selectable_label(s.local_input_lock, "Lock Remote Keyboard & Mouse").clicked() {
+                            s.send_cmd(SessionCommand::Control(ControlMsg::SpecialAction(
+                                SpecialAction::LockLocalInput { enabled: !s.local_input_lock },
+                            )));
+                        }
                         if ui.button("Send Ctrl+Alt+Del").clicked() {
                             s.send_cmd(SessionCommand::Control(ControlMsg::SpecialAction(
                                 SpecialAction::SendCtrlAltDel,

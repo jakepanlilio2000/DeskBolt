@@ -182,7 +182,7 @@ fn run_agent_workers(
         cv: Condvar::new(),
     });
 
-    let (input_tx, input_rx) = std::sync::mpsc::channel::<InputMsg>();
+    let (input_tx, input_rx) = std::sync::mpsc::channel::<InputCommand>();
     #[cfg(not(target_os = "android"))]
     let (clip_tx, clip_rx) = std::sync::mpsc::channel();
 
@@ -200,7 +200,8 @@ fn run_agent_workers(
 
     let inp_stop = stop.clone();
     let inp_shared = shared.clone();
-    let inp_handle = thread::spawn(move || input_loop(inp_shared, input_rx, inp_stop));
+    let input_events = ev_tx.clone();
+    let inp_handle = thread::spawn(move || input_loop(inp_shared, input_rx, inp_stop, input_events));
 
     #[cfg(not(target_os = "android"))]
     let clip_handle = {
@@ -211,6 +212,7 @@ fn run_agent_workers(
 
     let mut audio_viewers = std::collections::HashSet::new();
     let mut workspace_viewers = HashSet::new();
+    let mut curtain = crate::privacy::CurtainState::default();
     let display_backend = crate::display_modes::Native;
     let mut display = crate::display_modes::DisplayController::new(crate::display_modes::recovery_path());
     if let Err(error) = display.recover(&display_backend) {
@@ -220,7 +222,7 @@ fn run_agent_workers(
     while let Some(cmd) = cmd_rx.blocking_recv() {
         match cmd {
             IpcMsg::Input(inp) => {
-                let _ = input_tx.send(inp);
+                let _ = input_tx.send(InputCommand::Remote(inp));
             }
             #[cfg(not(target_os = "android"))]
             clip @ (IpcMsg::Clipboard(_) | IpcMsg::SetClipboardLimit(_)) => {
@@ -251,16 +253,36 @@ fn run_agent_workers(
                     }
                     SpecialAction::RestoreDisplayMode => display.release(&display_backend, viewer)
                         .map(|()| "Host display mode restored.".into()),
+                    SpecialAction::PrivacyCurtain { enabled } => curtain.manually(viewer, enabled, platform::set_curtain_mode)
+                        .map(|blanked| if enabled { "Remote screen blanked.".into() } else if blanked {
+                            "Host policy keeps the remote screen blank.".into()
+                        } else { "Remote screen restored.".into() }),
+                    SpecialAction::LockLocalInput { enabled } => {
+                        let (reply, result) = std::sync::mpsc::sync_channel(1);
+                        if input_tx.send(InputCommand::Lock { viewer, enabled, reply: Some(reply) }).is_err() {
+                            Err("The host input service is unavailable.".into())
+                        } else {
+                            result.recv_timeout(Duration::from_secs(3))
+                                .unwrap_or_else(|_| Err("The host input service did not respond.".into()))
+                                .map(|()| if enabled { "Remote keyboard and mouse locked.".into() } else {
+                                    "Remote keyboard and mouse unlocked.".into()
+                                })
+                        }
+                    }
                     _ => Err("The desktop action is unavailable.".into()),
                 };
                 let accepted = result.is_ok();
-                if accepted {
+                if accepted && matches!(action, SpecialAction::SetDisplayMode { .. } | SpecialAction::RestoreDisplayMode) {
                     shared.capture_reinit.store(true, Ordering::Release);
                 }
                 let message = result.unwrap_or_else(|error| error);
                 let _ = ev_tx.blocking_send(IpcMsg::DesktopActionResult { viewer, action, accepted, message });
             }
             IpcMsg::ReleaseDesktopSettings(viewer) => {
+                let _ = input_tx.send(InputCommand::Lock { viewer, enabled: false, reply: None });
+                if let Err(error) = curtain.release(viewer, platform::set_curtain_mode) {
+                    warn!("Could not restore screen visibility: {error}");
+                }
                 match display.disconnected(&display_backend, viewer) {
                     Ok(true) => shared.capture_reinit.store(true, Ordering::Release),
                     Ok(false) => {}
@@ -299,8 +321,8 @@ fn run_agent_workers(
             IpcMsg::KeyframeRequest { .. } => {
                 shared.force_keyframe.store(true, Ordering::SeqCst);
             }
-            IpcMsg::SetCurtainMode(enabled) => {
-                if let Err(error) = platform::set_curtain_mode(enabled) {
+            IpcMsg::PolicyCurtain { viewer, enabled } => {
+                if let Err(error) = curtain.policy(viewer, enabled, platform::set_curtain_mode) {
                     warn!("Could not change screen blanking: {error}");
                 }
             }
@@ -346,6 +368,7 @@ fn run_agent_workers(
         }
     }
 
+    let _ = platform::set_curtain_mode(false);
     if let Err(error) = display.shutdown(&display_backend) {
         warn!("Could not restore display mode: {error}");
     }
@@ -951,21 +974,64 @@ pub fn map_norm_to_virtual_desktop(
     (wx, wy)
 }
 
+enum InputCommand {
+    Remote(InputMsg),
+    Lock {
+        viewer: u64,
+        enabled: bool,
+        reply: Option<std::sync::mpsc::SyncSender<Result<(), String>>>,
+    },
+}
+
 fn input_loop(
     shared: Arc<SharedAgentState>,
-    rx: std::sync::mpsc::Receiver<InputMsg>,
+    rx: std::sync::mpsc::Receiver<InputCommand>,
     stop: Arc<AtomicBool>,
+    events: mpsc::Sender<IpcMsg>,
 ) {
+    use crate::platform::local_input_lock::LocalInputLock;
+    use deskbolt_proto::SpecialAction;
+
     let mut injector = platform::create_injector();
     injector.sync_desktop();
+    let mut lock: Option<(u64, LocalInputLock)> = None;
 
     while !stop.load(Ordering::SeqCst) {
-        let Ok(msg) = rx.recv() else {
-            break;
-        };
-        if shared.desktop_switched.swap(false, Ordering::SeqCst) {
+        let switched = shared.desktop_switched.swap(false, Ordering::SeqCst);
+        if switched {
             injector.sync_desktop();
         }
+        let lost = lock.as_mut().and_then(|(_, state)| {
+            if switched {
+                Some("Local input was unlocked when the desktop changed.".into())
+            } else {
+                state.maintain().err()
+            }
+        });
+        if let Some(message) = lost && let Some((viewer, _)) = lock.take() {
+            let _ = events.try_send(IpcMsg::DesktopActionResult {
+                viewer, action: SpecialAction::LockLocalInput { enabled: false }, accepted: true, message,
+            });
+        }
+        let msg = match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(InputCommand::Remote(msg)) => msg,
+            Ok(InputCommand::Lock { viewer, enabled, reply }) => {
+                let result = match lock.as_ref() {
+                    Some((owner, _)) if *owner != viewer => Err("Another viewer holds the local input lock.".into()),
+                    Some(_) if !enabled => { lock.take(); Ok(()) }
+                    None if enabled => LocalInputLock::acquire().map(|state| { lock = Some((viewer, state)); }),
+                    _ => Ok(()),
+                };
+                if let Some(reply) = reply && reply.send(result).is_err() && enabled
+                    && lock.as_ref().is_some_and(|(owner, _)| *owner == viewer)
+                {
+                    lock.take();
+                }
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         match msg {
             InputMsg::Pointer(ev) => {
                 let mon_id = *shared.active_monitor.lock().unwrap();
@@ -1000,6 +1066,7 @@ fn input_loop(
             InputMsg::DeviceAction(action) => injector.device_action(action),
         }
     }
+    drop(lock);
     injector.release_all_keys();
 }
 
