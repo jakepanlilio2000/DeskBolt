@@ -136,10 +136,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libxcb1-dev libxrandr-dev libdbus-1-dev libpipewire-0.3-dev \
-            libwayland-dev libegl-dev libxkbcommon-dev libxkbcommon-x11-dev \
-            libxcb-shape0-dev libxcb-xfixes0-dev libasound2-dev libclang-dev clang nasm \
-            rpm zstd file desktop-file-utils
+            libxcb1-dev libxcb-randr0-dev libxcb-render0-dev libxcb-shm0-dev \
+            libx11-dev libxrandr-dev libdbus-1-dev libpipewire-0.3-dev \
+            libwayland-dev libegl-dev libdrm-dev libgbm-dev libfontconfig1-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libasound2-dev libclang-dev clang nasm pkg-config \
+            rpm zstd file desktop-file-utils squashfs-tools
           rustup update stable
           cargo install cargo-deb cargo-generate-rpm
           cargo build --release --workspace --locked
@@ -255,9 +257,6 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - uses: android-actions/setup-android@v3
-        if: matrix.platform == 'android'
-
       - uses: gradle/actions/setup-gradle@v4
         if: matrix.platform == 'android'
         with:
@@ -267,8 +266,24 @@ jobs:
         if: matrix.platform == 'android'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends nasm clang
-          sdkmanager "ndk;27.2.12479018" "platforms;android-35" "build-tools;35.0.0"
+          sudo apt-get install -y --no-install-recommends nasm clang unzip
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          export ANDROID_SDK_ROOT="${ANDROID_HOME}"
+          sudo chown -R "$USER:$USER" "${ANDROID_HOME}" || true
+          SDKMGR="$(find "${ANDROID_HOME}/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -n 1)"
+          if [ -z "${SDKMGR}" ]; then
+            curl -fsSL -o cmdline-tools.zip "https://dl.android.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+            mkdir -p "${ANDROID_HOME}/cmdline-tools/latest"
+            unzip -q cmdline-tools.zip -d "${ANDROID_HOME}/cmdline-tools/tmp"
+            mv "${ANDROID_HOME}/cmdline-tools/tmp/cmdline-tools/"* "${ANDROID_HOME}/cmdline-tools/latest/"
+            rm -rf cmdline-tools.zip "${ANDROID_HOME}/cmdline-tools/tmp"
+            SDKMGR="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
+          fi
+          chmod +x "${SDKMGR}"
+          { yes || true; } | "${SDKMGR}" --sdk_root="${ANDROID_HOME}" --licenses
+          "${SDKMGR}" --sdk_root="${ANDROID_HOME}" --install "ndk;27.2.12479018" "platforms;android-35" "build-tools;35.0.0"
+          echo "ANDROID_HOME=${ANDROID_HOME}" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=${ANDROID_HOME}" >> "$GITHUB_ENV"
           export ANDROID_NDK_HOME="${ANDROID_HOME}/ndk/27.2.12479018"
           rustup target add aarch64-linux-android x86_64-linux-android
           cargo install cargo-ndk
