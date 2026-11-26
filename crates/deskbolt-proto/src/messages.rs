@@ -369,6 +369,8 @@ pub enum FileTransferMsg {
         total_bytes: u64,
         modified_unix: i64,
         overwrite: bool,
+        resume_offset: u64,
+        prefix_sha256: Option<[u8; 32]>,
     },
     TransferStartAck {
         transfer_id: u64,
@@ -376,6 +378,8 @@ pub enum FileTransferMsg {
         exists: bool,
         existing_size: u64,
         existing_modified_unix: i64,
+        resume_offset: u64,
+        prefix_sha256: Option<[u8; 32]>,
         error: Option<String>,
     },
     FileChunk {

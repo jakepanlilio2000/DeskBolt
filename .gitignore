@@ -165,4 +165,6 @@ skills-lock.json
 # ==============================================================================
 *.log
 *.part
+*.part.meta
+*.part.meta.*.tmp
 *.deskbolt-part

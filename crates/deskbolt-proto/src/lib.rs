@@ -5,6 +5,7 @@ pub mod error;
 pub mod frame;
 pub mod hash_tree;
 pub mod messages;
+pub mod partial_file;
 #[cfg(not(target_os = "android"))]
 pub mod native_clipboard;
 pub mod tls;

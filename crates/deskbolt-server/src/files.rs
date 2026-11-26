@@ -4,9 +4,10 @@ use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use deskbolt_proto::{DESKTOP_UPLOAD_PREFIX, DriveEntry, FileEntry, FileTransferMsg, TransferDir, valid_drop_filename};
-use ring::digest::{Context, SHA256};
-use tokio::fs::{self, File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use ring::digest::Context;
+use deskbolt_proto::partial_file::{DEFAULT_PART_TTL_HOURS, PartialFile};
+use tokio::fs::{self, File};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 #[cfg(target_os = "windows")]
 use windows::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetLogicalDrives, GetVolumeInformationW};
 #[cfg(target_os = "windows")]
@@ -59,15 +60,6 @@ pub fn validate_remote_path(raw: &str) -> Result<PathBuf, String> {
     Ok(p.to_path_buf())
 }
 
-struct ActiveUpload {
-    part_path: PathBuf,
-    final_path: PathBuf,
-    file: File,
-    hasher: Context,
-    bytes_written: u64,
-    expected_bytes: u64,
-}
-
 struct ActiveDownload {
     path: PathBuf,
     transfer_id: u64,
@@ -82,7 +74,8 @@ struct ActiveDownload {
 
 /// Stateful per-session handler for Channel `0x05` FileTransfer operations.
 pub struct FileSessionHandler {
-    uploads: HashMap<u64, ActiveUpload>,
+    part_ttl_hours: u64,
+    uploads: HashMap<u64, PartialFile>,
     downloads: HashMap<u64, ActiveDownload>,
 }
 
@@ -94,7 +87,12 @@ impl Default for FileSessionHandler {
 
 impl FileSessionHandler {
     pub fn new() -> Self {
+        Self::with_part_ttl(DEFAULT_PART_TTL_HOURS)
+    }
+
+    pub fn with_part_ttl(part_ttl_hours: u64) -> Self {
         Self {
+            part_ttl_hours,
             uploads: HashMap::new(),
             downloads: HashMap::new(),
         }
@@ -132,7 +130,9 @@ impl FileSessionHandler {
                 total_bytes,
                 modified_unix: _,
                 overwrite,
-            } => self.handle_transfer_start(transfer_id, direction, &remote_path, total_bytes, overwrite).await,
+                resume_offset,
+                prefix_sha256,
+            } => self.handle_transfer_start(transfer_id, direction, &remote_path, total_bytes, overwrite, (resume_offset, prefix_sha256)).await,
             FileTransferMsg::FileChunk {
                 transfer_id,
                 offset,
@@ -225,12 +225,9 @@ impl FileSessionHandler {
         out
     }
 
-    /// Cleans up partial `.part` files when a session disconnects mid-transfer.
-    pub async fn cleanup_all(&mut self) {
-        let upload_ids: Vec<u64> = self.uploads.keys().copied().collect();
-        for id in upload_ids {
-            self.abort_transfer(id).await;
-        }
+    /// Close active handles and retain checkpoints for a subsequent connection.
+    pub fn cleanup_all(&mut self) {
+        self.uploads.clear();
         self.downloads.clear();
     }
 
@@ -241,7 +238,15 @@ impl FileSessionHandler {
         remote_path: &str,
         total_bytes: u64,
         overwrite: bool,
+        resume: (u64, Option<[u8; 32]>),
     ) -> Vec<FileTransferMsg> {
+        if self.uploads.contains_key(&transfer_id) || self.downloads.contains_key(&transfer_id) {
+            return vec![FileTransferMsg::TransferStartAck {
+                transfer_id, accepted: false, exists: false, existing_size: 0,
+                existing_modified_unix: 0, resume_offset: 0, prefix_sha256: None,
+                error: Some("Transfer ID is already active.".into()),
+            }];
+        }
         let validated = match transfer_path(direction, remote_path) {
             Ok(p) => p,
             Err(e) => {
@@ -251,6 +256,8 @@ impl FileSessionHandler {
                     exists: false,
                     existing_size: 0,
                     existing_modified_unix: 0,
+                    resume_offset: 0,
+                    prefix_sha256: None,
                     error: Some(e),
                 }];
             }
@@ -273,6 +280,8 @@ impl FileSessionHandler {
                         exists: true,
                         existing_size: meta.len(),
                         existing_modified_unix: mtime,
+                        resume_offset: 0,
+                        prefix_sha256: None,
                         error: None,
                     }];
                 }
@@ -285,35 +294,28 @@ impl FileSessionHandler {
                         exists: false,
                         existing_size: 0,
                         existing_modified_unix: 0,
+                        resume_offset: 0,
+                        prefix_sha256: None,
                         error: Some(format!("create parent directory failed: {e}")),
                     }];
                 }
-                let part_path = part_path_for(&validated, transfer_id);
-                match OpenOptions::new()
-                    .create(true)
-                    .truncate(true)
-                    .write(true)
-                    .open(&part_path)
-                    .await
-                {
-                    Ok(file) => {
-                        self.uploads.insert(
-                            transfer_id,
-                            ActiveUpload {
-                                part_path,
-                                final_path: validated,
-                                file,
-                                hasher: Context::new(&SHA256),
-                                bytes_written: 0,
-                                expected_bytes: total_bytes,
-                            },
-                        );
+                match PartialFile::open(&validated, total_bytes, self.part_ttl_hours).await {
+                    Ok(mut part) => {
+                        if resume != (0, None) && resume != (part.offset(), part.prefix())
+                            && let Err(error) = part.restart().await
+                        {
+                            return vec![FileTransferMsg::FileAbort { transfer_id, reason: error.to_string() }];
+                        }
+                        let (resume_offset, prefix_sha256) = (part.offset(), part.prefix());
+                        self.uploads.insert(transfer_id, part);
                         vec![FileTransferMsg::TransferStartAck {
                             transfer_id,
                             accepted: true,
                             exists: false,
                             existing_size: 0,
                             existing_modified_unix: 0,
+                            resume_offset,
+                            prefix_sha256,
                             error: None,
                         }]
                     }
@@ -323,6 +325,8 @@ impl FileSessionHandler {
                         exists: false,
                         existing_size: 0,
                         existing_modified_unix: 0,
+                        resume_offset: 0,
+                        prefix_sha256: None,
                         error: Some(format!("open target failed: {e}")),
                     }],
                 }
@@ -337,6 +341,8 @@ impl FileSessionHandler {
                             exists: true,
                             existing_size: 0,
                             existing_modified_unix: 0,
+                            resume_offset: 0,
+                            prefix_sha256: None,
                             error: Some("requested path is not a file".into()),
                         }];
                     }
@@ -347,13 +353,22 @@ impl FileSessionHandler {
                             exists: false,
                             existing_size: 0,
                             existing_modified_unix: 0,
+                            resume_offset: 0,
+                            prefix_sha256: None,
                             error: Some(format!("stat failed: {e}")),
                         }];
                     }
                 };
                 match File::open(&validated).await {
-                    Ok(file) => {
+                    Ok(mut file) => {
                         let size = meta.len();
+                        let (resume_offset, prefix_sha256, hasher) =
+                            match deskbolt_proto::partial_file::resume_source(
+                                &mut file, if total_bytes == 0 || total_bytes == size { resume } else { (0, None) }, size,
+                            ).await {
+                                Ok(result) => result,
+                                Err(error) => return vec![FileTransferMsg::FileAbort { transfer_id, reason: error.to_string() }],
+                            };
                         let mtime = meta
                             .modified()
                             .ok()
@@ -366,8 +381,8 @@ impl FileSessionHandler {
                                 path: validated,
                                 transfer_id,
                                 file,
-                                hasher: Context::new(&SHA256),
-                                bytes_sent: 0,
+                                hasher,
+                                bytes_sent: resume_offset,
                                 total_bytes: size,
                                 next_seq: 0,
                                 acked_seq: 0,
@@ -380,6 +395,8 @@ impl FileSessionHandler {
                             exists: true,
                             existing_size: size,
                             existing_modified_unix: mtime,
+                            resume_offset,
+                            prefix_sha256,
                             error: None,
                         }];
                         out.extend(self.poll_downloads().await);
@@ -391,6 +408,8 @@ impl FileSessionHandler {
                         exists: true,
                         existing_size: 0,
                         existing_modified_unix: 0,
+                        resume_offset: 0,
+                        prefix_sha256: None,
                         error: Some(format!("open failed: {e}")),
                     }],
                 }
@@ -411,22 +430,10 @@ impl FileSessionHandler {
                 reason: "unknown upload transfer id".into(),
             }];
         };
-        if offset != up.bytes_written || data.len() > FILE_CHUNK_SIZE {
+        if let Err(error) = up.append(offset, data).await {
             self.abort_transfer(transfer_id).await;
-            return vec![FileTransferMsg::FileAbort {
-                transfer_id,
-                reason: "out-of-order or oversized chunk".into(),
-            }];
+            return vec![FileTransferMsg::FileAbort { transfer_id, reason: error.to_string() }];
         }
-        if let Err(e) = up.file.write_all(data).await {
-            self.abort_transfer(transfer_id).await;
-            return vec![FileTransferMsg::FileAbort {
-                transfer_id,
-                reason: format!("write failed: {e}"),
-            }];
-        }
-        up.hasher.update(data);
-        up.bytes_written += data.len() as u64;
         vec![FileTransferMsg::FileAck {
             transfer_id,
             acked_seq: chunk_seq,
@@ -447,58 +454,16 @@ impl FileSessionHandler {
         total_bytes: u64,
         expected_sha256: [u8; 32],
     ) -> FileTransferMsg {
-        let Some(mut up) = self.uploads.remove(&transfer_id) else {
-            return FileTransferMsg::FileVerifyResult {
-                transfer_id,
-                verified: false,
-                error: Some("unknown transfer id".into()),
-            };
+        let result = match self.uploads.remove(&transfer_id) {
+            Some(upload) => upload.finish(total_bytes, expected_sha256).await.map_err(|error| error.to_string()),
+            None => Err("Unknown transfer ID.".into()),
         };
-
-        if let Err(e) = up.file.flush().await {
-            drop(up.file);
-            let _ = fs::remove_file(&up.part_path).await;
-            return FileTransferMsg::FileVerifyResult {
-                transfer_id,
-                verified: false,
-                error: Some(format!("flush failed: {e}")),
-            };
-        }
-        drop(up.file);
-
-        let actual = up.hasher.finish();
-        if up.bytes_written != total_bytes
-            || up.bytes_written != up.expected_bytes
-            || actual.as_ref() != expected_sha256
-        {
-            let _ = fs::remove_file(&up.part_path).await;
-            return FileTransferMsg::FileVerifyResult {
-                transfer_id,
-                verified: false,
-                error: Some("SHA-256 checksum or byte count mismatch".into()),
-            };
-        }
-
-        if let Err(e) = fs::rename(&up.part_path, &up.final_path).await {
-            let _ = fs::remove_file(&up.part_path).await;
-            return FileTransferMsg::FileVerifyResult {
-                transfer_id,
-                verified: false,
-                error: Some(format!("finalize file rename failed: {e}")),
-            };
-        }
-
-        FileTransferMsg::FileVerifyResult {
-            transfer_id,
-            verified: true,
-            error: None,
-        }
+        FileTransferMsg::FileVerifyResult { transfer_id, verified: result.is_ok(), error: result.err() }
     }
 
     async fn abort_transfer(&mut self, transfer_id: u64) {
         if let Some(up) = self.uploads.remove(&transfer_id) {
-            drop(up.file);
-            let _ = fs::remove_file(&up.part_path).await;
+            up.discard().await;
         }
         self.downloads.remove(&transfer_id);
     }
@@ -515,14 +480,6 @@ fn transfer_path(direction: TransferDir, raw: &str) -> Result<PathBuf, String> {
         return validate_remote_path(&desktop.join(name).to_string_lossy());
     }
     validate_remote_path(raw)
-}
-
-fn part_path_for(target: &Path, transfer_id: u64) -> PathBuf {
-    let name = target
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file".to_string());
-    target.with_file_name(format!(".{name}.{transfer_id}.part"))
 }
 
 #[cfg(target_os = "windows")]
@@ -871,6 +828,8 @@ mod tests {
                 total_bytes: data.len() as u64,
                 modified_unix: 0,
                 overwrite: true,
+                resume_offset: 0,
+                prefix_sha256: None,
             })
             .await;
         assert!(matches!(r1[0], FileTransferMsg::TransferStartAck { accepted: true, .. }));
@@ -905,6 +864,8 @@ mod tests {
                 total_bytes: data.len() as u64,
                 modified_unix: 0,
                 overwrite: true,
+                resume_offset: 0,
+                prefix_sha256: None,
             })
             .await;
         let _ = handler
@@ -924,7 +885,8 @@ mod tests {
             .await;
         assert!(matches!(r_bad[0], FileTransferMsg::FileVerifyResult { verified: false, .. }));
         assert!(!bad_target.exists());
-        assert!(!part_path_for(&bad_target, 2).exists());
+        assert!(!root.join("bad.bin.part").exists());
+        assert!(!root.join("bad.bin.part.meta").exists());
 
         let _ = fs::remove_dir_all(&root).await;
     }
@@ -986,8 +948,8 @@ mod tests {
             other => panic!("unexpected tail resp: {other:?}"),
         };
 
-        let mut f = OpenOptions::new().append(true).open(&log_path).await.unwrap();
-        f.write_all(b"line2\n").await.unwrap();
+        let mut f = tokio::fs::OpenOptions::new().append(true).open(&log_path).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut f, b"line2\n").await.unwrap();
         drop(f);
 
         let t2 = handler

@@ -1,3 +1,4 @@
+use deskbolt_proto::partial_file::{DEFAULT_PART_TTL_HOURS, PartialFile, offer, resume_source};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -16,8 +17,10 @@ use deskbolt_proto::{
     derive_auth_key, format_fingerprint, pack_message, parse_fingerprint, random_bytes,
     read_frame_async, unpack_message, verify_server_proof, write_frame_async,
 };
-use ring::digest::{Context, SHA256};
-use tokio::fs::{self, File, OpenOptions};
+use ring::digest::Context;
+#[cfg(test)]
+use ring::digest::SHA256;
+use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -1929,6 +1932,13 @@ fn run_decode_worker(
     }
 }
 
+async fn download_offer(path: &Path, size: u64) -> (u64, Option<[u8; 32]>, u64) {
+    match offer(path, DEFAULT_PART_TTL_HOURS).await {
+        Some((offset, hash, expected)) if size == 0 || size == expected => (offset, Some(hash), expected),
+        _ => (0, None, size),
+    }
+}
+
 struct HashScan {
     root: String,
     page_size: u32,
@@ -1949,11 +1959,7 @@ struct ActiveUploadJob {
 }
 
 struct ActiveDownloadJob {
-    part_path: PathBuf,
-    final_path: PathBuf,
-    file: File,
-    hasher: Context,
-    bytes_written: u64,
+    part: PartialFile,
     started_at: Instant,
 }
 
@@ -1962,6 +1968,7 @@ struct FileClientQueue {
     uploads: HashMap<u64, ActiveUploadJob>,
     downloads: HashMap<u64, ActiveDownloadJob>,
     pending_overwrites: VecDeque<OverwritePrompt>,
+    restarted_uploads: std::collections::HashSet<u64>,
 }
 
 impl FileClientQueue {
@@ -1971,6 +1978,7 @@ impl FileClientQueue {
             uploads: HashMap::new(),
             downloads: HashMap::new(),
             pending_overwrites: VecDeque::new(),
+            restarted_uploads: std::collections::HashSet::new(),
         }
     }
 
@@ -2043,6 +2051,8 @@ impl FileClientQueue {
             total_bytes: total,
             modified_unix: mtime,
             overwrite: policy == OverwritePolicy::OverwriteAll,
+            resume_offset: 0,
+            prefix_sha256: None,
         })
     }
 
@@ -2104,6 +2114,7 @@ impl FileClientQueue {
             }
         }
         self.emit_progress(notify);
+        let (resume_offset, prefix_sha256, total_bytes) = download_offer(&local_path, total_bytes).await;
         Some(FileTransferMsg::TransferStart {
             transfer_id: id,
             direction: TransferDir::Download,
@@ -2111,6 +2122,8 @@ impl FileClientQueue {
             total_bytes,
             modified_unix: 0,
             overwrite: true,
+            resume_offset,
+            prefix_sha256,
         })
     }
 
@@ -2130,13 +2143,18 @@ impl FileClientQueue {
             return None;
         }
         item.status = TransferItemStatus::Queued;
+        let (resume_offset, prefix_sha256, total_bytes) = if item.direction == TransferDir::Download {
+            download_offer(&item.local_path, item.total_bytes).await
+        } else { (0, None, item.total_bytes) };
         let msg = FileTransferMsg::TransferStart {
             transfer_id,
             direction: item.direction,
             remote_path: item.remote_path.clone(),
-            total_bytes: item.total_bytes,
+            total_bytes,
             modified_unix: 0,
             overwrite: true,
+            resume_offset,
+            prefix_sha256,
         };
         self.emit_progress(notify);
         Some(msg)
@@ -2145,8 +2163,7 @@ impl FileClientQueue {
     async fn cancel(&mut self, transfer_id: u64, notify: &UiNotifier) -> Option<FileTransferMsg> {
         self.uploads.remove(&transfer_id);
         if let Some(dl) = self.downloads.remove(&transfer_id) {
-            drop(dl.file);
-            let _ = fs::remove_file(&dl.part_path).await;
+            dl.part.discard().await;
         }
         if let Some(it) = self.items.iter_mut().find(|i| i.id == transfer_id) {
             it.status = TransferItemStatus::Failed("Cancelled".into());
@@ -2245,60 +2262,66 @@ impl FileClientQueue {
                 accepted,
                 exists,
                 existing_size,
+                resume_offset,
+                prefix_sha256,
                 error,
                 ..
             } => {
                 if let Some(it) = self.items.iter_mut().find(|i| i.id == transfer_id) {
                     if accepted {
-                        match it.direction {
+                        let result = match it.direction {
                             TransferDir::Upload => {
-                                if let Ok(file) = File::open(&it.local_path).await {
+                                async {
+                                    let mut file = File::open(&it.local_path).await?;
+                                    let (offset, prefix, hasher) = resume_source(
+                                        &mut file, (resume_offset, prefix_sha256), it.total_bytes,
+                                    ).await?;
+                                    if (offset, prefix) != (resume_offset, prefix_sha256) {
+                                        if self.restarted_uploads.insert(transfer_id) {
+                                            replies.push(FileTransferMsg::FileAbort {
+                                                transfer_id, reason: "Upload prefix changed.".into(),
+                                            });
+                                            replies.push(FileTransferMsg::TransferStart {
+                                                transfer_id, direction: TransferDir::Upload,
+                                                remote_path: it.remote_path.clone(), total_bytes: it.total_bytes,
+                                                modified_unix: 0, overwrite: policy == OverwritePolicy::OverwriteAll,
+                                                resume_offset: 0, prefix_sha256: None,
+                                            });
+                                            return Ok(());
+                                        }
+                                        return Err(std::io::Error::other("Host rejected a fresh upload."));
+                                    }
+                                    it.bytes_done = offset;
                                     it.status = TransferItemStatus::Transferring;
-                                    self.uploads.insert(
-                                        transfer_id,
-                                        ActiveUploadJob {
-                                            path: it.local_path.clone(),
-                                            file,
-                                            hasher: Context::new(&SHA256),
-                                            bytes_sent: 0,
-                                            next_seq: 0,
-                                            acked_seq: 0,
-                                            completed_sent: false,
-                                            started_at: Instant::now(),
-                                        },
-                                    );
-                                }
+                                    self.uploads.insert(transfer_id, ActiveUploadJob {
+                                        path: it.local_path.clone(), file, hasher, bytes_sent: offset,
+                                        next_seq: 0, acked_seq: 0, completed_sent: false, started_at: Instant::now(),
+                                    });
+                                    Ok(())
+                                }.await
                             }
                             TransferDir::Download => {
-                                if let Some(parent) = it.local_path.parent() {
-                                    let _ = fs::create_dir_all(parent).await;
-                                }
-                                let part_path = it.local_path.with_file_name(format!(
-                                    ".{}.{}.part",
-                                    it.file_name, transfer_id
-                                ));
-                                if let Ok(file) = OpenOptions::new()
-                                    .create(true)
-                                    .truncate(true)
-                                    .write(true)
-                                    .open(&part_path)
-                                    .await
-                                {
+                                async {
+                                    if let Some(parent) = it.local_path.parent() {
+                                        fs::create_dir_all(parent).await?;
+                                    }
+                                    let mut part = PartialFile::open(&it.local_path, existing_size, DEFAULT_PART_TTL_HOURS).await?;
+                                    if resume_offset == 0 && prefix_sha256.is_none() {
+                                        if part.offset() != 0 { part.restart().await?; }
+                                    } else if (resume_offset, prefix_sha256) != (part.offset(), part.prefix()) {
+                                        return Err(std::io::Error::other("Local partial file changed. Retry the download."));
+                                    }
                                     it.total_bytes = existing_size;
+                                    it.bytes_done = part.offset();
                                     it.status = TransferItemStatus::Transferring;
-                                    self.downloads.insert(
-                                        transfer_id,
-                                        ActiveDownloadJob {
-                                            part_path,
-                                            final_path: it.local_path.clone(),
-                                            file,
-                                            hasher: Context::new(&SHA256),
-                                            bytes_written: 0,
-                                            started_at: Instant::now(),
-                                        },
-                                    );
-                                }
+                                    self.downloads.insert(transfer_id, ActiveDownloadJob { part, started_at: Instant::now() });
+                                    Ok(())
+                                }.await
                             }
+                        };
+                        if let Err(error) = result {
+                            it.status = TransferItemStatus::Failed(error.to_string());
+                            replies.push(FileTransferMsg::FileAbort { transfer_id, reason: error.to_string() });
                         }
                     } else if exists && it.direction == TransferDir::Upload {
                         match policy {
@@ -2341,13 +2364,12 @@ impl FileClientQueue {
                 data,
             } => {
                 if let Some(dl) = self.downloads.get_mut(&transfer_id) {
-                    if offset == dl.bytes_written && dl.file.write_all(&data).await.is_ok() {
-                        dl.hasher.update(&data);
-                        dl.bytes_written += data.len() as u64;
+                    if dl.part.append(offset, &data).await.is_ok() {
+                        let bytes_written = dl.part.offset();
                         let elapsed = dl.started_at.elapsed().as_secs_f64().max(0.01);
-                        let bps = (dl.bytes_written as f64 / elapsed) as u64;
+                        let bps = (bytes_written as f64 / elapsed) as u64;
                         if let Some(it) = self.items.iter_mut().find(|i| i.id == transfer_id) {
-                            it.bytes_done = dl.bytes_written;
+                            it.bytes_done = bytes_written;
                             it.speed_bps = bps;
                             it.status = TransferItemStatus::Transferring;
                         }
@@ -2370,16 +2392,8 @@ impl FileClientQueue {
                 total_bytes,
                 sha256,
             } => {
-                if let Some(mut dl) = self.downloads.remove(&transfer_id) {
-                    let _ = dl.file.flush().await;
-                    drop(dl.file);
-                    let digest = dl.hasher.finish();
-                    let ok = dl.bytes_written == total_bytes
-                        && digest.as_ref() == sha256
-                        && fs::rename(&dl.part_path, &dl.final_path).await.is_ok();
-                    if !ok {
-                        let _ = fs::remove_file(&dl.part_path).await;
-                    }
+                if let Some(dl) = self.downloads.remove(&transfer_id) {
+                    let ok = dl.part.finish(total_bytes, sha256).await.is_ok();
                     if let Some(it) = self.items.iter_mut().find(|i| i.id == transfer_id) {
                         it.status = if ok {
                             TransferItemStatus::Verified
@@ -2418,8 +2432,7 @@ impl FileClientQueue {
             } => {
                 self.uploads.remove(&transfer_id);
                 if let Some(dl) = self.downloads.remove(&transfer_id) {
-                    drop(dl.file);
-                    let _ = fs::remove_file(&dl.part_path).await;
+                    dl.part.discard().await;
                 }
                 if let Some(it) = self.items.iter_mut().find(|i| i.id == transfer_id) {
                     it.status = TransferItemStatus::Failed(reason);
@@ -2769,6 +2782,7 @@ mod tests {
 
             // Serve upload + download FileTransfer loop until Disconnect
             let mut uploaded = Vec::new();
+            let mut bad_offer = true;
             let mut dl_data: Option<Vec<u8>> = None;
             let mut dl_off = 0usize;
             let mut dl_seq = 0u32;
@@ -2798,12 +2812,15 @@ mod tests {
                                     exists: false,
                                     existing_size: 0,
                                     existing_modified_unix: 0,
+                                    resume_offset: if bad_offer { FILE_CHUNK_SIZE as u64 } else { 0 },
+                                    prefix_sha256: bad_offer.then_some([0; 32]),
                                     error: None,
                                 },
                                 None,
                             )
                             .unwrap();
                             write_frame_async(&mut tls, ack.channel, ack.flags, &ack.payload).await.unwrap();
+                            bad_offer = false;
                         }
                         FileTransferMsg::FileChunk { transfer_id, chunk_seq, data, .. } => {
                             uploaded.extend_from_slice(&data);
@@ -2842,11 +2859,15 @@ mod tests {
                         FileTransferMsg::TransferStart {
                             transfer_id,
                             direction: TransferDir::Download,
+                            resume_offset,
+                            prefix_sha256,
                             ..
                         } => {
                             dl_id = transfer_id;
                             dl_data = Some(uploaded.clone());
-                            dl_off = 0;
+                            assert_eq!(resume_offset, FILE_CHUNK_SIZE as u64);
+                            dl_off = resume_offset as usize;
+                            assert_eq!(prefix_sha256.unwrap(), ring::digest::digest(&SHA256, &uploaded[..dl_off]).as_ref());
                             dl_seq = 0;
                             let ack = pack_message(
                                 ChannelId::FileTransfer,
@@ -2857,13 +2878,15 @@ mod tests {
                                     exists: true,
                                     existing_size: uploaded.len() as u64,
                                     existing_modified_unix: 0,
+                                    resume_offset,
+                                    prefix_sha256,
                                     error: None,
                                 },
                                 None,
                             )
                             .unwrap();
                             write_frame_async(&mut tls, ack.channel, ack.flags, &ack.payload).await.unwrap();
-                            let first = &uploaded[..uploaded.len().min(FILE_CHUNK_SIZE)];
+                            let first = &uploaded[dl_off..uploaded.len().min(dl_off + FILE_CHUNK_SIZE)];
                             dl_off += first.len();
                             dl_seq += 1;
                             let cf = pack_message(
@@ -2871,7 +2894,7 @@ mod tests {
                                 FLAG_NONE,
                                 &FileTransferMsg::FileChunk {
                                     transfer_id,
-                                    offset: 0,
+                                    offset: resume_offset,
                                     chunk_seq: dl_seq,
                                     data: first.to_vec(),
                                 },
@@ -2981,6 +3004,9 @@ mod tests {
         let src_path = dir.join("upload.bin");
         let dl_path = dir.join("download.bin");
         std::fs::write(&src_path, &payload).unwrap();
+        let mut partial = PartialFile::open(&dl_path, payload.len() as u64, DEFAULT_PART_TTL_HOURS).await.unwrap();
+        partial.append(0, &payload[..FILE_CHUNK_SIZE]).await.unwrap();
+        drop(partial);
 
         sess.send_cmd(SessionCommand::QueueUpload {
             local_path: src_path,

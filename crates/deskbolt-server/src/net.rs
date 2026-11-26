@@ -635,7 +635,7 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
     let mut frames = AsyncFrameReader::default();
     let mut agent_rx = hub.from_agent_tx.subscribe();
     let mut chat_rx = chat_tx.subscribe();
-    let mut file_handler = FileSessionHandler::new();
+    let mut file_handler = FileSessionHandler::with_part_ttl(policy.part_ttl_hours);
     let (term_tx, mut term_rx) = mpsc::channel::<TerminalMsg>(64);
     let mut term_handler = TerminalSessionHandler::new(term_tx);
     let (tun_tx, mut tun_rx) = mpsc::channel::<TunnelMsg>(128);
@@ -823,7 +823,7 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
     drop(voice_engine);
     term_handler.cleanup_all();
     tun_handler.cleanup_all().await;
-    file_handler.cleanup_all().await;
+    file_handler.cleanup_all();
     drop(out_tx);
     let _ = writer_task.await;
     result
@@ -1069,7 +1069,8 @@ async fn dispatch_client_frame(
                 if let Ok(FileTransferMsg::TransferStart { transfer_id, .. }) = unpack_message(&frame) {
                     let reply = FileTransferMsg::TransferStartAck {
                         transfer_id, accepted: false, exists: false, existing_size: 0,
-                        existing_modified_unix: 0, error: Some(message.into()),
+                        existing_modified_unix: 0, resume_offset: 0, prefix_sha256: None,
+                        error: Some(message.into()),
                     };
                     if let Ok(f) = pack_message(ChannelId::FileTransfer, FLAG_NONE, &reply, None) {
                         let _ = out_tx.send(f).await;
@@ -1717,6 +1718,8 @@ mod tests {
                 total_bytes: payload.len() as u64,
                 modified_unix: 0,
                 overwrite: true,
+                resume_offset: 0,
+                prefix_sha256: None,
             },
             None,
         )
@@ -1732,7 +1735,20 @@ mod tests {
 
         let mut offset = 0usize;
         for (idx, chunk) in payload.chunks(64 * 1024).enumerate() {
-            let seq = (idx + 1) as u32;
+            if idx == 1 {
+                use tokio::io::AsyncWriteExt as _;
+                tls.shutdown().await.unwrap();
+                while read_frame_async(&mut tls).await.is_ok_and(|frame| frame.is_some()) {}
+                drop(tls);
+                (tls, _) = test_auth_connect(addr, id.fingerprint, b"ServerPass#4", SessionMode::FileTransfer).await;
+                write_frame_async(&mut tls, start.channel, start.flags, &start.payload).await.unwrap();
+                let ack = read_frame_async(&mut tls).await.unwrap().unwrap();
+                let expected = ring::digest::digest(&SHA256, &payload[..offset]);
+                assert!(matches!(unpack_message::<FileTransferMsg>(&ack).unwrap(),
+                    FileTransferMsg::TransferStartAck { accepted: true, resume_offset, prefix_sha256: Some(hash), .. }
+                    if resume_offset == offset as u64 && hash == expected.as_ref()));
+            }
+            let seq = idx.max(1) as u32;
             let cf = deskbolt_proto::frame::pack_file_message(
                 &deskbolt_proto::FileTransferMsg::FileChunk {
                     transfer_id: 1,
@@ -1775,6 +1791,8 @@ mod tests {
         ));
 
         // Download same file back through serve_listener
+        let resume = 64 * 1024;
+        let prefix = ring::digest::digest(&SHA256, &payload[..resume]);
         let dl_start = pack_message(
             ChannelId::FileTransfer,
             FLAG_NONE,
@@ -1782,9 +1800,11 @@ mod tests {
                 transfer_id: 2,
                 direction: TransferDir::Download,
                 remote_path,
-                total_bytes: 0,
+                total_bytes: payload.len() as u64,
                 modified_unix: 0,
                 overwrite: true,
+                resume_offset: resume as u64,
+                prefix_sha256: Some(prefix.as_ref().try_into().unwrap()),
             },
             None,
         )
@@ -1795,10 +1815,10 @@ mod tests {
         let dl_ack = read_frame_async(&mut tls).await.unwrap().unwrap();
         assert!(matches!(
             unpack_message::<deskbolt_proto::FileTransferMsg>(&dl_ack).unwrap(),
-            deskbolt_proto::FileTransferMsg::TransferStartAck { accepted: true, .. }
+            deskbolt_proto::FileTransferMsg::TransferStartAck { accepted: true, resume_offset, .. } if resume_offset == resume as u64
         ));
 
-        let mut downloaded = Vec::new();
+        let mut downloaded = payload[..resume].to_vec();
         loop {
             let f = read_frame_async(&mut tls).await.unwrap().unwrap();
             match unpack_message::<deskbolt_proto::FileTransferMsg>(&f).unwrap() {
@@ -1881,9 +1901,28 @@ mod tests {
         assert_eq!(seen.len(), 15_043);
         assert!(seen.contains(&format!("{}included.txt", "d/".repeat(40))));
 
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let fallback = pack_message(ChannelId::FileTransfer, FLAG_NONE, &FileTransferMsg::TransferStart {
+            transfer_id: 3,
+            direction: TransferDir::Download,
+            remote_path: temp_dir.join("payload.TXT").to_string_lossy().into_owned(),
+            total_bytes: payload.len() as u64,
+            modified_unix: 0,
+            overwrite: false,
+            resume_offset: resume as u64,
+            prefix_sha256: Some([0; 32]),
+        }, None).unwrap();
+        write_frame_async(&mut tls, fallback.channel, fallback.flags, &fallback.payload).await.unwrap();
+        let ack = read_frame_async(&mut tls).await.unwrap().unwrap();
+        assert!(matches!(unpack_message::<FileTransferMsg>(&ack).unwrap(),
+            FileTransferMsg::TransferStartAck { accepted: true, resume_offset: 0, prefix_sha256: None, .. }));
+        let first = read_frame_async(&mut tls).await.unwrap().unwrap();
+        assert!(matches!(unpack_message::<FileTransferMsg>(&first).unwrap(),
+            FileTransferMsg::FileChunk { offset: 0, .. }));
+
+        drop(tls);
         let _ = shutdown_tx.send(true);
         let _ = server_task.await;
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     async fn test_auth_connect(

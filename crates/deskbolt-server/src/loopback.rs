@@ -487,6 +487,8 @@ async fn check_files() -> Check {
                 total_bytes: data.len() as u64,
                 modified_unix: 0,
                 overwrite: true,
+                resume_offset: 0,
+                prefix_sha256: None,
             },
         )
         .await?;

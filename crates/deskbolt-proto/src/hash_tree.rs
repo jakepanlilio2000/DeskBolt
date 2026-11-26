@@ -9,7 +9,7 @@ use ring::digest::{Context, SHA256};
 use crate::SyncEntry;
 
 pub const HASH_PAGE_SIZE: u32 = 512;
-pub const DEFAULT_EXCLUDE_GLOBS: &str = "node_modules/\n.git/\ntarget/\n*.tmp";
+pub const DEFAULT_EXCLUDE_GLOBS: &str = "node_modules/\n.git/\ntarget/\n*.tmp\n*.part\n*.part.meta";
 
 pub fn safe_relative_path(path: &str) -> bool {
     path.split('/').all(crate::valid_drop_filename)
@@ -53,7 +53,8 @@ fn scan(
         let parts = relative.split('/').collect::<Vec<_>>();
         let before_cursor = cursor.as_ref().is_some_and(|last| parts <= *last);
         if let Some(last) = &cursor
-            && before_cursor && !last.starts_with(&parts)
+            && before_cursor
+            && !last.starts_with(&parts)
         {
             continue;
         }
@@ -81,7 +82,9 @@ fn scan(
                 rel_path: relative.clone(),
                 is_dir: kind.is_dir(),
                 size: if kind.is_file() { metadata.len() } else { 0 },
-                modified_unix: metadata.modified().ok()
+                modified_unix: metadata
+                    .modified()
+                    .ok()
                     .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
                     .map_or(0, |duration| duration.as_secs() as i64),
                 sha256,
@@ -95,12 +98,19 @@ fn scan(
 }
 
 fn children(dir: &Path, prefix: &str) -> Result<Vec<(String, std::path::PathBuf)>, String> {
-    let mut items = fs::read_dir(dir).map_err(|e| e.to_string())?
+    let mut items = fs::read_dir(dir)
+        .map_err(|e| e.to_string())?
         .map(|entry| {
             let entry = entry.map_err(|e| e.to_string())?;
-            let name = entry.file_name().into_string()
+            let name = entry
+                .file_name()
+                .into_string()
                 .map_err(|_| "A file name cannot be represented on the wire.")?;
-            let relative = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+            let relative = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
             Ok((relative, entry.path()))
         })
         .collect::<Result<Vec<_>, String>>()?;
