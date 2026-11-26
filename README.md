@@ -18,7 +18,7 @@ Self-hosted remote desktop, file transfer, and system administration for Windows
 
 ## Core Capabilities
 
-- **Remote desktop.** Control a remote computer, view its screen, or open a file-only session. Switch monitors and synchronize the clipboard over a direct, encrypted connection.
+- **Remote desktop.** Control a remote computer, view its screen, or open a file-only session. Switch monitors and synchronize the clipboard over a direct, encrypted connection. Supported devices accelerate motion video and fall back to bundled codecs when needed. Open **Quality HUD** in the session toolbar to see latency, render rate, codec, bandwidth, decode time, and recent frame drops.
 - **Terminal access.** Open an interactive host shell, connect to SSH and serial devices, reuse command snippets, and run a command on multiple saved hosts.
 - **Files and logs.** Browse and transfer files, resume interrupted copies, compare directories with exclusion rules, edit remote text files, and follow live logs. Transfers use SHA-256 verification.
 - **Network and system administration.** Forward TCP ports, troubleshoot connectivity, and inspect remote systems, processes, and services.
