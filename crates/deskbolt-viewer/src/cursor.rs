@@ -29,8 +29,8 @@ impl CursorOverlay {
         self.screen_position = (visible && correct_shape).then_some((monitor_id, x, y));
     }
 
-    pub fn paint(&mut self, ui: &Ui, display: Rect, monitor_id: u8, frame: &crate::session::DecodedFrame, local_pointer: Option<Pos2>) -> bool {
-        let (width, height) = (frame.width, frame.height);
+    pub fn paint(&mut self, ui: &Ui, display: Rect, monitor_id: u8, frame: &crate::session::DecodedFrame, native_size: (u32, u32), local_pointer: Option<Pos2>) -> bool {
+        let (width, height) = native_size;
         let Some((id, x, y)) = self.screen_position else { return false };
         let Some(shape) = self.shape.as_ref() else { return false };
         if id != monitor_id || width == 0 || height == 0 {
@@ -43,7 +43,7 @@ impl CursorOverlay {
         let pos = (source.x.round() as i32, source.y.round() as i32);
         let stamp = (frame.seq, pos.0, pos.1);
         if self.texture.is_none() || (self.contains_invert && self.composite_position != Some(stamp)) {
-            let pixels = self.contains_invert.then(|| composite_invert(shape, frame, pos));
+            let pixels = self.contains_invert.then(|| composite_invert(shape, frame, native_size, pos));
             let image = ColorImage::from_rgba_unmultiplied(
                 [usize::from(shape.width), usize::from(shape.height)], pixels.as_deref().unwrap_or(&shape.rgba),
             );
@@ -60,18 +60,20 @@ impl CursorOverlay {
     }
 }
 
-fn composite_invert(shape: &CursorShape, frame: &crate::session::DecodedFrame, pos: (i32, i32)) -> Vec<u8> {
+fn composite_invert(shape: &CursorShape, frame: &crate::session::DecodedFrame, native_size: (u32, u32), pos: (i32, i32)) -> Vec<u8> {
     let mut rgba = shape.rgba.clone();
     let width = usize::from(shape.width);
     for (index, pixel) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         if *pixel != CURSOR_INVERT_PIXEL { continue; }
         let x = pos.0 + (index % width) as i32;
         let y = pos.1 + (index / width) as i32;
-        if x < 0 || y < 0 || x as u32 >= frame.width || y as u32 >= frame.height {
+        if x < 0 || y < 0 || x as u32 >= native_size.0 || y as u32 >= native_size.1 {
             *pixel = [0; 4];
             continue;
         }
-        let start = (y as usize * frame.width as usize + x as usize) * 4;
+        let pixel_x = x as u64 * u64::from(frame.width) / u64::from(native_size.0);
+        let pixel_y = y as u64 * u64::from(frame.height) / u64::from(native_size.1);
+        let start = ((pixel_y * u64::from(frame.width) + pixel_x) * 4) as usize;
         *pixel = frame.rgba.get(start..start + 4).map_or([0; 4], |background| {
             [255 - background[0], 255 - background[1], 255 - background[2], 255]
         });
@@ -87,6 +89,7 @@ mod tests {
     fn inversion_uses_the_underlying_frame_and_clips_at_the_edge() {
         let shape = CursorShape { width: 2, height: 1, hotspot_x: 0, hotspot_y: 0, rgba: CURSOR_INVERT_PIXEL.repeat(2) };
         let frame = crate::session::DecodedFrame { width: 1, height: 1, seq: 1, rgba: vec![10, 20, 30, 255] };
-        assert_eq!(composite_invert(&shape, &frame, (-1, 0)), [0, 0, 0, 0, 245, 235, 225, 255]);
+        assert_eq!(composite_invert(&shape, &frame, (1, 1), (-1, 0)), [0, 0, 0, 0, 245, 235, 225, 255]);
+        assert_eq!(composite_invert(&shape, &frame, (2, 2), (0, 0)), [245, 235, 225, 255, 245, 235, 225, 255]);
     }
 }

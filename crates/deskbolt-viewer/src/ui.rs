@@ -1614,6 +1614,9 @@ impl DeskBoltViewerApp {
                             }
                         }
 
+                        let native_size = s.monitors.iter()
+                            .find(|monitor| monitor.id == s.active_monitor_id && monitor.width > 0 && monitor.height > 0)
+                            .map_or((frame.width, frame.height), |monitor| (monitor.width, monitor.height));
                         let tex_id = self.textures.get(&s.id).map(|(_, _, t)| t.id());
                         if let Some(tid) = tex_id {
                             let ppp = ui.ctx().pixels_per_point();
@@ -1623,8 +1626,8 @@ impl DeskBoltViewerApp {
                                 let avail = ui.available_rect_before_wrap();
                                 let display_rect = compute_display_rect_with_mode(
                                     avail,
-                                    frame.width,
-                                    frame.height,
+                                    native_size.0,
+                                    native_size.1,
                                     cur_scale,
                                     ppp,
                                 );
@@ -1642,7 +1645,7 @@ impl DeskBoltViewerApp {
                                     } else {
                                         None
                                     };
-                                    if s.cursor.paint(ui, display_rect, s.active_monitor_id, &frame, local)
+                                    if s.cursor.paint(ui, display_rect, s.active_monitor_id, &frame, native_size, local)
                                         && local.is_some()
                                     {
                                         ui.ctx().set_cursor_icon(egui::CursorIcon::None);

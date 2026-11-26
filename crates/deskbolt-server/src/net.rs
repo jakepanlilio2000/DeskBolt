@@ -645,6 +645,7 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
     let (voice_tx, mut voice_rx) = mpsc::channel::<Vec<u8>>(64);
     let mut voice_engine: Option<VoiceEngine> = None;
     let mut system_audio = SystemAudioState::Idle;
+    let mut video_feedback = VideoFeedback::default();
 
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(128);
     let wake_agent = hub.to_agent_tx.clone();
@@ -701,6 +702,10 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
         tokio::time::Instant::now() + Duration::from_secs(10),
         Duration::from_secs(10),
     );
+    let mut probe_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(2), Duration::from_secs(2),
+    );
+    probe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_rx = Instant::now();
     let mut disconnect = crate::platform::subscribe_disconnect();
 
@@ -716,8 +721,16 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                 if last_rx.elapsed() > Duration::from_secs(35) {
                     break Err("session keepalive timeout".into());
                 }
-                if let Ok(f) = pack_message(ChannelId::AuthControl, FLAG_NONE, &ControlMsg::Ping { timestamp_ms: 0 }, None) {
-                    let _ = out_tx.try_send(f);
+                if *mode == SessionMode::FileTransfer
+                    && let Ok(frame) = pack_message(ChannelId::AuthControl, FLAG_NONE, &ControlMsg::Ping { timestamp_ms: 0 }, None)
+                {
+                    let _ = out_tx.try_send(frame);
+                }
+            }
+            _ = probe_tick.tick(), if *mode != SessionMode::FileTransfer => {
+                let nonce = video_feedback.begin_probe();
+                if let Ok(frame) = pack_message(ChannelId::AuthControl, FLAG_URGENT, &ControlMsg::Ping { timestamp_ms: nonce }, None) {
+                    let _ = out_tx.try_send(frame);
                 }
             }
             _ = download_pump.tick() => {
@@ -806,6 +819,15 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                         if !policy.capture_cursor && matches!(msg.as_ref(), IpcMsg::Video(VideoMsg::CursorUpdate { .. })) {
                             continue;
                         }
+                        match msg.as_ref() {
+                            IpcMsg::Video(VideoMsg::H264Frame { frame_seq, .. } | VideoMsg::TileBatch { frame_seq, .. }) => {
+                                if *frame_seq < video_feedback.last_frame {
+                                    video_feedback.last_ack = 0;
+                                }
+                                video_feedback.last_frame = *frame_seq;
+                            }
+                            _ => {}
+                        }
                         if let Some(frame) = ipc_to_wire_frame(&msg) {
                             if frame.channel == ChannelId::VideoTiles && frame.flags & FLAG_URGENT != 0 {
                                 let _ = out_tx.send(frame).await;
@@ -846,6 +868,7 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                             &mut voice_engine,
                             &voice_tx,
                             &mut system_audio,
+                            &mut video_feedback,
                         ).await {
                             if e == "client requested disconnect" {
                                 break Ok(());
@@ -862,6 +885,9 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
     if system_audio != SystemAudioState::Idle {
         let _ = hub.to_agent_tx.send(IpcMsg::SystemAudioStop(conn_id)).await;
     }
+    if video_feedback.level > 0 {
+        let _ = hub.to_agent_tx.try_send(IpcMsg::VideoCongestion { viewer: conn_id, level: 0 });
+    }
     drop(voice_engine);
     term_handler.cleanup_all();
     tun_handler.cleanup_all().await;
@@ -869,6 +895,64 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
     drop(out_tx);
     let _ = writer_task.await;
     result
+}
+
+#[derive(Default)]
+struct VideoFeedback {
+    probe: Option<(u64, Instant)>,
+    next_probe: u64,
+    rtt: Option<(u64, Instant)>,
+    last_frame: u64,
+    last_ack: u64,
+    last_report: Option<Instant>,
+    level: u8,
+    clean_samples: u8,
+}
+
+impl VideoFeedback {
+    fn begin_probe(&mut self) -> u64 {
+        self.next_probe = self.next_probe.wrapping_add(1).max(1);
+        self.probe = Some((self.next_probe, Instant::now()));
+        self.next_probe
+    }
+
+    fn pong(&mut self, nonce: u64) {
+        if let Some((sent, start)) = self.probe
+            && sent == nonce
+        {
+            self.rtt = Some((start.elapsed().as_millis() as u64, Instant::now()));
+            self.probe = None;
+        }
+    }
+
+    fn acknowledge(&mut self, sequence: u64, decode_ms: u16, now: Instant) -> Option<u8> {
+        if sequence <= self.last_ack || sequence > self.last_frame {
+            return None;
+        }
+        self.last_ack = sequence;
+        if self.last_report.is_some_and(|t| now.duration_since(t) < Duration::from_millis(250)) {
+            return None;
+        }
+        self.last_report = Some(now);
+        let rtt = self.rtt.filter(|(_, t)| now.duration_since(*t) <= Duration::from_secs(5))
+            .map_or(0, |(ms, _)| ms);
+        if rtt >= 250 || decode_ms >= 100 {
+            self.level = 2;
+            self.clean_samples = 0;
+        } else if rtt >= 140 || decode_ms >= 45 {
+            self.level = self.level.max(1);
+            self.clean_samples = 0;
+        } else if rtt < 100 && decode_ms < 30 {
+            self.clean_samples += 1;
+            if self.clean_samples == 4 {
+                self.level = self.level.saturating_sub(1);
+                self.clean_samples = 0;
+            }
+        } else {
+            self.clean_samples = 0;
+        }
+        Some(self.level)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -969,6 +1053,7 @@ async fn dispatch_client_frame(
     voice_engine: &mut Option<VoiceEngine>,
     voice_tx: &mpsc::Sender<Vec<u8>>,
     system_audio: &mut SystemAudioState,
+    video_feedback: &mut VideoFeedback,
 ) -> Result<(), String> {
     match frame.channel {
         ChannelId::AuthControl => {
@@ -982,6 +1067,12 @@ async fn dispatch_client_frame(
                         None,
                     ) {
                         let _ = out_tx.try_send(pong);
+                    }
+                }
+                ControlMsg::Pong { timestamp_ms } => video_feedback.pong(timestamp_ms),
+                ControlMsg::FrameAck { last_seq, decode_ms } if *mode != SessionMode::FileTransfer => {
+                    if let Some(level) = video_feedback.acknowledge(last_seq, decode_ms, Instant::now()) {
+                        let _ = hub.to_agent_tx.try_send(IpcMsg::VideoCongestion { viewer: conn_id, level });
                     }
                 }
                 ControlMsg::MonitorSelect { monitor_id } if *mode != SessionMode::FileTransfer => {
@@ -1408,6 +1499,22 @@ mod tests {
     use tokio::net::TcpStream;
 
     use super::*;
+
+    #[test]
+    fn congested_frame_acknowledgements_require_valid_sequences_and_recover_gradually() {
+        let now = Instant::now();
+        let mut feedback = VideoFeedback { last_frame: 30, rtt: Some((270, now)), ..VideoFeedback::default() };
+        assert_eq!(feedback.acknowledge(1000, 1, now), None);
+        assert_eq!(feedback.acknowledge(1, 1, now), Some(2));
+        assert_eq!(feedback.acknowledge(1, 1, now), None);
+        for step in 1..=8 {
+            let at = now + Duration::from_millis(step * 250);
+            feedback.rtt = Some((20, at));
+            let level = feedback.acknowledge(step + 1, 10, at).unwrap();
+            assert_eq!(level, 2 - (step / 4) as u8);
+        }
+        assert_eq!(feedback.acknowledge(10, 75, now + Duration::from_secs(3)), Some(1));
+    }
 
     #[tokio::test]
     async fn unavailable_local_prompt_uses_the_configured_fallback() {

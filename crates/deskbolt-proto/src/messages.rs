@@ -722,6 +722,7 @@ pub enum IpcMsg {
     SystemAudioReady { viewer: u64, error: Option<String> },
     SystemAudioFrame(#[serde(deserialize_with = "crate::audio_codec::bounded_packet")] Vec<u8>),
     SystemAudioFailed(String),
+    VideoCongestion { viewer: u64, level: u8 },
 }
 
 #[cfg(test)]

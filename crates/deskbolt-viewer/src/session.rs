@@ -1103,7 +1103,7 @@ async fn run_session_task(
     }
 
     // Spawn dedicated video decode worker thread
-    let (vid_tx, vid_rx) = std::sync::mpsc::sync_channel::<VideoMsg>(4);
+    let (vid_tx, vid_rx) = std::sync::mpsc::sync_channel::<(VideoMsg, Instant)>(4);
     let (ack_tx, mut ack_rx) = mpsc::channel::<Frame>(16);
     let dec_latest = latest_frame;
     let dec_seq = frame_seq;
@@ -1473,7 +1473,7 @@ async fn run_session_task(
                                 if matches!(v, VideoMsg::CursorUpdate { .. }) {
                                     notify(SessionUiEvent::Cursor(v));
                                 } else {
-                                    let _ = vid_tx.try_send(v);
+                                    let _ = vid_tx.try_send((v, Instant::now()));
                                 }
                             }
                         }
@@ -1484,6 +1484,11 @@ async fn run_session_task(
                                         notify(SessionUiEvent::MonitorsUpdated { monitors, active_id: active_monitor_id });
                                     }
                                     ControlMsg::AndroidControls => notify(SessionUiEvent::AndroidControls),
+                                    ControlMsg::Ping { timestamp_ms } => {
+                                        if let Ok(pong) = pack_message(ChannelId::AuthControl, FLAG_URGENT, &ControlMsg::Pong { timestamp_ms }, None) {
+                                            let _ = write_frame_async(&mut writer, pong.channel, pong.flags, &pong.payload).await;
+                                        }
+                                    }
                                     ControlMsg::Pong { timestamp_ms } => {
                                         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
                                         if timestamp_ms > 0 && now_ms >= timestamp_ms {
@@ -1973,7 +1978,7 @@ async fn wait_password(cmd_rx: &mut mpsc::Receiver<SessionCommand>) -> Option<St
 }
 
 fn run_decode_worker(
-    rx: std::sync::mpsc::Receiver<VideoMsg>,
+    rx: std::sync::mpsc::Receiver<(VideoMsg, Instant)>,
     latest_frame: Arc<Mutex<Option<DecodedFrame>>>,
     frame_seq: Arc<AtomicU64>,
     ack_tx: mpsc::Sender<Frame>,
@@ -1984,8 +1989,7 @@ fn run_decode_worker(
     let mut buf_w = 0u32;
     let mut buf_h = 0u32;
 
-    while let Ok(msg) = rx.recv() {
-        let t0 = Instant::now();
+    while let Ok((msg, queued_at)) = rx.recv() {
         let (seq, updated) = match &msg {
             VideoMsg::TileBatch { frame_seq: s, .. } => {
                 let ok = apply_tile_batch_rgba(&msg, &mut rgba_buf, &mut buf_w, &mut buf_h).is_ok();
@@ -2027,7 +2031,7 @@ fn run_decode_worker(
             });
             repaint();
 
-            let decode_ms = t0.elapsed().as_millis().min(u16::MAX as u128) as u16;
+            let decode_ms = queued_at.elapsed().as_millis().min(u16::MAX as u128) as u16;
             if let Ok(ack) = pack_message(
                 ChannelId::AuthControl,
                 FLAG_NONE,

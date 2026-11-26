@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{
     Arc, Condvar, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -125,6 +126,7 @@ struct SharedAgentState {
     quality_mode: Mutex<VideoQualityMode>,
     target_fps: Mutex<u8>,
     bitrate_kbps: Mutex<u32>,
+    congestion: Mutex<HashMap<u64, (u8, Instant)>>,
     force_keyframe: AtomicBool,
     desktop_switched: AtomicBool,
     capture_cursor: AtomicBool,
@@ -153,6 +155,7 @@ fn run_agent_workers(
         quality_mode: Mutex::new(VideoQualityMode::Auto),
         target_fps: Mutex::new(30),
         bitrate_kbps: Mutex::new(4000),
+        congestion: Mutex::new(HashMap::new()),
         force_keyframe: AtomicBool::new(true),
         desktop_switched: AtomicBool::new(true),
         capture_cursor: AtomicBool::new(true),
@@ -220,6 +223,14 @@ fn run_agent_workers(
                 *shared.target_fps.lock().unwrap() = target_fps.clamp(15, 120);
                 *shared.bitrate_kbps.lock().unwrap() = h264_bitrate_kbps.max(250);
                 shared.force_keyframe.store(true, Ordering::SeqCst);
+            }
+            IpcMsg::VideoCongestion { viewer, level } => {
+                let mut viewers = shared.congestion.lock().unwrap();
+                if level == 0 {
+                    viewers.remove(&viewer);
+                } else {
+                    viewers.insert(viewer, (level.min(2), Instant::now()));
+                }
             }
             IpcMsg::MonitorSelect { monitor_id } => {
                 *shared.active_monitor.lock().unwrap() = monitor_id;
@@ -345,11 +356,19 @@ fn capture_loop(
     let mut last_dims: (u32, u32) = (0, 0);
     let mut need_full = true;
     let mut cursor_delta = CursorDelta::default();
+    let mut last_level = 0;
 
     while !stop.load(Ordering::SeqCst) {
         let wanted_mon = *shared.active_monitor.lock().unwrap();
-        let fps = *shared.target_fps.lock().unwrap();
-        let frame_interval = Duration::from_millis((1000 / fps.max(1) as u64).max(8));
+        let level = shared.congestion_level();
+        if level != last_level {
+            shared.force_keyframe.store(true, Ordering::Relaxed);
+            last_level = level;
+        }
+        let (fps, _, _) = adaptive_quality(
+            level, *shared.target_fps.lock().unwrap(), *shared.bitrate_kbps.lock().unwrap(),
+        );
+        let frame_interval = Duration::from_micros(1_000_000 / u64::from(fps));
         let loop_start = Instant::now();
 
         if capturer.is_none() {
@@ -493,6 +512,8 @@ fn encode_loop(
     let mut seq: u64 = 0;
     let mut h264: Option<H264VideoEncoder> = None;
     let mut auto_tracker = AutoModeTracker::new();
+    let mut sent_motion = false;
+    let mut scaled = Vec::new();
     let mut last_frame_cache: Option<(u8, u32, u32, Vec<u8>)> = None;
 
     while !stop.load(Ordering::SeqCst) {
@@ -510,6 +531,7 @@ fn encode_loop(
                     {
                         seq += 1;
                         let tiles = build_full_tiles(bgra, w, h);
+                        sent_motion = false;
                         let _ = ev_tx.blocking_send(IpcMsg::Video(VideoMsg::TileBatch {
                             monitor_id: mon,
                             frame_seq: seq,
@@ -535,8 +557,11 @@ fn encode_loop(
         }
 
         let quality = *shared.quality_mode.lock().unwrap();
-        let fps = *shared.target_fps.lock().unwrap() as f32;
-        let bitrate = *shared.bitrate_kbps.lock().unwrap() * 1000;
+        let (fps, bitrate, downscale) = adaptive_quality(
+            shared.congestion_level(), *shared.target_fps.lock().unwrap(), *shared.bitrate_kbps.lock().unwrap(),
+        );
+        let fps = f32::from(fps);
+        let bitrate = bitrate * 1000;
 
         let dirty_area: u64 = if raw.force_full {
             (raw.width as u64) * (raw.height as u64)
@@ -555,67 +580,108 @@ fn encode_loop(
                 false
             }
             VideoQualityMode::SmoothVideo => true,
-            VideoQualityMode::Auto => auto_tracker.update(dirty_ratio),
+            VideoQualityMode::Auto => auto_tracker.update(dirty_ratio) || downscale,
         };
 
         last_frame_cache = Some((raw.monitor_id, raw.width, raw.height, raw.bgra.clone()));
         seq += 1;
 
         if use_h264 {
-            let enc = match h264.as_mut() {
-                Some(e) => {
-                    let _ = e.reconfigure(raw.width, raw.height, bitrate, fps);
-                    e
-                }
-                None => match H264VideoEncoder::new(raw.width, raw.height, bitrate, fps) {
-                    Ok(e) => h264.insert(e),
-                    Err(e) => {
-                        warn!("H264 init error: {e}");
-                        continue;
-                    }
-                },
+            let (bgra, width, height) = if downscale && raw.width >= 64 && raw.height >= 64 {
+                let (width, height) = scale_motion_frame(&raw.bgra, raw.width, raw.height, &mut scaled);
+                (scaled.as_slice(), width, height)
+            } else {
+                (raw.bgra.as_slice(), raw.width, raw.height)
             };
-            if raw.force_full || auto_tracker.just_entered_h264() {
-                enc.force_keyframe();
-            }
-            match enc.encode_bgra(&raw.bgra, raw.width, raw.height) {
+            let result = (|| {
+                let encoder = match h264.as_mut() {
+                    Some(encoder) => {
+                        encoder.reconfigure(width, height, bitrate, fps)?;
+                        encoder
+                    }
+                    None => h264.insert(H264VideoEncoder::new(width, height, bitrate, fps)?),
+                };
+                if raw.force_full || !sent_motion || auto_tracker.just_entered_h264() {
+                    encoder.force_keyframe();
+                }
+                encoder.encode_bgra(bgra, width, height)
+            })();
+            match result {
                 Ok((annex_b, is_keyframe)) => {
                     let msg = VideoMsg::H264Frame {
                         monitor_id: raw.monitor_id,
                         frame_seq: seq,
                         timestamp_us: now_micros(),
-                        width: raw.width as u16,
-                        height: raw.height as u16,
+                        width: width as u16,
+                        height: height as u16,
                         is_keyframe,
                         annex_b,
                     };
                     if ev_tx.blocking_send(IpcMsg::Video(msg)).is_err() {
                         break;
                     }
+                    sent_motion = true;
+                    continue;
                 }
-                Err(e) => warn!("H264 encode failed: {e}"),
-            }
-        } else {
-            let tiles = if raw.force_full || raw.dirty_rects.is_empty() && raw.move_rects.is_empty() {
-                build_full_tiles(&raw.bgra, raw.width, raw.height)
-            } else {
-                dirty_rects_to_tiles(&raw.bgra, raw.width, raw.height, &raw.dirty_rects)
-            };
-            let msg = VideoMsg::TileBatch {
-                monitor_id: raw.monitor_id,
-                frame_seq: seq,
-                timestamp_us: now_micros(),
-                width: raw.width as u16,
-                height: raw.height as u16,
-                is_full_refresh: raw.force_full,
-                move_rects: raw.move_rects,
-                tiles,
-            };
-            if ev_tx.blocking_send(IpcMsg::Video(msg)).is_err() {
-                break;
+                Err(error) => {
+                    warn!("Motion encoding failed: {error}");
+                    h264 = None;
+                }
             }
         }
+
+        let full_refresh = raw.force_full || sent_motion || use_h264;
+        sent_motion = false;
+        let tiles = if full_refresh || raw.dirty_rects.is_empty() && raw.move_rects.is_empty() {
+            build_full_tiles(&raw.bgra, raw.width, raw.height)
+        } else {
+            dirty_rects_to_tiles(&raw.bgra, raw.width, raw.height, &raw.dirty_rects)
+        };
+        let msg = VideoMsg::TileBatch {
+            monitor_id: raw.monitor_id,
+            frame_seq: seq,
+            timestamp_us: now_micros(),
+            width: raw.width as u16,
+            height: raw.height as u16,
+            is_full_refresh: full_refresh,
+            move_rects: if full_refresh { Vec::new() } else { raw.move_rects },
+            tiles,
+        };
+        if ev_tx.blocking_send(IpcMsg::Video(msg)).is_err() {
+            break;
+        }
     }
+}
+
+impl SharedAgentState {
+    fn congestion_level(&self) -> u8 {
+        let mut viewers = self.congestion.lock().unwrap();
+        viewers.retain(|_, (_, time)| time.elapsed() < Duration::from_secs(8));
+        viewers.values().map(|(level, _)| *level).max().unwrap_or_default()
+    }
+}
+
+fn adaptive_quality(level: u8, fps: u8, bitrate_kbps: u32) -> (u8, u32, bool) {
+    let bitrate = bitrate_kbps.clamp(100, 100_000);
+    match level {
+        0 => (fps.clamp(15, 120), bitrate, false),
+        1 => (((u16::from(fps) * 3 / 4) as u8).max(15), (bitrate * 3 / 4).max(100), false),
+        _ => ((fps / 2).max(15), (bitrate / 2).max(100), true),
+    }
+}
+
+fn scale_motion_frame(bgra: &[u8], width: u32, height: u32, dst: &mut Vec<u8>) -> (u32, u32) {
+    let w = (width * 3 / 4) & !1;
+    let h = (height * 3 / 4) & !1;
+    dst.resize((w * h * 4) as usize, 0);
+    for y in 0..h {
+        for x in 0..w {
+            let source = ((y * height / h * width + x * width / w) * 4) as usize;
+            let dest = ((y * w + x) * 4) as usize;
+            dst[dest..dest + 4].copy_from_slice(&bgra[source..source + 4]);
+        }
+    }
+    (w, h)
 }
 
 /// Adaptive hysteresis tracker switching between Crisp Text (`zstd`) and Motion (`openh264`).
@@ -871,6 +937,17 @@ mod tests {
         );
         let (mid_x, _) = map_norm_to_virtual_desktop(0.0, 0.5, &primary, -1920, 0, 3840, 1080);
         assert!((mid_x - 32776).abs() < 20);
+    }
+
+    #[test]
+    fn congestion_reduces_motion_fps_bitrate_and_dimensions() {
+        assert_eq!(adaptive_quality(0, 120, 8_000), (120, 8_000, false));
+        assert_eq!(adaptive_quality(1, 120, 8_000), (90, 6_000, false));
+        assert_eq!(adaptive_quality(2, 30, 4_000), (15, 2_000, true));
+        assert_eq!(adaptive_quality(2, 15, 100), (15, 100, true));
+        let mut output = Vec::new();
+        assert_eq!(scale_motion_frame(&vec![255; 65 * 67 * 4], 65, 67, &mut output), (48, 50));
+        assert_eq!(output, vec![255; 48 * 50 * 4]);
     }
 
     #[test]
