@@ -133,9 +133,11 @@ cargo build --release --workspace
 - **Linux Prerequisites (Debian/Ubuntu):**
   ```bash
   sudo apt-get install -y --no-install-recommends \
-    libxcb1-dev libxrandr-dev libdbus-1-dev libpipewire-0.3-dev \
-    libwayland-dev libegl-dev libxkbcommon-dev libxkbcommon-x11-dev \
-    libxcb-shape0-dev libxcb-xfixes0-dev libasound2-dev libclang-dev clang nasm
+    libxcb1-dev libxcb-randr0-dev libxcb-render0-dev libxcb-shm0-dev \
+    libx11-dev libxrandr-dev libdbus-1-dev libpipewire-0.3-dev \
+    libwayland-dev libegl-dev libdrm-dev libgbm-dev libfontconfig1-dev \
+    libxkbcommon-dev libxkbcommon-x11-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+    libasound2-dev libclang-dev clang nasm pkg-config
   ```
 - **Android Build (`16 KB` Page Alignment via `.cargo/config.toml`):**
   ```bash
