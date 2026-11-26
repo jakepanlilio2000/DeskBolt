@@ -1843,6 +1843,44 @@ mod tests {
         }
         assert_eq!(downloaded, payload);
 
+        // Page through a tree larger and deeper than the previous scan limits.
+        for index in 0..15_001 {
+            std::fs::create_dir(temp_dir.join(format!("dir-{index:05}"))).unwrap();
+        }
+        let deep = (0..40).fold(temp_dir.clone(), |dir, _| dir.join("d"));
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("included.txt"), b"deep").unwrap();
+        std::fs::create_dir(temp_dir.join("node_modules")).unwrap();
+        std::fs::write(temp_dir.join("node_modules/hidden.txt"), b"excluded").unwrap();
+        std::fs::write(temp_dir.join("hidden.tmp"), b"excluded").unwrap();
+        let mut cursor = None;
+        let mut seen = std::collections::HashSet::new();
+        let mut pages = 0;
+        loop {
+            let req = FileTransferMsg::HashTreeReq {
+                root: temp_dir.to_string_lossy().into_owned(),
+                cursor,
+                page_size: 512,
+                exclude_globs: deskbolt_proto::hash_tree::DEFAULT_EXCLUDE_GLOBS.lines().map(str::to_owned).collect(),
+            };
+            let frame = pack_message(ChannelId::FileTransfer, FLAG_NONE, &req, None).unwrap();
+            write_frame_async(&mut tls, frame.channel, frame.flags, &frame.payload).await.unwrap();
+            let frame = read_frame_async(&mut tls).await.unwrap().unwrap();
+            let FileTransferMsg::HashTreeResp { entries, next_cursor, error: None, .. } =
+                unpack_message(&frame).unwrap() else { panic!("invalid hash page"); };
+            pages += 1;
+            assert!(entries.len() <= 512);
+            for entry in entries {
+                assert!(!entry.rel_path.contains("hidden") && !entry.rel_path.starts_with("node_modules"));
+                assert!(seen.insert(entry.rel_path));
+            }
+            cursor = next_cursor;
+            if cursor.is_none() { break; }
+        }
+        assert!(pages > 1);
+        assert_eq!(seen.len(), 15_043);
+        assert!(seen.contains(&format!("{}included.txt", "d/".repeat(40))));
+
         let _ = std::fs::remove_dir_all(&temp_dir);
         let _ = shutdown_tx.send(true);
         let _ = server_task.await;

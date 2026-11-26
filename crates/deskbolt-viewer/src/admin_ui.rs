@@ -129,6 +129,7 @@ pub struct SyncDiffModal {
     pub diffs: Vec<DiffEntry>,
     pub status: String,
     local_rx: Option<std::sync::mpsc::Receiver<Result<Vec<SyncEntry>, String>>>,
+    exclude_globs: String,
 }
 
 pub struct BroadcastModalState {
@@ -860,15 +861,6 @@ impl DeskBoltViewerApp {
         };
         let local_dir = s.file_transfer.local_path.clone();
         let remote_dir = s.file_transfer.remote_path.clone();
-        s.file_transfer.remote_hash_tree = None;
-        s.send_cmd(SessionCommand::File(FileTransferMsg::HashTreeReq {
-            path: remote_dir.clone(),
-        }));
-        let (tx, rx) = std::sync::mpsc::channel();
-        let ldir_c = local_dir.clone();
-        self.runtime.spawn(async move {
-            let _ = tx.send(scan_local_hash_tree(&ldir_c).await);
-        });
         self.admin.sync_modal = Some(SyncDiffModal {
             title: format!("Compare & Sync - {}", s.title),
             deskbolt_session_id: Some(session_id),
@@ -879,8 +871,9 @@ impl DeskBoltViewerApp {
             local_tree: None,
             remote_tree: None,
             diffs: Vec::new(),
-            status: "Computing SHA-256 directory manifests...".into(),
-            local_rx: Some(rx),
+            status: "Edit exclusions, then scan both folders.".into(),
+            local_rx: None,
+            exclude_globs: deskbolt_proto::hash_tree::DEFAULT_EXCLUDE_GLOBS.into(),
         });
     }
 
@@ -1339,6 +1332,7 @@ impl DeskBoltViewerApp {
                                 diffs: Vec::new(),
                                 status: "Computing SHA-256 manifests...".into(),
                                 local_rx: Some(rx),
+                                exclude_globs: String::new(),
                             });
                         }
                     });
@@ -2034,6 +2028,48 @@ impl DeskBoltViewerApp {
                         });
                     ui.label(&modal.status);
                 });
+                if let Some(id) = modal.deskbolt_session_id
+                    && let Some(session) = self.sessions.iter_mut().find(|session| session.id == id)
+                {
+                    ui.label("Exclude paths (one rule per line)");
+                    ui.text_edit_multiline(&mut modal.exclude_globs);
+                    let remote_pending = session.file_transfer.remote_hash_tree.is_none()
+                        && session.file_transfer.remote_hash_error.is_none()
+                        && modal.status.starts_with("Computing");
+                    if ui.add_enabled(!remote_pending && modal.local_rx.is_none(), egui::Button::new("Scan folders")).clicked() {
+                        use deskbolt_proto::hash_tree::{HASH_PAGE_SIZE, scan_hash_page};
+                        let globs: Vec<String> = modal.exclude_globs.lines().map(str::to_owned).collect();
+                        session.file_transfer.remote_hash_tree = None;
+                        session.file_transfer.remote_hash_error = None;
+                        session.send_cmd(SessionCommand::File(FileTransferMsg::HashTreeReq {
+                            root: modal.remote_dir.clone(), cursor: None, page_size: HASH_PAGE_SIZE,
+                            exclude_globs: globs.clone(),
+                        }));
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        let root = modal.local_dir.clone();
+                        self.runtime.spawn(async move {
+                            let scan = async {
+                                let mut entries = Vec::new();
+                                let mut cursor = None;
+                                loop {
+                                    let (page, next) = scan_hash_page(root.clone(), cursor, HASH_PAGE_SIZE, globs.clone()).await?;
+                                    entries.extend(page);
+                                    cursor = next;
+                                    if cursor.is_none() { return Ok(entries); }
+                                }
+                            }.await;
+                            let _ = tx.send(scan);
+                        });
+                        modal.local_rx = Some(rx);
+                        modal.local_tree = None;
+                        modal.remote_tree = None;
+                        modal.diffs.clear();
+                        modal.status = "Computing SHA-256 directory manifests...".into();
+                    }
+                    if let Some(error) = &session.file_transfer.remote_hash_error {
+                        modal.status = format!("Remote scan error: {error}");
+                    }
+                }
                 ui.separator();
 
                 ScrollArea::vertical().max_height(310.0).show(ui, |ui| {

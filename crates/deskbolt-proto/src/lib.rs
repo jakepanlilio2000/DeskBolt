@@ -3,6 +3,7 @@ pub mod codec;
 pub mod cursor;
 pub mod error;
 pub mod frame;
+pub mod hash_tree;
 pub mod messages;
 #[cfg(not(target_os = "android"))]
 pub mod native_clipboard;

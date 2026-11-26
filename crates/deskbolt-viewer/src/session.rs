@@ -111,6 +111,7 @@ pub struct FileTransferState {
     pub queue: Vec<TransferItem>,
     pub pending_overwrite: Option<OverwritePrompt>,
     pub remote_hash_tree: Option<Vec<SyncEntry>>,
+    pub remote_hash_error: Option<String>,
     pub hash_tree_error: Option<String>,
 }
 
@@ -172,6 +173,7 @@ impl FileTransferState {
             queue: Vec::new(),
             pending_overwrite: None,
             remote_hash_tree: None,
+            remote_hash_error: None,
             hash_tree_error: None,
         };
         st.refresh_local();
@@ -527,6 +529,7 @@ impl ViewerSession {
                 }
                 SessionUiEvent::HashTree { entries, error } => {
                     self.file_transfer.remote_hash_tree = error.is_none().then_some(entries);
+                    self.file_transfer.remote_hash_error = error.clone();
                     self.file_transfer.hash_tree_error = error;
                 }
                 SessionUiEvent::TailChunk {
@@ -1054,6 +1057,7 @@ async fn run_session_task(
     let (mut reader, mut writer) = tokio::io::split(tls);
     let mut frames = AsyncFrameReader::default();
     let mut ft_client = FileClientQueue::new();
+    let mut hash_scan: Option<HashScan> = None;
     let mut next_transfer_id: u64 = 1;
     let mut quick_edit_pending: Option<String> = None;
     let mut quick_edit_uploads: HashMap<u64, (String, PathBuf)> = HashMap::new();
@@ -1179,6 +1183,12 @@ async fn run_session_task(
                         }
                     }
                     SessionCommand::File(ft) => {
+                        if let FileTransferMsg::HashTreeReq { root, page_size, exclude_globs, .. } = &ft {
+                            hash_scan = Some(HashScan {
+                                root: root.clone(), page_size: *page_size, globs: exclude_globs.clone(),
+                                entries: Vec::new(), cursor: None,
+                            });
+                        }
                         if let Ok(f) = pack_message(ChannelId::FileTransfer, FLAG_NONE, &ft, None)
                             && write_frame_async(&mut writer, f.channel, f.flags, &f.payload).await.is_err()
                         {
@@ -1407,8 +1417,30 @@ async fn run_session_task(
                         ChannelId::FileTransfer => {
                             if let Ok(ft) = unpack_message::<FileTransferMsg>(&frame) {
                                 match ft {
-                                    FileTransferMsg::HashTreeResp { entries, error, .. } => {
-                                        notify(SessionUiEvent::HashTree { entries, error });
+                                    FileTransferMsg::HashTreeResp { root, entries, next_cursor, mut error } => {
+                                        if let Some(scan) = hash_scan.as_mut().filter(|scan| scan.root == root) {
+                                            if entries.iter().any(|entry| !deskbolt_proto::hash_tree::safe_relative_path(&entry.rel_path))
+                                                || next_cursor.as_ref().is_some_and(|next| scan.cursor.as_ref() == Some(next)
+                                                    || entries.last().is_none_or(|entry| &entry.rel_path != next))
+                                            {
+                                                error = Some("Invalid directory manifest page.".into());
+                                            }
+                                            scan.entries.extend(entries);
+                                            if let Some(cursor) = next_cursor.filter(|_| error.is_none()) {
+                                                scan.cursor = Some(cursor.clone());
+                                                let next = FileTransferMsg::HashTreeReq {
+                                                    root, cursor: Some(cursor), page_size: scan.page_size,
+                                                    exclude_globs: scan.globs.clone(),
+                                                };
+                                                if let Ok(f) = pack_message(ChannelId::FileTransfer, FLAG_NONE, &next, None) {
+                                                    let _ = write_frame_async(&mut writer, f.channel, f.flags, &f.payload).await;
+                                                }
+                                            } else {
+                                                let entries = std::mem::take(&mut scan.entries);
+                                                hash_scan = None;
+                                                notify(SessionUiEvent::HashTree { entries, error });
+                                            }
+                                        }
                                     }
                                     FileTransferMsg::TailChunkResp { path, next_offset, data, truncated, error } => {
                                         if quick_edit_pending.take().is_some() {
@@ -1895,6 +1927,14 @@ fn run_decode_worker(
             }
         }
     }
+}
+
+struct HashScan {
+    root: String,
+    page_size: u32,
+    globs: Vec<String>,
+    entries: Vec<SyncEntry>,
+    cursor: Option<String>,
 }
 
 struct ActiveUploadJob {
@@ -3064,12 +3104,13 @@ mod tests {
                                 _ => {}
                             },
                             ChannelId::FileTransfer => match unpack_message::<FileTransferMsg>(&f).unwrap() {
-                                FileTransferMsg::HashTreeReq { path } => {
+                                FileTransferMsg::HashTreeReq { root, .. } => {
                                     let resp = pack_message(
                                         ChannelId::FileTransfer,
                                         FLAG_NONE,
                                         &FileTransferMsg::HashTreeResp {
-                                            path,
+                                            root,
+                                            next_cursor: None,
                                             entries: vec![SyncEntry {
                                                 rel_path: "app.conf".into(),
                                                 is_dir: false,
@@ -3214,7 +3255,7 @@ mod tests {
         assert_eq!(&got, b"e2e-tun");
 
         // HashTree & TailChunk verify
-        sess.send_cmd(SessionCommand::File(FileTransferMsg::HashTreeReq { path: "/etc".into() }));
+        sess.send_cmd(SessionCommand::File(FileTransferMsg::HashTreeReq { root: "/etc".into(), cursor: None, page_size: 1, exclude_globs: Vec::new() }));
         sess.send_cmd(SessionCommand::File(FileTransferMsg::TailChunkReq {
             path: "/var/log/app.log".into(),
             offset: 0,

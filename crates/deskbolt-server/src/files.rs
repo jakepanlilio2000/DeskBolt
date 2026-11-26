@@ -3,7 +3,7 @@ use std::io::SeekFrom;
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use deskbolt_proto::{DESKTOP_UPLOAD_PREFIX, DriveEntry, FileEntry, FileTransferMsg, SyncEntry, TransferDir, valid_drop_filename};
+use deskbolt_proto::{DESKTOP_UPLOAD_PREFIX, DriveEntry, FileEntry, FileTransferMsg, TransferDir, valid_drop_filename};
 use ring::digest::{Context, SHA256};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -156,7 +156,17 @@ impl FileSessionHandler {
                 self.abort_transfer(transfer_id).await;
                 Vec::new()
             }
-            FileTransferMsg::HashTreeReq { path } => vec![compute_hash_tree(&path).await],
+            FileTransferMsg::HashTreeReq { root, cursor, page_size, exclude_globs } => {
+                let result = match validate_remote_path(&root) {
+                    Ok(path) => deskbolt_proto::hash_tree::scan_hash_page(path, cursor, page_size, exclude_globs).await,
+                    Err(error) => Err(error),
+                };
+                let (entries, next_cursor, error) = match result {
+                    Ok((entries, cursor)) => (entries, cursor, None),
+                    Err(error) => (Vec::new(), None, Some(error)),
+                };
+                vec![FileTransferMsg::HashTreeResp { root, entries, next_cursor, error }]
+            }
             FileTransferMsg::TailChunkReq {
                 path,
                 offset,
@@ -722,117 +732,7 @@ async fn rename_path(raw_from: &str, raw_to: &str) -> FileTransferMsg {
     }
 }
 
-const MAX_HASH_TREE_ENTRIES: usize = 10_000;
-const MAX_HASH_TREE_DEPTH: usize = 32;
 const MAX_TAIL_CHUNK_BYTES: usize = 256 * 1024;
-
-fn meta_modified_unix(meta: &std::fs::Metadata) -> i64 {
-    meta.modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-async fn sha256_file(path: &Path) -> Result<[u8; 32], String> {
-    let mut file = File::open(path)
-        .await
-        .map_err(|e| format!("open {} for hash: {e}", path.display()))?;
-    let mut ctx = Context::new(&SHA256);
-    let mut buf = vec![0u8; FILE_CHUNK_SIZE];
-    loop {
-        let n = file
-            .read(&mut buf)
-            .await
-            .map_err(|e| format!("read {} for hash: {e}", path.display()))?;
-        if n == 0 {
-            break;
-        }
-        ctx.update(&buf[..n]);
-    }
-    let digest = ctx.finish();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(digest.as_ref());
-    Ok(out)
-}
-
-async fn compute_hash_tree(raw_path: &str) -> FileTransferMsg {
-    let root = match validate_remote_path(raw_path) {
-        Ok(p) => p,
-        Err(e) => {
-            return FileTransferMsg::HashTreeResp {
-                path: raw_path.to_string(),
-                entries: Vec::new(),
-                error: Some(e),
-            };
-        }
-    };
-
-    let mut entries = Vec::new();
-    // shortcut: bounded at 10,000 entries and depth 32 to keep single-frame manifests within wire bounds; paginate if indexing entire disks.
-    let mut queue = std::collections::VecDeque::from([(root.clone(), String::new(), 0usize)]);
-    while let Some((dir, prefix, depth)) = queue.pop_front() {
-        let mut rd = match fs::read_dir(&dir).await {
-            Ok(r) => r,
-            Err(e) => {
-                return FileTransferMsg::HashTreeResp {
-                    path: root.to_string_lossy().into_owned(),
-                    entries,
-                    error: Some(format!("cannot read directory {}: {e}", dir.display())),
-                };
-            }
-        };
-        while let Ok(Some(item)) = rd.next_entry().await {
-            if entries.len() >= MAX_HASH_TREE_ENTRIES {
-                break;
-            }
-            let item_path = item.path();
-            let Ok(meta) = fs::symlink_metadata(&item_path).await else {
-                continue;
-            };
-            if meta.file_type().is_symlink() {
-                continue;
-            }
-            let name = item.file_name().to_string_lossy().into_owned();
-            let rel_path = if prefix.is_empty() {
-                name
-            } else {
-                format!("{prefix}/{name}")
-            };
-            if meta.is_dir() {
-                entries.push(SyncEntry {
-                    rel_path: rel_path.clone(),
-                    is_dir: true,
-                    size: 0,
-                    modified_unix: meta_modified_unix(&meta),
-                    sha256: None,
-                });
-                if depth < MAX_HASH_TREE_DEPTH {
-                    queue.push_back((item_path, rel_path, depth + 1));
-                }
-            } else if meta.is_file() {
-                let hash = sha256_file(&item_path).await.ok();
-                entries.push(SyncEntry {
-                    rel_path,
-                    is_dir: false,
-                    size: meta.len(),
-                    modified_unix: meta_modified_unix(&meta),
-                    sha256: hash,
-                });
-            }
-        }
-        if entries.len() >= MAX_HASH_TREE_ENTRIES {
-            break;
-        }
-    }
-
-    entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
-    FileTransferMsg::HashTreeResp {
-        path: root.to_string_lossy().into_owned(),
-        entries,
-        error: None,
-    }
-}
 
 async fn read_tail_chunk(raw_path: &str, offset: u64, max_bytes: u32) -> FileTransferMsg {
     let path = match validate_remote_path(raw_path) {
@@ -1043,7 +943,10 @@ mod tests {
         let mut handler = FileSessionHandler::new();
         let tree_resp = handler
             .handle_message(FileTransferMsg::HashTreeReq {
-                path: root.to_string_lossy().into_owned(),
+                root: root.to_string_lossy().into_owned(),
+                cursor: None,
+                page_size: 10,
+                exclude_globs: Vec::new(),
             })
             .await;
         match &tree_resp[0] {

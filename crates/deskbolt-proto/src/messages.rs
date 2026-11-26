@@ -403,11 +403,15 @@ pub enum FileTransferMsg {
         reason: String,
     },
     HashTreeReq {
-        path: String,
+        root: String,
+        cursor: Option<String>,
+        page_size: u32,
+        exclude_globs: Vec<String>,
     },
     HashTreeResp {
-        path: String,
+        root: String,
         entries: Vec<SyncEntry>,
+        next_cursor: Option<String>,
         error: Option<String>,
     },
     TailChunkReq {

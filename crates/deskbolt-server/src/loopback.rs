@@ -438,22 +438,22 @@ async fn check_pty() -> Check {
 
 async fn hash_tree(client: &mut Client, root: &Path) -> Check<Vec<deskbolt_proto::SyncEntry>> {
     use ChannelId::FileTransfer as Channel;
-    client
-        .send(
-            Channel,
-            &FileTransferMsg::HashTreeReq {
-                path: root.to_string_lossy().into_owned(),
-            },
-        )
-        .await?;
-    match client.recv(Channel).await? {
-        FileTransferMsg::HashTreeResp {
-            entries,
-            error: None,
-            ..
-        } => Ok(entries),
-        message => {
-            Err(format!("Could not read the SHA-256 directory manifest: {message:?}").into())
+    let mut cursor = None;
+    let mut manifest = Vec::new();
+    loop {
+        client.send(Channel, &FileTransferMsg::HashTreeReq {
+            root: root.to_string_lossy().into_owned(),
+            cursor,
+            page_size: deskbolt_proto::hash_tree::HASH_PAGE_SIZE,
+            exclude_globs: Vec::new(),
+        }).await?;
+        match client.recv(Channel).await? {
+            FileTransferMsg::HashTreeResp { entries, next_cursor, error: None, .. } => {
+                manifest.extend(entries);
+                cursor = next_cursor;
+                if cursor.is_none() { return Ok(manifest); }
+            }
+            message => return Err(format!("Could not read the SHA-256 directory manifest: {message:?}").into()),
         }
     }
 }
