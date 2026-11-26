@@ -1172,23 +1172,21 @@ async fn dispatch_client_frame(
                         "popup_message",
                         &title,
                     );
-                    let _ = hub.to_agent_tx.try_send(IpcMsg::ShowPopup {
-                        title: title.clone(),
-                        body: body.clone(),
-                        urgent,
-                    });
-                    #[cfg(any(test, all(feature = "dev-mcp", not(target_os = "android"))))]
-                    if !policy.os_prompts_enabled() {
-                        let ack = CommsMsg::PopupAck {
-                            shown: true,
-                            message: format!("Popup '{title}' queued."),
-                        };
-                        if let Ok(f) = pack_message(ChannelId::Comms, FLAG_NONE, &ack, None) {
-                            let _ = out_tx.send(f).await;
+                    let ack = if sas_enabled || !policy.os_prompts_enabled() {
+                        let queued = hub.to_agent_tx.try_send(IpcMsg::ShowPopup {
+                            title,
+                            body,
+                            urgent,
+                        }).is_ok();
+                        CommsMsg::PopupAck {
+                            shown: queued,
+                            message: if queued {
+                                "Message queued for the remote desktop session.".into()
+                            } else {
+                                "The remote desktop could not receive the message.".into()
+                            },
                         }
-                        return Ok(());
-                    }
-                    let ack =
+                    } else {
                         match tokio::task::spawn_blocking(move || show_desktop_popup(&title, &body, urgent))
                             .await
                         {
@@ -1202,9 +1200,10 @@ async fn dispatch_client_frame(
                             },
                             Err(e) => CommsMsg::PopupAck {
                                 shown: false,
-                                message: format!("popup task failed: {e}"),
+                                message: format!("Message delivery failed: {e}"),
                             },
-                        };
+                        }
+                    };
                     if let Ok(f) = pack_message(ChannelId::Comms, FLAG_NONE, &ack, None) {
                         let _ = out_tx.send(f).await;
                     }
