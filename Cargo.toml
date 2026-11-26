@@ -1,0 +1,87 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/deskbolt-proto",
+    "crates/deskbolt-server",
+    "crates/deskbolt-viewer",
+]
+
+[workspace.package]
+version = "0.1.0-beta1"
+edition = "2024"
+license = "MPL-2.0"
+authors = ["StackSync Solutions <jakepanlilio2000>"]
+
+[workspace.dependencies]
+tokio = { version = "1.54.1", features = ["full"] }
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_Environment",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_Power",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Services",
+    "Win32_System_Shutdown",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+cpal = "0.18.2"
+windows-service = "0.8.1"
+dxgi-capture-rs = "1.2.2"
+openh264 = "0.9.10"
+zstd = "0.14.4"
+eframe = "0.37.0"
+egui = "0.37.0"
+rusqlite = { version = "0.32", features = ["bundled"] }
+rcgen = "0.14.10"
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+argon2 = "0.5"
+ring = "0.17"
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+xcap = "0.9.10"
+enigo = "0.6.1"
+arboard = "3.7.0"
+libc = "0.2"
+android-activity = { version = "0.6", features = ["game-activity"] }
+jni = "0.22"
+portable-pty = "0.9.0"
+vt100 = "0.15.2"
+russh = { version = "0.65", default-features = false, features = ["flate2", "ring", "rsa"] }
+russh-sftp = "3.0.1"
+serialport = { version = "4.7", default-features = false }
+surge-ping = "0.9.1"
+hickory-resolver = "0.25.2"
+sysinfo = { version = "0.34.2", default-features = false, features = ["disk", "system"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[workspace.lints.rust]

@@ -1,0 +1,166 @@
+# ==============================================================================
+# Build Outputs & Rust / C++ Compilation Artifacts
+# ==============================================================================
+/target/
+**/*.rs.bk
+*.pdb
+*.obj
+*.o
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
+*.exe
+*.out
+
+# ==============================================================================
+# Test Outputs, Coverage & Temporary Fixtures
+# ==============================================================================
+/coverage/
+/test-results/
+/tests/tmp/
+/tests/output/
+*.profraw
+*.profdata
+lcov.info
+tarpaulin-report.html
+*.test.db
+*.test.db-shm
+*.test.db-wal
+*.test.toml
+*.test.pem
+*.test.key
+*.pcap
+*.pcapng
+*.dmp
+*.crash
+core
+core.*
+
+# ==============================================================================
+# AI Tooling, Audit Evidence & Knowledge Graph Dumps
+# ==============================================================================
+/graphify-out/
+/.evidence/
+/.headroom/
+/.ponytail/
+/.agents/
+/.agent/
+/.claude/
+/.cursor/
+/.windsurf/
+/.codex/
+/.gemini/
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.cursorrules
+.windsurfrules
+*headroom*
+*ponytail*
+*_audit.md
+*_prompt.md
+*.bak
+*.tmp
+*.orig
+
+# ==============================================================================
+# Runtime Databases, Credentials & Generated TLS Certificates
+# ==============================================================================
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.sqlite
+*.sqlite3
+config.toml
+!config.example.toml
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+*.pfx
+
+# ==============================================================================
+# Cross-Platform Packaging & Mobile Artifacts (Linux, macOS, Android, Windows)
+# ==============================================================================
+# Windows Installers
+*.msi
+*.wixobj
+*.wixpdb
+/packaging/windows/*.exe
+
+# Linux Packages & Makepkg Build Directories
+*.deb
+*.rpm
+*.pkg.tar.zst
+*.pkg.tar.xz
+*.AppImage
+/packaging/arch/pkg/
+/packaging/arch/src/
+
+# macOS Bundles & Disk Images
+*.dmg
+*.app/
+
+# Android Gradle, NDK & Signing Keys
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/.cxx/
+/android/local.properties
+*.apk
+*.aab
+*.ap_
+*.dex
+*.keystore
+*.jks
+
+# ==============================================================================
+# OS & IDE Files
+# ==============================================================================
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ==============================================================================
+# Build Configuration (Tracked)
+# ==============================================================================
+!.cargo/config.toml
+
+# ==============================================================================
+# Local Python Tooling, Workspace Metadata & Stray Paths
+# ==============================================================================
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+skills-lock.json
+.graphifyignore
+/Users/
+
+# ==============================================================================
+# Release Staging, Android Native Libraries & Archives
+# ==============================================================================
+/dist/
+/android/app/src/main/jniLibs/
+*.tar.gz
+*.zip
+
+# ==============================================================================
+# Runtime Logs & Partial File Transfers
+# ==============================================================================
+*.log
+*.part
+*.deskbolt-part
