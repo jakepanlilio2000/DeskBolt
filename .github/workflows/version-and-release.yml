@@ -352,9 +352,13 @@ jobs:
           path: release-artifacts
           merge-multiple: true
 
-      - name: Generate SHA-256 checksums
+      - name: Stage release assets and generate SHA-256 checksums
         working-directory: release-artifacts
-        run: sha256sum * > "DeskBolt-${{ steps.ver.outputs.tag }}-SHA256SUMS.txt"
+        run: |
+          mkdir publish
+          cp -- ./*.zip ./*.exe ./*.dmg ./*.apk dist/linux-out/* publish/
+          cd publish
+          sha256sum -- * > "DeskBolt-${{ steps.ver.outputs.tag }}-SHA256SUMS.txt"
 
       - uses: softprops/action-gh-release@v2
         with:
@@ -362,4 +366,5 @@ jobs:
           name: DeskBolt ${{ steps.ver.outputs.tag }}
           prerelease: ${{ contains(steps.ver.outputs.version, '-beta') }}
           generate_release_notes: true
-          files: release-artifacts/*
+          files: release-artifacts/publish/*
+          fail_on_unmatched_files: true
