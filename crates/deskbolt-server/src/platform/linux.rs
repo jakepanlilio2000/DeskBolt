@@ -4,11 +4,8 @@ use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::process::Command;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
-use deskbolt_proto::{ClipboardSync, IpcMsg, KeyEvent, MonitorInfo, MouseBtn, PointerEvent};
-use tokio::sync::mpsc;
+use deskbolt_proto::{KeyEvent, MonitorInfo, MouseBtn, PointerEvent};
 use tracing::{info, warn};
 
 use super::desktop_common::{
@@ -287,14 +284,6 @@ pub fn enumerate_monitors() -> Vec<MonitorInfo> {
 
 pub fn bind_active_input_desktop() -> Result<String, String> {
     Ok(std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "Default".into()))
-}
-
-pub fn run_clipboard_loop(
-    rx: std::sync::mpsc::Receiver<ClipboardSync>,
-    ev_tx: mpsc::Sender<IpcMsg>,
-    stop: Arc<AtomicBool>,
-) {
-    super::desktop_common::run_clipboard_loop(rx, ev_tx, stop)
 }
 
 fn is_openrc_host() -> bool {

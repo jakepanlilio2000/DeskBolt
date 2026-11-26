@@ -5,6 +5,8 @@ use deskbolt_proto::{
     ClipboardSync, ControlMsg, FileTransferMsg, InputMsg, MouseBtn, PointerEvent, SessionMode,
     SpecialAction, SysAdminMsg, TerminalMsg, TransferDir, VideoQualityMode,
 };
+#[cfg(not(target_os = "android"))]
+use deskbolt_proto::native_clipboard::NativeClipboard;
 use egui::{
     Align, Color32, ColorImage, Context, Key, Layout, Pos2, Rect, ScrollArea, Sense, TextureHandle,
     TextureOptions, Vec2, Window,
@@ -24,7 +26,7 @@ use crate::net_tools::send_wol_packet;
 use crate::oob::OobAction;
 use crate::session::{
     ConnectTarget, ConnectionPhase, LogTailBuffer, OverwritePrompt, SessionCommand,
-    TransferItemStatus, ViewerSession, read_local_clipboard_utf8,
+    TransferItemStatus, ViewerSession,
 };
 use crate::sftp_sync::is_quick_edit_ext;
 use crate::shortcuts::create_desktop_shortcut;
@@ -69,7 +71,10 @@ pub struct DeskBoltViewerApp {
     local_mkdir_input: String,
     remote_mkdir_input: String,
     rename_modal: Option<RenameItemModal>,
+    #[cfg(not(target_os = "android"))]
     clip_seq: u64,
+    #[cfg(not(target_os = "android"))]
+    clipboard: Option<NativeClipboard>,
     show_about: bool,
     touch_two_finger: Option<(Pos2, f64, f32)>,
     #[cfg(target_os = "android")]
@@ -142,7 +147,10 @@ impl DeskBoltViewerApp {
             local_mkdir_input: String::new(),
             remote_mkdir_input: String::new(),
             rename_modal: None,
+            #[cfg(not(target_os = "android"))]
             clip_seq: 1,
+            #[cfg(not(target_os = "android"))]
+            clipboard: None,
             show_about: false,
             touch_two_finger: None,
             #[cfg(target_os = "android")]
@@ -201,15 +209,36 @@ impl DeskBoltViewerApp {
         }
     }
 
-    fn poll_all_sessions(&mut self, ctx: &Context) {
+    fn poll_all_sessions(&mut self, _ctx: &Context) {
         let mut pins_to_save = Vec::new();
         for s in &mut self.sessions {
             let (pin_opt, clip_opt) = s.poll_events();
             if let Some(pin_info) = pin_opt {
                 pins_to_save.push(pin_info);
             }
-            if let Some(text) = clip_opt {
-                ctx.copy_text(text);
+            if let Some(message) = clip_opt
+                && self.active_tab_id == Some(s.id)
+            {
+                let limit = self.settings.clipboard_max_bytes;
+                if !message.within_limit(limit) {
+                    s.status_banner = "Clipboard exceeds the viewer size limit.".into();
+                    continue;
+                }
+                #[cfg(not(target_os = "android"))]
+                {
+                    if self.clipboard.is_none() {
+                        self.clipboard = NativeClipboard::open();
+                    }
+                    s.status_banner = if self.clipboard.as_mut().is_some_and(|c| c.write(&message, limit)) {
+                        "Clipboard updated.".into()
+                    } else {
+                        "Clipboard could not be updated.".into()
+                    };
+                }
+                #[cfg(target_os = "android")]
+                if let ClipboardSync::SetText { utf8_text, .. } = message {
+                    _ctx.copy_text(utf8_text);
+                }
             }
         }
         for (host_id_opt, fp) in pins_to_save {
@@ -1275,13 +1304,17 @@ impl DeskBoltViewerApp {
                     }
                     ui.menu_button("Clipboard", |ui| {
                         ui.checkbox(&mut s.auto_clipboard, "Auto-sync clipboard");
+                        #[cfg(not(target_os = "android"))]
                         if is_full && ui.button("Send Local Clipboard").clicked() {
-                            if let Some(txt) = read_local_clipboard_utf8() {
+                            if self.clipboard.is_none() {
+                                self.clipboard = NativeClipboard::open();
+                            }
+                            let limit = self.settings.clipboard_max_bytes;
+                            if let Some(data) = self.clipboard.as_mut().and_then(|c| c.read(limit)) {
                                 self.clip_seq += 1;
-                                s.send_cmd(SessionCommand::Clipboard(ClipboardSync::SetText {
-                                    seq: self.clip_seq,
-                                    utf8_text: txt,
-                                }));
+                                s.send_cmd(SessionCommand::Clipboard(ClipboardSync::set(self.clip_seq, data)));
+                            } else {
+                                s.status_banner = "Clipboard is empty, unavailable, or exceeds the size limit.".into();
                             }
                             ui.close();
                         }

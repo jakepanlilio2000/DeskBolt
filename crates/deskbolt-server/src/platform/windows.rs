@@ -1,26 +1,15 @@
 use std::collections::HashSet;
 use std::mem;
 use std::path::Path;
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
-};
-use std::thread;
 use std::time::Duration;
 
 use deskbolt_proto::{
-    ClipboardSync, DesktopState, IpcMsg, KeyEvent, MonitorInfo, MouseBtn, MoveRect, PointerEvent,
+    DesktopState, KeyEvent, MonitorInfo, MouseBtn, MoveRect, PointerEvent,
 };
 use dxgi_capture_rs::{CaptureError, DXGIManager, FrameMetadata};
-use tokio::sync::mpsc;
 use tracing::{info, warn};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::System::DataExchange::{
-    AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard,
-    RemoveClipboardFormatListener, SetClipboardData,
-};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
     KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
@@ -30,9 +19,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetSystemMetrics, HWND_MESSAGE, PostMessageW, PostQuitMessage, RegisterClassW,
+    GetSystemMetrics, PostMessageW, PostQuitMessage, RegisterClassW,
     SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, TranslateMessage,
-    WM_CLIPBOARDUPDATE, WM_CLOSE, WNDCLASSW,
+    WM_CLOSE, WNDCLASSW,
 };
 use windows::core::w;
 
@@ -41,9 +30,6 @@ use crate::service;
 use crate::win32_util;
 
 use super::{CaptureOutput, InputInjector, RawCapturedFrame, ScreenCapturer};
-
-const CF_UNICODETEXT_ID: u32 = 13;
-const MAX_CLIPBOARD_BYTES: usize = 2 * 1024 * 1024;
 
 pub struct WinDxgiCapturer {
     manager: DXGIManager,
@@ -352,208 +338,6 @@ pub fn enumerate_monitors() -> Vec<MonitorInfo> {
 
 pub fn bind_active_input_desktop() -> Result<String, String> {
     win32_util::bind_thread_to_active_input_desktop()
-}
-
-struct ClipWindowState {
-    ev_tx: mpsc::Sender<IpcMsg>,
-    seq: u64,
-    last_written_text: Arc<Mutex<Option<String>>>,
-}
-
-pub fn run_clipboard_loop(
-    rx: std::sync::mpsc::Receiver<ClipboardSync>,
-    ev_tx: mpsc::Sender<IpcMsg>,
-    stop: Arc<AtomicBool>,
-) {
-    let _ = win32_util::bind_thread_to_active_input_desktop();
-    let last_written = Arc::new(Mutex::new(None::<String>));
-
-    let writer_last = last_written.clone();
-    let writer_stop = stop.clone();
-    let writer_handle = thread::spawn(move || {
-        while !writer_stop.load(Ordering::SeqCst) {
-            let Ok(msg) = rx.recv() else {
-                break;
-            };
-            match msg {
-                ClipboardSync::SetText { utf8_text, .. } => {
-                    if utf8_text.len() <= MAX_CLIPBOARD_BYTES {
-                        *writer_last.lock().unwrap() = Some(utf8_text.clone());
-                        set_local_clipboard_utf8(&utf8_text);
-                    }
-                }
-                ClipboardSync::Clear { .. } => {
-                    *writer_last.lock().unwrap() = Some(String::new());
-                    clear_local_clipboard();
-                }
-                ClipboardSync::SetData { .. } => {}
-            }
-        }
-    });
-
-    // SAFETY: Registers hidden message window and AddClipboardFormatListener on this thread.
-    unsafe {
-        let hinst = GetModuleHandleW(None).unwrap_or_default();
-        let class_name = w!("DeskBoltClipboardClass");
-        let wc = WNDCLASSW {
-            lpfnWndProc: Some(clip_wnd_proc),
-            hInstance: hinst.into(),
-            lpszClassName: class_name,
-            ..Default::default()
-        };
-        RegisterClassW(&wc);
-
-        let state = Box::new(ClipWindowState {
-            ev_tx,
-            seq: 1,
-            last_written_text: last_written,
-        });
-        let state_ptr = Box::into_raw(state);
-
-        if let Ok(hwnd) = CreateWindowExW(
-            Default::default(),
-            class_name,
-            w!("DeskBoltClip"),
-            Default::default(),
-            0,
-            0,
-            0,
-            0,
-            Some(HWND_MESSAGE),
-            None,
-            Some(hinst.into()),
-            Some(state_ptr.cast()),
-        ) {
-            let _ = AddClipboardFormatListener(hwnd);
-
-            let stopper_hwnd = hwnd.0 as usize;
-            let stopper_flag = stop.clone();
-            let watchdog = thread::spawn(move || {
-                while !stopper_flag.load(Ordering::SeqCst) {
-                    thread::sleep(Duration::from_millis(100));
-                }
-                let _ = PostMessageW(Some(HWND(stopper_hwnd as *mut _)), WM_CLOSE, WPARAM(0), LPARAM(0));
-            });
-
-            let mut msg = Default::default();
-            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-            let _ = RemoveClipboardFormatListener(hwnd);
-            let _ = DestroyWindow(hwnd);
-            let _ = watchdog.join();
-        }
-        drop(Box::from_raw(state_ptr));
-    }
-
-    let _ = writer_handle.join();
-}
-
-unsafe extern "system" fn clip_wnd_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        CREATESTRUCTW, GWLP_USERDATA, GetWindowLongPtrW, SetWindowLongPtrW, WM_CREATE,
-    };
-    // SAFETY: Standard Win32 window procedure userdata pointer handling.
-    unsafe {
-        if msg == WM_CREATE {
-            let cs = &*(lparam.0 as *const CREATESTRUCTW);
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize);
-            return LRESULT(0);
-        }
-        if msg == WM_CLIPBOARDUPDATE {
-            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ClipWindowState;
-            if !ptr.is_null() {
-                let state = &mut *ptr;
-                if let Some(text) = read_local_clipboard_utf8()
-                    && text.len() <= MAX_CLIPBOARD_BYTES
-                {
-                    let mut guard = state.last_written_text.lock().unwrap();
-                    if guard.as_deref() == Some(text.as_str()) {
-                        *guard = None;
-                    } else {
-                        *guard = None;
-                        state.seq = state.seq.saturating_add(1);
-                        let _ = state.ev_tx.blocking_send(IpcMsg::Clipboard(ClipboardSync::SetText {
-                            seq: state.seq,
-                            utf8_text: text,
-                        }));
-                    }
-                }
-            }
-            return LRESULT(0);
-        }
-        if msg == WM_CLOSE {
-            PostQuitMessage(0);
-            return LRESULT(0);
-        }
-        DefWindowProcW(hwnd, msg, wparam, lparam)
-    }
-}
-
-fn read_local_clipboard_utf8() -> Option<String> {
-    // SAFETY: Opens clipboard, locks CF_UNICODETEXT global handle, reads UTF-16 nul-terminated text.
-    unsafe {
-        if OpenClipboard(None).is_err() {
-            return None;
-        }
-        let result = (|| {
-            let h = GetClipboardData(CF_UNICODETEXT_ID).ok()?;
-            let ptr = GlobalLock(windows::Win32::Foundation::HGLOBAL(h.0)) as *const u16;
-            if ptr.is_null() {
-                return None;
-            }
-            let mut len = 0usize;
-            while len < MAX_CLIPBOARD_BYTES && *ptr.add(len) != 0 {
-                len += 1;
-            }
-            let slice = std::slice::from_raw_parts(ptr, len);
-            let text = String::from_utf16_lossy(slice);
-            let _ = GlobalUnlock(windows::Win32::Foundation::HGLOBAL(h.0));
-            Some(text)
-        })();
-        let _ = CloseClipboard();
-        result
-    }
-}
-
-fn set_local_clipboard_utf8(text: &str) {
-    let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-    let bytes = utf16.len() * 2;
-    // SAFETY: Allocates GMEM_MOVEABLE global memory and transfers ownership to SetClipboardData.
-    unsafe {
-        if OpenClipboard(None).is_err() {
-            return;
-        }
-        let _ = EmptyClipboard();
-        if let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, bytes) {
-            let dst = GlobalLock(hmem) as *mut u16;
-            if !dst.is_null() {
-                std::ptr::copy_nonoverlapping(utf16.as_ptr(), dst, utf16.len());
-                let _ = GlobalUnlock(hmem);
-                let _ = SetClipboardData(
-                    CF_UNICODETEXT_ID,
-                    Some(windows::Win32::Foundation::HANDLE(hmem.0)),
-                );
-            }
-        }
-        let _ = CloseClipboard();
-    }
-}
-
-fn clear_local_clipboard() {
-    // SAFETY: Open/Empty/Close clipboard.
-    unsafe {
-        if OpenClipboard(None).is_ok() {
-            let _ = EmptyClipboard();
-            let _ = CloseClipboard();
-        }
-    }
 }
 
 pub fn install_service() -> Result<(), String> {

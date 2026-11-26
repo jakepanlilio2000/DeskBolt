@@ -46,13 +46,11 @@ dxgi-capture-rs = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 xcap = { workspace = true }
 enigo = { workspace = true, features = ["x11rb", "wayland"] }
-arboard = { workspace = true }
 libc = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 xcap = { workspace = true }
 enigo = { workspace = true }
-arboard = { workspace = true }
 libc = { workspace = true }
 
 [target.'cfg(target_os = "android")'.dependencies]

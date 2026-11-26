@@ -1,9 +1,8 @@
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, atomic::{AtomicBool, Ordering}};
+use std::sync::{Condvar, Mutex, OnceLock, atomic::{AtomicBool, Ordering}};
 use std::thread;
 
-use deskbolt_proto::{ClipboardSync, IpcMsg, KeyEvent, MonitorInfo, MouseBtn, PointerEvent};
+use deskbolt_proto::{KeyEvent, MonitorInfo, MouseBtn, PointerEvent};
 use jni::objects::{Global, JByteArray, JClass, JObject, JString, JValue};
 use jni::sys::{jfloat, jint};
 use jni::{EnvUnowned, JavaVM, jni_sig, jni_str};
@@ -321,17 +320,6 @@ pub fn enumerate_monitors() -> Vec<MonitorInfo> {
 
 pub fn bind_active_input_desktop() -> Result<String, String> {
     Ok("AndroidMediaProjection".into())
-}
-
-pub fn run_clipboard_loop(
-    _rx: std::sync::mpsc::Receiver<ClipboardSync>,
-    _ev_tx: mpsc::Sender<IpcMsg>,
-    stop: Arc<AtomicBool>,
-) {
-    let mut _q: VecDeque<String> = VecDeque::new();
-    while !stop.load(Ordering::SeqCst) {
-        thread::sleep(std::time::Duration::from_millis(250));
-    }
 }
 
 pub fn install_service() -> Result<(), String> {

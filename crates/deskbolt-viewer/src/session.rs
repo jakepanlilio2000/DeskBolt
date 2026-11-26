@@ -24,10 +24,6 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 #[cfg(target_os = "windows")]
 use windows::Win32::Storage::FileSystem::GetLogicalDrives;
-#[cfg(target_os = "windows")]
-use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
-#[cfg(target_os = "windows")]
-use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
 
 pub const FILE_CHUNK_SIZE: usize = 64 * 1024;
 pub const MAX_UNACKED_CHUNKS: u32 = 8;
@@ -253,7 +249,7 @@ pub enum SessionUiEvent {
     MonitorsUpdated { monitors: Vec<MonitorInfo>, active_id: u8 },
     RttUpdated(u64),
     StatusBanner(String),
-    RemoteClipboard(String),
+    RemoteClipboard(ClipboardSync),
     FileRoots(Vec<DriveEntry>),
     FileDirList { path: String, entries: Vec<FileEntry>, error: Option<String> },
     FileActionResult { ok: bool, error: Option<String> },
@@ -426,7 +422,7 @@ impl ViewerSession {
         let _ = self.cmd_tx.try_send(cmd);
     }
 
-    pub fn poll_events(&mut self) -> (Option<(Option<i64>, String)>, Option<String>) {
+    pub fn poll_events(&mut self) -> (Option<(Option<i64>, String)>, Option<ClipboardSync>) {
         let mut pin_to_save = None;
         let mut clip_to_copy = None;
         while let Ok(ev) = self.event_rx.try_recv() {
@@ -463,10 +459,9 @@ impl ViewerSession {
                     self.last_rtt_ms = Some(ms);
                 }
                 SessionUiEvent::StatusBanner(msg) => self.status_banner = msg,
-                SessionUiEvent::RemoteClipboard(text) => {
-                    if self.auto_clipboard {
-                        self.status_banner = format!("Clipboard updated ({} chars)", text.chars().count());
-                        clip_to_copy = Some(text);
+                SessionUiEvent::RemoteClipboard(message) => {
+                    if self.auto_clipboard && self.mode == SessionMode::FullControl {
+                        clip_to_copy = Some(message);
                     }
                 }
                 SessionUiEvent::FileRoots(roots) => {
@@ -1337,8 +1332,8 @@ async fn run_session_task(
                             }
                         }
                         ChannelId::Clipboard => {
-                            if let Ok(ClipboardSync::SetText { utf8_text, .. }) = unpack_message::<ClipboardSync>(&frame) {
-                                notify(SessionUiEvent::RemoteClipboard(utf8_text));
+                            if let Ok(message) = unpack_message::<ClipboardSync>(&frame) {
+                                notify(SessionUiEvent::RemoteClipboard(message));
                             }
                         }
                         ChannelId::FileTransfer => {
@@ -2373,43 +2368,13 @@ pub fn read_local_dir(path: &Path) -> Result<Vec<FileEntry>, String> {
     Ok(entries)
 }
 
-/// Reads UTF-8 text from the local clipboard (used by Toolbar "Send Local Clipboard").
 pub fn read_local_clipboard_utf8() -> Option<String> {
-    #[cfg(target_os = "windows")]
-    {
-        // SAFETY: Standard Win32 CF_UNICODETEXT read with GlobalLock/GlobalUnlock and CloseClipboard.
-        unsafe {
-            if OpenClipboard(None).is_err() {
-                return None;
-            }
-            let res = (|| {
-                let h = GetClipboardData(13).ok()?;
-                let ptr = GlobalLock(windows::Win32::Foundation::HGLOBAL(h.0)) as *const u16;
-                if ptr.is_null() {
-                    return None;
-                }
-                let mut len = 0usize;
-                while len < 1_048_576 && *ptr.add(len) != 0 {
-                    len += 1;
-                }
-                let text = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
-                let _ = GlobalUnlock(windows::Win32::Foundation::HGLOBAL(h.0));
-                Some(text)
-            })();
-            let _ = CloseClipboard();
-            res
-        }
-    }
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        arboard::Clipboard::new()
-            .and_then(|mut cb| cb.get_text())
-            .ok()
-    }
+    #[cfg(not(target_os = "android"))]
+    return deskbolt_proto::native_clipboard::NativeClipboard::open()?
+        .text(deskbolt_proto::MAX_CLIPBOARD_BYTES);
+
     #[cfg(target_os = "android")]
-    {
-        None
-    }
+    None
 }
 
 #[cfg(test)]

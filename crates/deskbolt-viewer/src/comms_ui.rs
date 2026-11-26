@@ -789,6 +789,10 @@ impl DeskBoltViewerApp {
                                 ui.label("Cursor Sync:");
                                 ui.checkbox(&mut opt.draft.remote_cursor_sync, "Synchronize remote cursor shape & visibility");
                                 ui.end_row();
+                                ui.label("Clipboard limit (bytes)");
+                                ui.add(egui::DragValue::new(&mut opt.draft.clipboard_max_bytes)
+                                    .range(0..=deskbolt_proto::MAX_CLIPBOARD_BYTES).speed(1024));
+                                ui.end_row();
                                 ui.label("Multi-Monitor Mode:");
                                 egui::ComboBox::from_id_salt("opt_multimon")
                                     .selected_text(opt.draft.multimonitor_mode.label())

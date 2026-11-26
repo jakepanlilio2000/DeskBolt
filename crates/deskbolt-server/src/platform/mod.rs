@@ -2,10 +2,10 @@ use std::net::IpAddr;
 use std::path::Path;
 
 use deskbolt_proto::{
-    ClipboardSync, DesktopState, KeyEvent, MonitorInfo, MoveRect, PointerEvent, PowerAction,
+    DesktopState, KeyEvent, MonitorInfo, MoveRect, PointerEvent, PowerAction,
     SessionMode,
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 
 #[cfg(target_os = "windows")]
 mod windows;
@@ -140,14 +140,6 @@ pub fn enumerate_monitors() -> Vec<MonitorInfo> {
 
 pub fn bind_active_input_desktop() -> Result<String, String> {
     imp::bind_active_input_desktop()
-}
-
-pub fn run_clipboard_loop(
-    rx: std::sync::mpsc::Receiver<ClipboardSync>,
-    ev_tx: mpsc::Sender<deskbolt_proto::IpcMsg>,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) {
-    imp::run_clipboard_loop(rx, ev_tx, stop)
 }
 
 pub fn install_service() -> Result<(), String> {

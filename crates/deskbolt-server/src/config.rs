@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use deskbolt_proto::{
-    DEFAULT_PORT, GeneratedIdentity, SessionMode, StoredCredential, VideoQualityMode,
+    DEFAULT_CLIPBOARD_MAX_BYTES, DEFAULT_PORT, GeneratedIdentity, MAX_CLIPBOARD_BYTES, SessionMode, StoredCredential, VideoQualityMode,
     generate_self_signed_cert, load_identity_from_pem_bytes,
 };
 
@@ -100,6 +100,7 @@ pub struct ServerConfig {
     pub audit_log_path: Option<PathBuf>,
     // Feature toggles
     pub permissions: FeaturePermissions,
+    pub clipboard_max_bytes: usize,
     // Capture & privacy
     pub default_quality: VideoQualityMode,
     pub max_fps: u8,
@@ -129,6 +130,7 @@ impl ServerConfig {
             force_view_only: false,
             audit_log_path: None,
             permissions: FeaturePermissions::default(),
+            clipboard_max_bytes: DEFAULT_CLIPBOARD_MAX_BYTES,
             default_quality: VideoQualityMode::Auto,
             max_fps: 60,
             capture_cursor: true,
@@ -213,6 +215,11 @@ impl ServerConfig {
                         .map_err(|_| format!("invalid max_fps on line {ln}"))?
                         .clamp(15, 120);
                 }
+                "clipboard_max_bytes" => {
+                    cfg.clipboard_max_bytes = v.parse::<usize>()
+                        .map_err(|_| format!("invalid clipboard_max_bytes on line {ln}"))?
+                        .min(MAX_CLIPBOARD_BYTES);
+                }
                 "capture_cursor" => cfg.capture_cursor = parse_bool(v, ln)?,
                 "curtain_on_control" => cfg.curtain_on_control = parse_bool(v, ln)?,
                 _ => {}
@@ -258,6 +265,7 @@ impl ServerConfig {
              allow_tunnels = {}\n\
              default_quality = \"{}\"\n\
              max_fps = {}\n\
+             clipboard_max_bytes = {}\n\
              capture_cursor = {}\n\
              curtain_on_control = {}\n",
             escape_toml(&self.bind_addr),
@@ -288,6 +296,7 @@ impl ServerConfig {
             self.permissions.tunnels,
             quality_to_str(self.default_quality),
             self.max_fps.clamp(15, 120),
+            self.clipboard_max_bytes.min(MAX_CLIPBOARD_BYTES),
             self.capture_cursor,
             self.curtain_on_control,
         )
@@ -547,6 +556,7 @@ pub struct ServerPolicy {
     pub force_view_only: bool,
     pub audit_log_path: Option<PathBuf>,
     pub permissions: FeaturePermissions,
+    pub clipboard_max_bytes: usize,
     pub default_quality: VideoQualityMode,
     pub max_fps: u8,
     pub capture_cursor: bool,
@@ -569,6 +579,7 @@ impl ServerPolicy {
             force_view_only: cfg.force_view_only,
             audit_log_path: cfg.audit_log_path.clone(),
             permissions: cfg.permissions.clone(),
+            clipboard_max_bytes: cfg.clipboard_max_bytes.min(MAX_CLIPBOARD_BYTES),
             default_quality: cfg.default_quality,
             max_fps: cfg.max_fps.clamp(15, 120),
             capture_cursor: cfg.capture_cursor,
@@ -602,6 +613,7 @@ impl ServerPolicy {
             force_view_only: false,
             audit_log_path: None,
             permissions: FeaturePermissions::default(),
+            clipboard_max_bytes: DEFAULT_CLIPBOARD_MAX_BYTES,
             default_quality: VideoQualityMode::Auto,
             max_fps: 60,
             capture_cursor: true,
@@ -927,6 +939,7 @@ mod tests {
         cfg.permissions.voice_chat = false;
         cfg.default_quality = VideoQualityMode::CrispText;
         cfg.max_fps = 45;
+        cfg.clipboard_max_bytes = 4096;
         cfg.capture_cursor = false;
         cfg.curtain_on_control = true;
         cfg.save(&temp).unwrap();
@@ -950,6 +963,7 @@ mod tests {
         assert!(reloaded.permissions.text_chat);
         assert_eq!(reloaded.default_quality, VideoQualityMode::CrispText);
         assert_eq!(reloaded.max_fps, 45);
+        assert_eq!(reloaded.clipboard_max_bytes, 4096);
         assert!(!reloaded.capture_cursor);
         assert!(reloaded.curtain_on_control);
 

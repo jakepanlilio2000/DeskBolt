@@ -14,6 +14,8 @@ use deskbolt_proto::{
     ChannelId, FLAG_KEYFRAME, FLAG_NONE, pack_message, read_frame_async, unpack_message,
     write_frame_async,
 };
+#[cfg(not(target_os = "android"))]
+use deskbolt_proto::{ClipboardSync, DEFAULT_CLIPBOARD_MAX_BYTES, native_clipboard::NativeClipboard};
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::warn;
 
@@ -166,7 +168,8 @@ fn run_agent_workers(
     });
 
     let (input_tx, input_rx) = std::sync::mpsc::channel::<InputMsg>();
-    let (clip_tx, clip_rx) = std::sync::mpsc::channel::<deskbolt_proto::ClipboardSync>();
+    #[cfg(not(target_os = "android"))]
+    let (clip_tx, clip_rx) = std::sync::mpsc::channel();
 
     let cap_stop = stop.clone();
     let cap_shared = shared.clone();
@@ -184,17 +187,21 @@ fn run_agent_workers(
     let inp_shared = shared.clone();
     let inp_handle = thread::spawn(move || input_loop(inp_shared, input_rx, inp_stop));
 
-    let clip_stop = stop.clone();
-    let clip_ev = ev_tx.clone();
-    let clip_handle = thread::spawn(move || platform::run_clipboard_loop(clip_rx, clip_ev, clip_stop));
+    #[cfg(not(target_os = "android"))]
+    let clip_handle = {
+        let clip_stop = stop.clone();
+        let clip_ev = ev_tx.clone();
+        thread::spawn(move || run_clipboard_loop(clip_rx, clip_ev, clip_stop))
+    };
 
     while let Some(cmd) = cmd_rx.blocking_recv() {
         match cmd {
             IpcMsg::Input(inp) => {
                 let _ = input_tx.send(inp);
             }
-            IpcMsg::Clipboard(c) => {
-                let _ = clip_tx.send(c);
+            #[cfg(not(target_os = "android"))]
+            clip @ (IpcMsg::Clipboard(_) | IpcMsg::SetClipboardLimit(_)) => {
+                let _ = clip_tx.send(clip);
             }
             IpcMsg::QualityPreset {
                 mode,
@@ -232,11 +239,57 @@ fn run_agent_workers(
     stop.store(true, Ordering::SeqCst);
     slot.cv.notify_all();
     drop(input_tx);
-    drop(clip_tx);
     let _ = cap_handle.join();
     let _ = enc_handle.join();
     let _ = inp_handle.join();
-    let _ = clip_handle.join();
+    #[cfg(not(target_os = "android"))]
+    {
+        drop(clip_tx);
+        let _ = clip_handle.join();
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn run_clipboard_loop(
+    rx: std::sync::mpsc::Receiver<IpcMsg>,
+    events: mpsc::Sender<IpcMsg>,
+    stop: Arc<AtomicBool>,
+) {
+    let _ = bind_active_input_desktop();
+    let mut clipboard = None;
+    let mut previous = None;
+    let mut initialized = false;
+    let mut limit = DEFAULT_CLIPBOARD_MAX_BYTES;
+    let mut seq = 0;
+    while !stop.load(Ordering::Relaxed) {
+        let command = rx.recv_timeout(Duration::from_millis(250)).ok();
+        if let Some(IpcMsg::SetClipboardLimit(bytes)) = command {
+            limit = bytes as usize;
+            continue;
+        }
+        if clipboard.is_none() {
+            clipboard = NativeClipboard::open();
+        }
+        let Some(clipboard) = clipboard.as_mut() else { continue };
+        if let Some(IpcMsg::Clipboard(message)) = command
+            && clipboard.write(&message, limit)
+        {
+            previous = clipboard.read(limit);
+            initialized = true;
+            continue;
+        }
+        let current = clipboard.read(limit);
+        if initialized && current != previous
+            && let Some(data) = current.as_ref()
+        {
+            seq += 1;
+            if events.blocking_send(IpcMsg::Clipboard(ClipboardSync::set(seq, data.clone()))).is_err() {
+                break;
+            }
+        }
+        previous = current;
+        initialized = true;
+    }
 }
 
 fn capture_loop(

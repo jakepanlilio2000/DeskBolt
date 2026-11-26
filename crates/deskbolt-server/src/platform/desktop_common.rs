@@ -3,20 +3,9 @@ use std::ffi::CString;
 use std::io::{self, BufRead};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
-};
-use std::thread;
-use std::time::Duration;
-
-use arboard::Clipboard;
-use deskbolt_proto::{
-    ClipboardSync, IpcMsg, KeyEvent, MonitorInfo, MouseBtn, PointerEvent,
-};
 use enigo::{Axis, Button, Coordinate, Direction, Enigo, Key, Keyboard, Mouse, Settings};
-use tokio::sync::mpsc;
-use tracing::{info, warn};
+use deskbolt_proto::{KeyEvent, MonitorInfo, MouseBtn, PointerEvent};
+use tracing::warn;
 use xcap::Monitor;
 
 use super::{
@@ -24,7 +13,6 @@ use super::{
     rgba_to_bgra,
 };
 
-const MAX_CLIPBOARD_BYTES: usize = 2 * 1024 * 1024;
 const DIFF_BLOCK_PX: u32 = 64;
 
 pub fn enumerate_xcap_monitors() -> Vec<MonitorInfo> {
@@ -304,65 +292,6 @@ pub fn vk_to_enigo_key(vk: u16) -> Option<Key> {
         _ => return None,
     };
     Some(k)
-}
-
-pub fn run_clipboard_loop(
-    rx: std::sync::mpsc::Receiver<ClipboardSync>,
-    ev_tx: mpsc::Sender<IpcMsg>,
-    stop: Arc<AtomicBool>,
-) {
-    let last_written = Arc::new(Mutex::new(None::<String>));
-    let mut seq = 1u64;
-    let mut last_observed = String::new();
-
-    let writer_last = last_written.clone();
-    let writer_stop = stop.clone();
-    let writer = thread::spawn(move || {
-        while !writer_stop.load(Ordering::SeqCst) {
-            let Ok(msg) = rx.recv_timeout(Duration::from_millis(200)) else {
-                continue;
-            };
-            let Ok(mut cb) = Clipboard::new() else {
-                continue;
-            };
-            match msg {
-                ClipboardSync::SetText { utf8_text, .. } if utf8_text.len() <= MAX_CLIPBOARD_BYTES => {
-                    *writer_last.lock().unwrap() = Some(utf8_text.clone());
-                    let _ = cb.set_text(utf8_text);
-                }
-                ClipboardSync::Clear { .. } => {
-                    *writer_last.lock().unwrap() = Some(String::new());
-                    let _ = cb.clear();
-                }
-                _ => {}
-            }
-        }
-    });
-
-    while !stop.load(Ordering::SeqCst) {
-        if let Ok(mut cb) = Clipboard::new()
-            && let Ok(text) = cb.get_text()
-            && text.len() <= MAX_CLIPBOARD_BYTES
-            && text != last_observed
-        {
-            last_observed = text.clone();
-            let mut guard = last_written.lock().unwrap();
-            if guard.as_deref() == Some(text.as_str()) {
-                *guard = None;
-            } else {
-                *guard = None;
-                seq = seq.saturating_add(1);
-                let _ = ev_tx.blocking_send(IpcMsg::Clipboard(ClipboardSync::SetText {
-                    seq,
-                    utf8_text: text,
-                }));
-            }
-        }
-        thread::sleep(Duration::from_millis(250));
-    }
-
-    let _ = writer.join();
-    info!("Desktop clipboard sync stopped");
 }
 
 pub fn unix_set_restrictive_acl(path: &Path) -> Result<(), String> {

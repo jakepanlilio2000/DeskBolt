@@ -252,6 +252,13 @@ pub enum ClipboardSync {
 }
 
 impl ClipboardSync {
+    pub fn set(seq: u64, data: ClipboardMsg) -> Self {
+        match data {
+            ClipboardMsg::Utf8Text(utf8_text) => Self::SetText { seq, utf8_text },
+            data => Self::SetData { seq, data },
+        }
+    }
+
     pub fn within_limit(&self, limit: usize) -> bool {
         let bytes = match self {
             Self::SetText { utf8_text, .. } => utf8_text.len(),
@@ -666,6 +673,7 @@ pub enum IpcMsg {
         urgent: bool,
     },
     Shutdown,
+    SetClipboardLimit(u32),
 }
 
 #[cfg(test)]

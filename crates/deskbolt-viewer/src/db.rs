@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use deskbolt_proto::{SessionMode, VideoQualityMode};
+use deskbolt_proto::{DEFAULT_CLIPBOARD_MAX_BYTES, MAX_CLIPBOARD_BYTES, SessionMode, VideoQualityMode};
 use rusqlite::{Connection, OptionalExtension, params};
 
 #[cfg(target_os = "android")]
@@ -361,6 +361,7 @@ pub struct ViewerSettings {
     pub texture_filter: TextureFilterMode,
     pub sys_keys_mode: SystemKeysMode,
     pub remote_cursor_sync: bool,
+    pub clipboard_max_bytes: usize,
     pub multimonitor_mode: MultimonitorViewMode,
     pub mic_device: String,
     pub speaker_device: String,
@@ -394,6 +395,7 @@ impl Default for ViewerSettings {
             texture_filter: TextureFilterMode::Linear,
             sys_keys_mode: SystemKeysMode::Focused,
             remote_cursor_sync: true,
+            clipboard_max_bytes: DEFAULT_CLIPBOARD_MAX_BYTES,
             multimonitor_mode: MultimonitorViewMode::Switch,
             mic_device: "Default".into(),
             speaker_device: "Default".into(),
@@ -929,6 +931,10 @@ impl PhonebookDb {
                 "texture_filter" => s.texture_filter = TextureFilterMode::from_key(&v),
                 "sys_keys_mode" => s.sys_keys_mode = SystemKeysMode::from_key(&v),
                 "remote_cursor_sync" => s.remote_cursor_sync = v != "0",
+                "clipboard_max_bytes" => {
+                    s.clipboard_max_bytes = v.parse().unwrap_or(DEFAULT_CLIPBOARD_MAX_BYTES)
+                        .min(MAX_CLIPBOARD_BYTES);
+                }
                 "multimonitor_mode" => s.multimonitor_mode = MultimonitorViewMode::from_key(&v),
                 "mic_device" => s.mic_device = v,
                 "speaker_device" => s.speaker_device = v,
@@ -954,7 +960,7 @@ impl PhonebookDb {
     }
 
     pub fn save_settings(&self, s: &ViewerSettings) -> Result<(), String> {
-        let pairs: [(&str, String); 28] = [
+        let pairs = [
             ("default_mode", (s.default_mode as i64).to_string()),
             ("default_quality", (s.default_quality as i64).to_string()),
             ("color_depth", s.color_depth.to_string()),
@@ -965,6 +971,7 @@ impl PhonebookDb {
             ("texture_filter", s.texture_filter.as_str().into()),
             ("sys_keys_mode", s.sys_keys_mode.as_str().into()),
             ("remote_cursor_sync", i32::from(s.remote_cursor_sync).to_string()),
+            ("clipboard_max_bytes", s.clipboard_max_bytes.to_string()),
             ("multimonitor_mode", s.multimonitor_mode.as_str().into()),
             ("mic_device", s.mic_device.clone()),
             ("speaker_device", s.speaker_device.clone()),
@@ -1457,6 +1464,7 @@ mod tests {
         settings.auto_save_chat = true;
         settings.noise_gate = 0.04;
         settings.hotkey_fullscreen = "F10".into();
+        settings.clipboard_max_bytes = 42_000;
         db.save_settings(&settings).unwrap();
         let reloaded = db.load_settings();
         assert_eq!(reloaded.scale_mode, ScaleMode::OneToOne);
@@ -1465,5 +1473,6 @@ mod tests {
         assert!(reloaded.auto_save_chat);
         assert!((reloaded.noise_gate - 0.04).abs() < 0.001);
         assert_eq!(reloaded.hotkey_fullscreen, "F10");
+        assert_eq!(reloaded.clipboard_max_bytes, 42_000);
     }
 }

@@ -299,6 +299,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         let _ = hub
             .to_agent_tx
             .try_send(IpcMsg::SetCaptureCursor(policy.capture_cursor));
+        let _ = hub.to_agent_tx.try_send(IpcMsg::SetClipboardLimit(policy.clipboard_max_bytes as u32));
         if mode == SessionMode::FullControl && policy.curtain_on_control && policy.os_prompts_enabled() {
             let _ = hub.to_agent_tx.try_send(IpcMsg::SetCurtainMode(true));
         }
@@ -744,6 +745,11 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
             ev = agent_rx.recv(), if *mode != SessionMode::FileTransfer => {
                 match ev {
                     Ok(msg) => {
+                        if let IpcMsg::Clipboard(clipboard) = msg.as_ref()
+                            && (*mode != SessionMode::FullControl || !clipboard.within_limit(policy.clipboard_max_bytes))
+                        {
+                            continue;
+                        }
                         if let Some(frame) = ipc_to_wire_frame(&msg) {
                             let _ = out_tx.try_send(frame);
                         }
@@ -1010,7 +1016,11 @@ async fn dispatch_client_frame(
                 return Ok(());
             }
             let clip: ClipboardSync = unpack_message(&frame).map_err(|e| e.to_string())?;
-            let _ = hub.to_agent_tx.try_send(IpcMsg::Clipboard(clip));
+            if clip.within_limit(policy.clipboard_max_bytes) {
+                let _ = hub.to_agent_tx.try_send(IpcMsg::Clipboard(clip));
+            } else {
+                send_control_error(out_tx, "Clipboard exceeds the host size limit.");
+            }
         }
         ChannelId::FileTransfer => {
             if *mode == SessionMode::ViewOnly || !policy.permissions.file_transfer {
