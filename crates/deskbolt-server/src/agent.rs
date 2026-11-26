@@ -227,7 +227,9 @@ fn run_agent_workers(
                 shared.force_keyframe.store(true, Ordering::SeqCst);
             }
             IpcMsg::SetCurtainMode(enabled) => {
-                let _ = platform::set_curtain_mode(enabled);
+                if let Err(error) = platform::set_curtain_mode(enabled) {
+                    warn!("Could not change screen blanking: {error}");
+                }
             }
             IpcMsg::SetCaptureCursor(enabled) => {
                 shared.capture_cursor.store(enabled, Ordering::Relaxed);

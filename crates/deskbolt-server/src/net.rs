@@ -23,10 +23,9 @@ use tracing::{info, warn};
 use crate::config::{ServerConfig, ServerPolicy, evaluate_ip_access, log_audit_event};
 use crate::files::FileSessionHandler;
 use crate::ipc::{AgentHub, ViewerActivity};
-use crate::platform::{
-    execute_power_action, prompt_connection_confirmation, set_curtain_mode, show_desktop_popup,
-    trigger_send_sas,
-};
+#[cfg(target_os = "windows")]
+use crate::platform::set_curtain_mode;
+use crate::platform::{execute_power_action, prompt_connection_confirmation, show_desktop_popup, trigger_send_sas};
 use crate::sysadmin::{SysAdminHandler, execute_broadcast_command};
 use crate::terminal::TerminalSessionHandler;
 use crate::tunnel::TunnelSessionHandler;
@@ -301,7 +300,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             .try_send(IpcMsg::SetCaptureCursor(policy.capture_cursor));
         let _ = hub.to_agent_tx.try_send(IpcMsg::SetClipboardLimit(policy.clipboard_max_bytes as u32));
         if mode == SessionMode::FullControl && policy.curtain_on_control && policy.os_prompts_enabled() {
-            let _ = hub.to_agent_tx.try_send(IpcMsg::SetCurtainMode(true));
+            let _ = hub.to_agent_tx.send(IpcMsg::SetCurtainMode(true)).await;
         }
     }
 
@@ -324,7 +323,8 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         if mode == SessionMode::FullControl {
             let _ = hub.to_agent_tx.try_send(IpcMsg::Input(InputMsg::ReleaseAllKeys));
             if policy.curtain_on_control && policy.os_prompts_enabled() {
-                let _ = hub.to_agent_tx.try_send(IpcMsg::SetCurtainMode(false));
+                let _ = hub.to_agent_tx.send(IpcMsg::SetCurtainMode(false)).await;
+                #[cfg(target_os = "windows")]
                 let _ = set_curtain_mode(false);
             }
         }
@@ -339,6 +339,22 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     drop(ctrl_guard);
 
     res
+}
+
+async fn approve_local_access(peer: Option<IpAddr>, mode: SessionMode, policy: &ServerPolicy) -> bool {
+    if !policy.confirm_connect || !policy.os_prompts_enabled() {
+        return true;
+    }
+    let default_allow = policy.confirm_default_allow;
+    let Some(peer) = peer else {
+        return default_allow;
+    };
+    let timeout = policy.confirm_timeout_secs;
+    tokio::task::spawn_blocking(move || {
+        prompt_connection_confirmation(peer, mode, timeout, default_allow)
+    })
+    .await
+    .unwrap_or(default_allow)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -496,31 +512,22 @@ async fn authenticate_stream<S: AsyncRead + AsyncWrite + Unpin>(
         return Err("requested mode disallowed by host policy".into());
     }
 
-    if policy.confirm_connect && policy.os_prompts_enabled() {
-        let timeout_secs = policy.confirm_timeout_secs;
-        let def_allow = policy.confirm_default_allow;
-        let approved = tokio::task::spawn_blocking(move || {
-            prompt_connection_confirmation(peer_ip, effective_requested, timeout_secs, def_allow)
-        })
-        .await
-        .unwrap_or(def_allow);
-        if !approved {
-            let reject = pack_message(
-                ChannelId::AuthControl,
-                FLAG_URGENT,
-                &ControlMsg::AuthResult {
-                    accepted: false,
-                    server_proof: [0u8; 32],
-                    granted_mode: requested_mode,
-                    retry_after_secs: 0,
-                    reason: "Connection declined by local desktop user.".into(),
-                },
-                None,
-            )
-            .map_err(|e| e.to_string())?;
-            let _ = write_frame_async(&mut tls, reject.channel, reject.flags, &reject.payload).await;
-            return Err("connection rejected by local user confirmation".into());
-        }
+    if !approve_local_access(Some(peer_ip), effective_requested, policy).await {
+        let reject = pack_message(
+            ChannelId::AuthControl,
+            FLAG_URGENT,
+            &ControlMsg::AuthResult {
+                accepted: false,
+                server_proof: [0u8; 32],
+                granted_mode: requested_mode,
+                retry_after_secs: 0,
+                reason: "Connection declined by local desktop user.".into(),
+            },
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+        let _ = write_frame_async(&mut tls, reject.channel, reject.flags, &reject.payload).await;
+        return Err("connection rejected by local user confirmation".into());
     }
 
     let granted_mode = if effective_requested == SessionMode::FullControl && !guard.try_acquire(controller_lock) {
@@ -694,9 +701,11 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
         Duration::from_secs(10),
     );
     let mut last_rx = Instant::now();
+    let mut disconnect = crate::platform::subscribe_disconnect();
 
     let result = loop {
         tokio::select! {
+            _ = disconnect.changed() => break Ok(()),
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
                     break Ok(());
@@ -947,11 +956,23 @@ async fn dispatch_client_frame(
                             return Ok(());
                         }
                         if *mode == SessionMode::FullControl && next_mode == SessionMode::ViewOnly {
-                            ctrl_guard.release();
                             let _ = hub.to_agent_tx.try_send(IpcMsg::Input(InputMsg::ReleaseAllKeys));
+                            if policy.curtain_on_control && policy.os_prompts_enabled() {
+                                let _ = hub.to_agent_tx.send(IpcMsg::SetCurtainMode(false)).await;
+                            }
+                            ctrl_guard.release();
                             *mode = next_mode;
                         } else if *mode == SessionMode::ViewOnly && next_mode == SessionMode::FullControl {
                             if ctrl_guard.try_acquire(controller_lock) {
+                                let peer_ip = peer_str.parse::<SocketAddr>().ok().map(|peer| peer.ip());
+                                if !approve_local_access(peer_ip, next_mode, policy).await {
+                                    ctrl_guard.release();
+                                    send_control_error(out_tx, "Control request declined by the host.");
+                                    return Ok(());
+                                }
+                                if policy.curtain_on_control && policy.os_prompts_enabled() {
+                                    let _ = hub.to_agent_tx.send(IpcMsg::SetCurtainMode(true)).await;
+                                }
                                 *mode = next_mode;
                             } else if let Ok(err) = pack_message(
                                 ChannelId::AuthControl,
@@ -1296,6 +1317,16 @@ mod tests {
     use tokio::net::TcpStream;
 
     use super::*;
+
+    #[tokio::test]
+    async fn unavailable_local_prompt_uses_the_configured_fallback() {
+        let mut policy = ServerPolicy::for_test(true);
+        policy.suppress_os_prompts = false;
+        policy.confirm_connect = true;
+        assert!(!approve_local_access(None, SessionMode::FullControl, &policy).await);
+        policy.confirm_default_allow = true;
+        assert!(approve_local_access(None, SessionMode::FullControl, &policy).await);
+    }
 
     fn test_hub() -> (AgentHub, mpsc::Receiver<IpcMsg>) {
         let (to_agent_tx, to_agent_rx) = mpsc::channel(32);

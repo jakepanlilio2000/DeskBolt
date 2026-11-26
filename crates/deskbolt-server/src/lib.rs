@@ -33,8 +33,10 @@ use crate::ipc::AgentHub;
 #[cfg(target_os = "windows")]
 use crate::ipc::DEFAULT_IPC_PIPE;
 use crate::net::run_tcp_server;
+#[cfg(not(target_os = "macos"))]
+use crate::platform::start_tray_icon;
 use crate::platform::{
-    install_service_with_code, run_service_dispatcher, start_tray_icon, startup_permission_check,
+    install_service_with_code, run_service_dispatcher, startup_permission_check,
     uninstall_service_with_code,
 };
 
@@ -165,8 +167,11 @@ pub fn run_inprocess_server_mode() -> Result<(), String> {
         .build()
         .map_err(|e| format!("tokio init: {e}"))?;
 
-    rt.block_on(async move {
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    #[cfg(target_os = "macos")]
+    let ui_channels = (shutdown_rx.clone(), shutdown_tx.clone());
+    let run = async move {
+        #[cfg(not(target_os = "macos"))]
         let tray_handle = show_tray
             .then(|| start_tray_icon(shutdown_rx.clone(), shutdown_tx.clone()))
             .flatten();
@@ -207,11 +212,25 @@ pub fn run_inprocess_server_mode() -> Result<(), String> {
         .await;
         let _ = shutdown_tx.send(true);
         let _ = agent_task.await;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Err(error) = platform::set_curtain_mode(false) {
+            tracing::warn!("Could not restore the screen: {error}");
+        }
+        #[cfg(not(target_os = "macos"))]
         if let Some(h) = tray_handle {
             let _ = h.join();
         }
         res
-    })
+    };
+    #[cfg(target_os = "macos")]
+    if show_tray && platform::macos::interactive_session() {
+        let server = std::thread::spawn(move || rt.block_on(run));
+        if let Err(error) = platform::macos::run_tray_icon(ui_channels.0, ui_channels.1) {
+            tracing::warn!("Host menu unavailable: {error}");
+        }
+        return server.join().map_err(|_| "The host stopped unexpectedly.")?;
+    }
+    rt.block_on(run)
 }
 
 fn print_usage() {

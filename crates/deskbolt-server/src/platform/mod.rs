@@ -30,7 +30,7 @@ mod wayland_capture;
 use linux as imp;
 
 #[cfg(target_os = "macos")]
-mod macos;
+pub(crate) mod macos;
 #[cfg(target_os = "macos")]
 mod macos_cursor;
 #[cfg(target_os = "macos")]
@@ -227,6 +227,20 @@ pub fn execute_power_action(
     imp::execute_power_action(action, force, delay_secs)
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn connection_prompt_text(
+    peer: std::net::IpAddr,
+    mode: deskbolt_proto::SessionMode,
+    seconds: u64,
+) -> String {
+    let access = match mode {
+        deskbolt_proto::SessionMode::FullControl => "control this device",
+        deskbolt_proto::SessionMode::ViewOnly => "view this screen",
+        deskbolt_proto::SessionMode::FileTransfer => "transfer files",
+    };
+    format!("{peer} requests permission to {access}. Respond within {seconds} s.")
+}
+
 pub fn show_desktop_popup(title: &str, body: &str, urgent: bool) -> Result<(), String> {
     imp::show_desktop_popup(title, body, urgent)
 }
@@ -248,6 +262,7 @@ pub fn set_os_autostart(enabled: bool) -> Result<(), String> {
     imp::set_os_autostart(enabled)
 }
 
+#[cfg(not(target_os = "macos"))]
 pub fn start_tray_icon(
     shutdown_rx: watch::Receiver<bool>,
     shutdown_tx: watch::Sender<bool>,
@@ -255,9 +270,85 @@ pub fn start_tray_icon(
     imp::start_tray_icon(shutdown_rx, shutdown_tx)
 }
 
+static DISCONNECT_VIEWERS: std::sync::OnceLock<watch::Sender<u64>> = std::sync::OnceLock::new();
+
+fn disconnect_signal() -> &'static watch::Sender<u64> {
+    DISCONNECT_VIEWERS.get_or_init(|| watch::channel(0).0)
+}
+
+pub(crate) fn subscribe_disconnect() -> watch::Receiver<u64> {
+    disconnect_signal().subscribe()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Clone, Copy)]
+enum TrayAction {
+    Status,
+    Settings,
+    Disconnect,
+    Exit,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl TrayAction {
+    const MENU: [(&str, Self); 4] = [
+        ("Status", Self::Status),
+        ("Settings", Self::Settings),
+        ("Disconnect All", Self::Disconnect),
+        ("Exit", Self::Exit),
+    ];
+
+    fn run(self, shutdown: &watch::Sender<bool>) {
+        let result = match self {
+            Self::Status => show_desktop_popup("DeskBolt Host", "The host is running.", false),
+            Self::Settings => std::env::current_exe()
+                .and_then(|exe| std::process::Command::new(exe).arg("--settings").spawn())
+                .map(|mut child| {
+                    // Reap the window process without blocking the menu.
+                    std::thread::spawn(move || { let _ = child.wait(); });
+                })
+                .map_err(|error| error.to_string()),
+            Self::Disconnect => {
+                disconnect_signal().send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+                Ok(())
+            }
+            Self::Exit => {
+                shutdown.send_replace(true);
+                Ok(())
+            }
+        };
+        if let Err(error) = result {
+            tracing::warn!("Host menu action failed: {error}");
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn tray_icon_rgba() -> Vec<u8> {
+    const BOLT: [u16; 16] = [
+        0, 0, 0x0080, 0x0180, 0x0380, 0x0700, 0x0f00, 0x1ff8,
+        0x1ff0, 0x01e0, 0x01c0, 0x0380, 0x0300, 0x0200, 0, 0,
+    ];
+    BOLT.into_iter().flat_map(|row| {
+        (0..16).flat_map(move |x| {
+            if row & (1 << (15 - x)) == 0 { [0, 0, 0, 0] } else { [65, 144, 248, 255] }
+        })
+    }).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disconnect_only_reaches_current_viewers() {
+        let signal = watch::channel(0u64).0;
+        let existing = signal.subscribe();
+        signal.send_modify(|epoch| *epoch += 1);
+        let new = signal.subscribe();
+        assert!(existing.has_changed().unwrap());
+        assert!(!new.has_changed().unwrap());
+    }
 
     #[test]
     fn rgba_to_bgra_and_tile_differ_detect_single_dirty_block() {

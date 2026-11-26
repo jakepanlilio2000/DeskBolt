@@ -14,6 +14,9 @@ use super::desktop_common::{
 };
 use super::{InputInjector, ScreenCapturer};
 
+#[path = "linux_curtain.rs"]
+mod curtain;
+
 const SYSTEMD_UNIT_PATH: &str = "/etc/systemd/system/deskbolt-server.service";
 const OPENRC_INIT_PATH: &str = "/etc/init.d/deskbolt-server";
 
@@ -407,17 +410,125 @@ use tokio::sync::watch;
 pub fn startup_permission_check() {}
 
 pub fn show_desktop_popup(title: &str, body: &str, urgent: bool) -> Result<(), String> {
-    info!(urgent, %title, %body, "Remote popup notification delivered to host");
-    Ok(())
+    notification_runtime()?.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let bus = ashpd::zbus::Connection::session().await?;
+            let proxy = notifications(&bus).await?;
+            let body = body.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+            notify(&proxy, 0, title, &body, &[], if urgent { 2 } else { 1 }, -1).await
+        })
+        .await
+        .map_err(|_| "The desktop notification service did not respond.".to_string())?
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    })
 }
 
 pub fn prompt_connection_confirmation(
-    _peer_ip: IpAddr,
-    _mode: SessionMode,
-    _timeout_secs: u16,
+    peer_ip: IpAddr,
+    mode: SessionMode,
+    timeout_secs: u16,
     default_allow: bool,
 ) -> bool {
-    default_allow
+    use ashpd::zbus::export::futures_core::Stream;
+    use std::future::poll_fn;
+    use std::time::Duration;
+    use tokio::time::{Instant, timeout_at};
+
+    let Ok(runtime) = notification_runtime() else {
+        return default_allow;
+    };
+    runtime.block_on(async {
+        let deadline = Instant::now() + Duration::from_secs(u64::from(timeout_secs));
+        let Ok(Ok((bus, mut actions, mut closed))) = timeout_at(deadline, async {
+            let bus = ashpd::zbus::Connection::session().await?;
+            let proxy = notifications(&bus).await?;
+            let capabilities: Vec<String> = proxy.call("GetCapabilities", &()).await?;
+            if !capabilities.iter().any(|name| name == "actions") {
+                return Err(ashpd::zbus::Error::Failure("Desktop actions are unavailable".into()));
+            }
+            let actions = proxy.receive_signal("ActionInvoked").await?;
+            let closed = proxy.receive_signal("NotificationClosed").await?;
+            Ok::<_, ashpd::zbus::Error>((bus, actions, closed))
+        }).await else {
+            return default_allow;
+        };
+        let Ok(Ok(proxy)) = timeout_at(deadline, notifications(&bus)).await else {
+            return default_allow;
+        };
+        let mut id = 0;
+        let result = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break default_allow;
+            }
+            let seconds = remaining.as_secs_f64().ceil() as u64;
+            let message = super::connection_prompt_text(peer_ip, mode, seconds);
+            let shown = timeout_at(deadline, notify(
+                &proxy, id, "DeskBolt connection request", &message,
+                &["allow", "Allow", "decline", "Decline"], 2, 0,
+            )).await;
+            let Ok(Ok(new_id)) = shown else { break default_allow };
+            id = new_id;
+            let tick = tokio::time::sleep_until(deadline.min(Instant::now() + Duration::from_secs(1)));
+            tokio::pin!(tick);
+            loop {
+                tokio::select! {
+                    biased;
+                    action = poll_fn(|cx| std::pin::Pin::new(&mut actions).poll_next(cx)) => {
+                        let Some(action) = action else { break };
+                        if let Ok((notification, name)) = action.body().deserialize::<(u32, String)>()
+                            && notification == id
+                            && matches!(name.as_str(), "allow" | "decline")
+                        {
+                            let _ = tokio::time::timeout(Duration::from_millis(250),
+                                proxy.call::<_, _, ()>("CloseNotification", &(id,))).await;
+                            return name == "allow";
+                        }
+                    }
+                    close = poll_fn(|cx| std::pin::Pin::new(&mut closed).poll_next(cx)) => {
+                        let Some(close) = close else { break };
+                        if let Ok((notification, reason)) = close.body().deserialize::<(u32, u32)>()
+                            && notification == id
+                        {
+                            return reason == 1 && default_allow;
+                        }
+                    }
+                    _ = &mut tick => break,
+                }
+            }
+        };
+        if id != 0 {
+            let _ = tokio::time::timeout(Duration::from_millis(250),
+                proxy.call::<_, _, ()>("CloseNotification", &(id,))).await;
+        }
+        result
+    })
+}
+
+fn notification_runtime() -> Result<tokio::runtime::Runtime, String> {
+    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none()
+        && std::env::var_os("XDG_RUNTIME_DIR").is_none()
+    {
+        return Err("A desktop session is required.".into());
+    }
+    tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|error| error.to_string())
+}
+
+async fn notifications(connection: &ashpd::zbus::Connection) -> ashpd::zbus::Result<ashpd::zbus::Proxy<'_>> {
+    ashpd::zbus::Proxy::new(connection, "org.freedesktop.Notifications",
+        "/org/freedesktop/Notifications", "org.freedesktop.Notifications").await
+}
+
+// The desktop notification wire format requires all eight fields.
+#[allow(clippy::too_many_arguments)]
+async fn notify(
+    proxy: &ashpd::zbus::Proxy<'_>, replaced: u32, title: &str, body: &str,
+    actions: &[&str], urgency: u8, expire_ms: i32,
+) -> ashpd::zbus::Result<u32> {
+    use ashpd::zbus::Variant;
+    let hints = std::collections::HashMap::from([("urgency", Variant::U8(urgency))]);
+    proxy.call("Notify", &("DeskBolt", replaced, "", title, body, actions, hints, expire_ms)).await
 }
 
 pub fn execute_power_action(
@@ -437,8 +548,8 @@ pub fn execute_power_action(
     crate::sysadmin::call_systemd_login_power(method)
 }
 
-pub fn set_curtain_mode(_enabled: bool) -> Result<(), String> {
-    Ok(())
+pub fn set_curtain_mode(enabled: bool) -> Result<(), String> {
+    curtain::set(enabled)
 }
 
 pub fn set_os_autostart(enabled: bool) -> Result<(), String> {
@@ -462,10 +573,45 @@ pub fn set_os_autostart(enabled: bool) -> Result<(), String> {
 }
 
 pub fn start_tray_icon(
-    _shutdown_rx: watch::Receiver<bool>,
-    _shutdown_tx: watch::Sender<bool>,
+    mut shutdown_rx: watch::Receiver<bool>,
+    shutdown_tx: watch::Sender<bool>,
 ) -> Option<std::thread::JoinHandle<()>> {
-    None
+    use ksni::{Tray, TrayMethods, menu::StandardItem};
+    use super::TrayAction;
+    struct HostTray(watch::Sender<bool>);
+    impl Tray for HostTray {
+        fn id(&self) -> String { "deskbolt-host".into() }
+        fn title(&self) -> String { "DeskBolt Host".into() }
+        fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+            let mut pixels = super::tray_icon_rgba();
+            for pixel in pixels.as_chunks_mut::<4>().0 {
+                pixel.rotate_right(1);
+            }
+            vec![ksni::Icon { width: 16, height: 16, data: pixels }]
+        }
+        fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+            TrayAction::MENU.into_iter().map(|(label, action)| {
+                StandardItem {
+                    label: label.into(),
+                    activate: Box::new(move |tray: &mut Self| {
+                        let shutdown = tray.0.clone();
+                        tokio::task::spawn_blocking(move || action.run(&shutdown));
+                    }),
+                    ..Default::default()
+                }.into()
+            }).collect()
+        }
+    }
+    let runtime = notification_runtime().ok()?;
+    Some(std::thread::spawn(move || {
+        runtime.block_on(async {
+            let started = tokio::time::timeout(std::time::Duration::from_secs(3), HostTray(shutdown_tx).spawn()).await;
+            if let Ok(Ok(tray)) = started {
+                let _ = shutdown_rx.wait_for(|stopping| *stopping).await;
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), tray.shutdown()).await;
+            }
+        });
+    }))
 }
 
 fn vk_to_linux_evdev_code(vk: u16) -> Option<u16> {
