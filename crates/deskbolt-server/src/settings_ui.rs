@@ -94,8 +94,12 @@ impl ServerSettingsApp {
             self.status_ok = false;
             return false;
         }
-        let _ = set_os_autostart(self.cfg.start_with_os);
-        self.status = "Host settings saved. Restart service to apply network changes.".into();
+        if let Err(error) = set_os_autostart(self.cfg.start_with_os) {
+            self.status = format!("Host settings saved. Automatic startup could not be changed: {error}");
+            self.status_ok = false;
+            return false;
+        }
+        self.status = "Host settings saved. Restart the host to apply changes.".into();
         self.status_ok = true;
         true
     }

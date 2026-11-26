@@ -25,10 +25,26 @@ pub fn default_data_dir() -> PathBuf {
     }
     #[cfg(target_os = "linux")]
     {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            let config_home = std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
+            if let Some(config_home) = config_home {
+                return config_home.join("deskbolt");
+            }
+        }
         PathBuf::from("/etc/deskbolt")
     }
     #[cfg(target_os = "macos")]
     {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0
+            && let Some(home) = std::env::var_os("HOME")
+        {
+            return PathBuf::from(home).join("Library/Application Support/DeskBolt");
+        }
         PathBuf::from("/Library/Application Support/DeskBolt")
     }
     #[cfg(target_os = "android")]
