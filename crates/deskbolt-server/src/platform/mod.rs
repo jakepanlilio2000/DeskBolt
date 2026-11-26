@@ -25,6 +25,8 @@ mod linux;
 #[cfg(target_os = "linux")]
 mod x11_cursor;
 #[cfg(target_os = "linux")]
+mod x11_framebuffer;
+#[cfg(target_os = "linux")]
 mod wayland_capture;
 #[cfg(target_os = "linux")]
 use linux as imp;
@@ -68,6 +70,9 @@ pub trait ScreenCapturer: Send {
     fn monitors(&self) -> Vec<MonitorInfo>;
     fn set_monitor(&mut self, monitor_idx: u8);
     fn capture_next(&mut self, force_full: bool, timeout_ms: u32) -> CaptureOutput;
+    fn set_workspace_capture(&mut self, _enabled: bool) -> bool {
+        false
+    }
     fn capture_cursor(&mut self) -> Option<CursorSnapshot> {
         None
     }
@@ -255,6 +260,8 @@ pub fn prompt_connection_confirmation(
 }
 
 pub(crate) mod display_mode;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+pub(crate) mod headless;
 pub(crate) mod local_input_lock;
 #[cfg(target_os = "windows")]
 mod windows_curtain;

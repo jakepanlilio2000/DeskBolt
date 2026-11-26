@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::mem::size_of;
 use std::sync::{
@@ -64,23 +65,27 @@ pub struct WaylandCapturer {
     state: Arc<Mutex<CaptureState>>,
     active: Arc<AtomicU8>,
     stop: Arc<AtomicBool>,
-    previous: Option<FramePixels>,
+    previous: HashMap<u8, FramePixels>,
+    group: Arc<AtomicBool>,
 }
 
 impl WaylandCapturer {
-    pub fn new(monitor_id: u8) -> Result<Self, String> {
+    pub fn new(monitor_id: u8, request_virtual: bool) -> Result<Self, String> {
         let capture = Self {
             state: Arc::default(),
             active: Arc::new(AtomicU8::new(monitor_id)),
             stop: Arc::default(),
-            previous: None,
+            previous: HashMap::new(),
+            group: Arc::default(),
         };
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let state = capture.state.clone();
         let stop = capture.stop.clone();
         let active = capture.active.clone();
+        let group = capture.group.clone();
         std::thread::spawn(move || {
-            if let Err(error) = run_streams(&state, active, stop, &ready_tx) {
+            if let Err(error) = run_streams(&state, active, group, stop, request_virtual, &ready_tx)
+            {
                 state.lock().unwrap().failure = Some(error.clone());
                 let _ = ready_tx.try_send(Err(error));
             }
@@ -111,7 +116,11 @@ impl ScreenCapturer for WaylandCapturer {
 
     fn set_monitor(&mut self, monitor_id: u8) {
         self.active.store(monitor_id, Ordering::Relaxed);
-        self.previous = None;
+    }
+
+    fn set_workspace_capture(&mut self, enabled: bool) -> bool {
+        self.group.store(enabled, Ordering::Relaxed);
+        true
     }
 
     fn capture_next(&mut self, force_full: bool, _timeout_ms: u32) -> CaptureOutput {
@@ -126,10 +135,11 @@ impl ScreenCapturer for WaylandCapturer {
                 .get_mut(usize::from(monitor_id))
                 .and_then(|display| display.pending.take())
         };
+        let previous = self.previous.get(&monitor_id);
         let Some(pixels) = pending.or_else(|| {
             force_full
                 .then(|| {
-                    self.previous.as_ref().map(|p| FramePixels {
+                    previous.map(|p| FramePixels {
                         width: p.width,
                         height: p.height,
                         bgra: p.bgra.clone(),
@@ -140,15 +150,12 @@ impl ScreenCapturer for WaylandCapturer {
             return CaptureOutput::Timeout;
         };
         let full = force_full
-            || self
-                .previous
-                .as_ref()
-                .is_none_or(|p| (p.width, p.height) != (pixels.width, pixels.height));
+            || previous.is_none_or(|p| (p.width, p.height) != (pixels.width, pixels.height));
         let dirty_rects = if full {
             Vec::new()
         } else {
             diff_bgra_dirty_rects(
-                &self.previous.as_ref().unwrap().bgra,
+                &previous.unwrap().bgra,
                 &pixels.bgra,
                 pixels.width,
                 pixels.height,
@@ -167,7 +174,7 @@ impl ScreenCapturer for WaylandCapturer {
             dirty_rects,
             force_full: full,
         };
-        self.previous = Some(pixels);
+        self.previous.insert(monitor_id, pixels);
         CaptureOutput::Frame(raw)
     }
 
@@ -185,7 +192,9 @@ impl ScreenCapturer for WaylandCapturer {
 fn run_streams(
     state: &Arc<Mutex<CaptureState>>,
     active: Arc<AtomicU8>,
+    group: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    request_virtual: bool,
     ready: &mpsc::SyncSender<Result<(), String>>,
 ) -> Result<(), String> {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -197,6 +206,11 @@ fn run_streams(
             tokio::time::timeout(Duration::from_secs(30), async {
                 let portal = Screencast::new().await?;
                 let session = portal.create_session(Default::default()).await?;
+                let supported = portal.available_source_types().await?;
+                let mut sources = SourceType::MONITOR & supported;
+                if request_virtual && supported.contains(SourceType::VIRTUAL) {
+                    sources |= SourceType::VIRTUAL;
+                }
                 let modes = portal
                     .available_cursor_modes()
                     .await
@@ -212,7 +226,7 @@ fn run_streams(
                     .select_sources(
                         &session,
                         SelectSourcesOptions::default()
-                            .set_sources(SourceType::MONITOR)
+                            .set_sources(sources)
                             .set_multiple(true)
                             .set_cursor_mode(cursor_mode),
                     )
@@ -275,6 +289,7 @@ fn run_streams(
         let state = state.clone();
         let failure = state.clone();
         let active = active.clone();
+        let group = group.clone();
         let validate = cursor_mode == CursorMode::METADATA;
         let listener = pw_stream
             .add_local_listener_with_user_data(VideoInfoRaw::default())
@@ -304,7 +319,8 @@ fn run_streams(
                         if validate {
                             read_cursor(buffer, display);
                         }
-                        if active.load(Ordering::Relaxed) == index as u8
+                        if (group.load(Ordering::Relaxed)
+                            || active.load(Ordering::Relaxed) == index as u8)
                             && let Some(frame) = read_pixels(buffer, info)
                         {
                             if display.info.width == 0 || display.info.height == 0 {

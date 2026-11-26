@@ -263,12 +263,15 @@ impl InputInjector for NoopInjector {
 
 pub fn create_capturer(monitor_idx: u8) -> Result<Box<dyn ScreenCapturer>, String> {
     if super::wayland_capture::is_wayland() {
-        match super::wayland_capture::WaylandCapturer::new(monitor_idx) {
+        match super::wayland_capture::WaylandCapturer::new(monitor_idx, enumerate_monitors().is_empty()) {
             Ok(capture) => return Ok(Box::new(capture)),
             Err(error) => warn!("Screen stream unavailable: {error}"),
         }
     }
-    Ok(Box::new(XcapCapturer::new(monitor_idx)?))
+    match XcapCapturer::new(monitor_idx) {
+        Ok(capture) => Ok(Box::new(capture)),
+        Err(_) => Ok(Box::new(super::x11_framebuffer::X11Framebuffer::open()?)),
+    }
 }
 
 pub fn create_injector() -> Box<dyn InputInjector> {

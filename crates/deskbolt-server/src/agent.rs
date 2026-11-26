@@ -444,6 +444,10 @@ fn capture_loop(
     let mut cursor_delta = CursorDelta::default();
     let mut last_level = 0;
     let mut secondary: HashMap<u8, SecondaryCapture> = HashMap::new();
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    let mut headless = None;
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    let mut last_virtual_attempt: Option<Instant> = None;
 
     while !stop.load(Ordering::SeqCst) {
         if shared.capture_reinit.swap(false, Ordering::Acquire) {
@@ -464,6 +468,17 @@ fn capture_loop(
         let loop_start = Instant::now();
 
         if capturer.is_none() {
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            if headless.is_none()
+                && last_virtual_attempt.is_none_or(|at| at.elapsed() >= Duration::from_secs(10))
+                && enumerate_monitors().is_empty()
+            {
+                last_virtual_attempt = Some(Instant::now());
+                match platform::headless::HeadlessOutput::open() {
+                    Ok(output) => headless = Some(output),
+                    Err(error) => warn!("Virtual display unavailable: {error}"),
+                }
+            }
             match platform::create_capturer(wanted_mon) {
                 Ok(mut cap) => {
                     let desk = cap.current_desktop_name();
@@ -510,6 +525,8 @@ fn capture_loop(
                 need_full = true;
             }
 
+            let all_displays = shared.all_displays.load(Ordering::Relaxed);
+            let one_capture_context = cap.set_workspace_capture(all_displays);
             let force_kf = shared.force_keyframe.swap(false, Ordering::SeqCst);
             let output = cap.capture_next(need_full || force_kf, 33);
             let cursor = if shared.capture_cursor.load(Ordering::Relaxed)
@@ -565,19 +582,32 @@ fn capture_loop(
                     capturer = None;
                     secondary.clear();
                     need_full = true;
+                    continue;
                 }
                 CaptureOutput::Reacquire(_) => {
                     capturer = None;
                     need_full = true;
                     thread::sleep(Duration::from_millis(50));
+                    continue;
                 }
             }
-            if shared.all_displays.load(Ordering::Relaxed) {
+            if all_displays {
                 let monitors = shared.monitors.lock().unwrap().clone();
                 secondary.retain(|id, _| *id != active && monitors.iter().any(|m| m.id == *id));
-                for monitor in monitors.into_iter().filter(|monitor| monitor.id != active) {
+                let with_cursor = shared.capture_cursor.load(Ordering::Relaxed);
+                for monitor in monitors.into_iter().filter(|monitor| monitor.id != active).take(15) {
                     let track = secondary.entry(monitor.id).or_default();
-                    track.capture(monitor.id, force_kf, &slot, &ev_tx, shared.capture_cursor.load(Ordering::Relaxed));
+                    if one_capture_context {
+                        cap.set_monitor(monitor.id);
+                        if !track.capture_current(&mut **cap, monitor.id, force_kf, &slot, &ev_tx, with_cursor) {
+                            shared.capture_reinit.store(true, Ordering::Release);
+                        }
+                    } else {
+                        track.capture(monitor.id, force_kf, &slot, &ev_tx, with_cursor);
+                    }
+                }
+                if one_capture_context {
+                    cap.set_monitor(active);
                 }
             } else if !secondary.is_empty() {
                 secondary.clear();
@@ -622,7 +652,16 @@ impl SecondaryCapture {
             self.capturer = platform::create_capturer(id).ok();
             self.refresh = true;
         }
-        let Some(capturer) = &mut self.capturer else { return };
+        let Some(mut capturer) = self.capturer.take() else { return };
+        if self.capture_current(&mut *capturer, id, force, slot, events, cursor_enabled) {
+            self.capturer = Some(capturer);
+        }
+    }
+
+    fn capture_current(
+        &mut self, capturer: &mut dyn ScreenCapturer, id: u8, force: bool,
+        slot: &LatestRawSlot, events: &mpsc::Sender<IpcMsg>, cursor_enabled: bool,
+    ) -> bool {
         self.refresh |= force;
         let output = capturer.capture_next(self.refresh, 1);
         if cursor_enabled && matches!(output, CaptureOutput::Frame(_) | CaptureOutput::Timeout)
@@ -636,9 +675,10 @@ impl SecondaryCapture {
                 self.refresh = false;
                 slot.publish(frame);
             }
-            CaptureOutput::Reacquire(_) | CaptureOutput::DesktopSwitched { .. } => self.capturer = None,
+            CaptureOutput::Reacquire(_) | CaptureOutput::DesktopSwitched { .. } => return false,
             _ => {}
         }
+        true
     }
 }
 
