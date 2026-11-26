@@ -1,0 +1,2048 @@
+use std::collections::VecDeque;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
+use std::time::{Duration, Instant};
+
+use deskbolt_proto::{
+    ARGON2_M_KIB, ARGON2_P_COST, ARGON2_T_COST, ChannelId, ClipboardSync, CommsMsg, ControlMsg,
+    FLAG_KEYFRAME, FLAG_NONE, FLAG_URGENT, FileTransferMsg, Frame, InputMsg, IpRateLimiter,
+    IpcMsg, NONCE_LEN, PROTO_VERSION, PowerMsg, SALT_LEN, ServerTlsStream, SessionMode,
+    SpecialAction, StoredCredential, SysAdminMsg, TerminalMsg, TlsServerConfig, TunnelMsg,
+    VideoMsg, VoiceControls, VoiceEngine, accept_tls, build_server_config, compute_server_proof,
+    pack_message, random_bytes, read_frame_async, sha256_fingerprint, unpack_message,
+    verify_client_proof, write_frame_async,
+};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpListener;
+use tokio::sync::{Semaphore, broadcast, mpsc, watch};
+use tracing::{info, warn};
+
+use crate::config::{ServerConfig, ServerPolicy, evaluate_ip_access, log_audit_event};
+use crate::files::FileSessionHandler;
+use crate::ipc::{AgentHub, ViewerActivity};
+use crate::platform::{
+    execute_power_action, prompt_connection_confirmation, set_curtain_mode, show_desktop_popup,
+    trigger_send_sas,
+};
+use crate::sysadmin::{SysAdminHandler, execute_broadcast_command};
+use crate::terminal::TerminalSessionHandler;
+use crate::tunnel::TunnelSessionHandler;
+
+const DEFAULT_PREAUTH_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_PREAUTH_CONNS: usize = 32;
+const MAX_VIDEO_QUEUE: usize = 2;
+
+/// Tracks exclusive keyboard/mouse ownership when `single_controller_lock = true`.
+struct ControllerGuard(Option<Arc<AtomicBool>>);
+
+impl ControllerGuard {
+    fn none() -> Self {
+        Self(None)
+    }
+
+    fn try_acquire(&mut self, lock: Option<&Arc<AtomicBool>>) -> bool {
+        if self.0.is_some() {
+            return true;
+        }
+        let Some(flag) = lock else {
+            return true;
+        };
+        if flag
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.0 = Some(flag.clone());
+            true
+        } else {
+            false
+        }
+    }
+
+    fn release(&mut self) {
+        if let Some(flag) = self.0.take() {
+            flag.store(false, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for ControllerGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Runs the TLS 1.3 TCP listener (`port`, default `4899`) with auth, rate limiting, and session mux.
+pub async fn run_tcp_server(
+    cfg: ServerConfig,
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+    hub: AgentHub,
+    sas_enabled: bool,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), String> {
+    let cred = Arc::new(cfg.load_credential()?);
+    let policy = ServerPolicy::from_config(&cfg);
+    let bind_target = format!("{}:{}", cfg.bind_addr, cfg.port);
+    let listener = TcpListener::bind(&bind_target)
+        .await
+        .map_err(|e| format!("failed to bind {bind_target}: {e}"))?;
+
+    info!("DeskBolt server listening on {bind_target} (TLS 1.3)");
+    serve_listener_with_policy(
+        listener,
+        cert_der,
+        key_der,
+        cred,
+        hub,
+        sas_enabled,
+        policy,
+        DEFAULT_PREAUTH_TIMEOUT,
+        shutdown_rx,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_listener(
+    listener: TcpListener,
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+    cred: Arc<StoredCredential>,
+    hub: AgentHub,
+    sas_enabled: bool,
+    single_controller_lock: bool,
+    preauth_timeout: Duration,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), String> {
+    serve_listener_with_policy(
+        listener,
+        cert_der,
+        key_der,
+        cred,
+        hub,
+        sas_enabled,
+        ServerPolicy::for_test(single_controller_lock),
+        preauth_timeout,
+        shutdown_rx,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_listener_with_policy(
+    listener: TcpListener,
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+    cred: Arc<StoredCredential>,
+    hub: AgentHub,
+    sas_enabled: bool,
+    policy: ServerPolicy,
+    preauth_timeout: Duration,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), String> {
+    let cert_fp = sha256_fingerprint(&cert_der);
+    let tls_cfg = build_server_config(cert_der, key_der).map_err(|e| e.to_string())?;
+    let limiter = Arc::new(Mutex::new(match policy.lockout_threshold {
+        Some(t) => IpRateLimiter::with_limits(t, policy.ban_duration_secs),
+        None => IpRateLimiter::new(),
+    }));
+    let preauth_sem = Arc::new(Semaphore::new(MAX_PREAUTH_CONNS));
+    let controller_lock = policy
+        .single_controller_lock
+        .then(|| Arc::new(AtomicBool::new(false)));
+    let policy = Arc::new(policy);
+    let (chat_tx, _) = broadcast::channel::<(u64, CommsMsg)>(64);
+    let next_conn_id = Arc::new(AtomicU64::new(1));
+
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((stream, peer)) => {
+                        let _ = stream.set_nodelay(true);
+                        let Ok(permit) = preauth_sem.clone().try_acquire_owned() else {
+                            warn!(%peer, "Dropping connection: pre-auth limit reached");
+                            drop(stream);
+                            continue;
+                        };
+                        let conn_id = next_conn_id.fetch_add(1, Ordering::Relaxed);
+                        let tls_cfg = tls_cfg.clone();
+                        let cred = cred.clone();
+                        let limiter = limiter.clone();
+                        let hub = hub.clone();
+                        let controller_lock = controller_lock.clone();
+                        let policy_c = policy.clone();
+                        let chat_tx_c = chat_tx.clone();
+                        let sess_shutdown = shutdown_rx.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_connection(
+                                conn_id,
+                                stream,
+                                peer,
+                                tls_cfg,
+                                cert_fp,
+                                cred,
+                                limiter,
+                                hub,
+                                sas_enabled,
+                                controller_lock,
+                                policy_c,
+                                chat_tx_c,
+                                preauth_timeout,
+                                permit,
+                                sess_shutdown,
+                            )
+                            .await
+                            {
+                                warn!(%peer, "Session ended: {e}");
+                            }
+                        });
+                    }
+                    Err(e) => warn!("TCP accept error: {e}"),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    conn_id: u64,
+    stream: S,
+    peer: SocketAddr,
+    tls_cfg: Arc<TlsServerConfig>,
+    cert_fp: [u8; 32],
+    cred: Arc<StoredCredential>,
+    limiter: Arc<Mutex<IpRateLimiter>>,
+    hub: AgentHub,
+    sas_enabled: bool,
+    controller_lock: Option<Arc<AtomicBool>>,
+    policy: Arc<ServerPolicy>,
+    chat_tx: broadcast::Sender<(u64, CommsMsg)>,
+    preauth_timeout: Duration,
+    preauth_permit: tokio::sync::OwnedSemaphorePermit,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), String> {
+    let peer_ip = peer.ip();
+    if let Err(reason) = evaluate_ip_access(peer_ip, &policy.ip_allowlist, &policy.ip_blocklist) {
+        log_audit_event(
+            policy.audit_log_path.as_deref(),
+            &peer.to_string(),
+            "connect_denied",
+            &reason,
+        );
+        return Err(reason);
+    }
+
+    let (tls, mut mode, mut ctrl_guard) = match tokio::time::timeout(
+        preauth_timeout,
+        authenticate_stream(
+            stream,
+            peer_ip,
+            tls_cfg,
+            cert_fp,
+            &cred,
+            &limiter,
+            controller_lock.as_ref(),
+            &policy,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(ok)) => ok,
+        Ok(Err(e)) => {
+            log_audit_event(
+                policy.audit_log_path.as_deref(),
+                &peer.to_string(),
+                "auth_failed",
+                &e,
+            );
+            return Err(e);
+        }
+        Err(_) => return Err("authentication timed out".into()),
+    };
+    drop(preauth_permit);
+
+    info!(%peer, ?mode, "Viewer authenticated");
+    log_audit_event(
+        policy.audit_log_path.as_deref(),
+        &peer.to_string(),
+        "auth_ok",
+        &format!("{mode:?}"),
+    );
+
+    let needs_desktop = mode != SessionMode::FileTransfer;
+    if needs_desktop {
+        let _ = hub.viewer_wake_tx.send(ViewerActivity::Connected);
+        let _ = hub.to_agent_tx.try_send(IpcMsg::QualityPreset {
+            mode: policy.default_quality,
+            target_fps: policy.max_fps,
+            h264_bitrate_kbps: 4000,
+        });
+        let _ = hub
+            .to_agent_tx
+            .try_send(IpcMsg::SetCaptureCursor(policy.capture_cursor));
+        if mode == SessionMode::FullControl && policy.curtain_on_control && !policy.suppress_os_prompts {
+            let _ = hub.to_agent_tx.try_send(IpcMsg::SetCurtainMode(true));
+        }
+    }
+
+    let res = run_authenticated_session(
+        conn_id,
+        &peer.to_string(),
+        tls,
+        &mut mode,
+        &hub,
+        sas_enabled,
+        controller_lock.as_ref(),
+        &mut ctrl_guard,
+        &policy,
+        chat_tx,
+        &mut shutdown_rx,
+    )
+    .await;
+
+    if needs_desktop {
+        if mode == SessionMode::FullControl {
+            let _ = hub.to_agent_tx.try_send(IpcMsg::Input(InputMsg::ReleaseAllKeys));
+            if policy.curtain_on_control && !policy.suppress_os_prompts {
+                let _ = hub.to_agent_tx.try_send(IpcMsg::SetCurtainMode(false));
+                let _ = set_curtain_mode(false);
+            }
+        }
+        let _ = hub.viewer_wake_tx.send(ViewerActivity::Disconnected);
+    }
+    log_audit_event(
+        policy.audit_log_path.as_deref(),
+        &peer.to_string(),
+        "disconnect",
+        res.as_ref().err().map(String::as_str).unwrap_or("clean"),
+    );
+    drop(ctrl_guard);
+
+    res
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn authenticate_stream<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: S,
+    peer_ip: IpAddr,
+    tls_cfg: Arc<TlsServerConfig>,
+    cert_fp: [u8; 32],
+    cred: &StoredCredential,
+    limiter: &Mutex<IpRateLimiter>,
+    controller_lock: Option<&Arc<AtomicBool>>,
+    policy: &ServerPolicy,
+) -> Result<(ServerTlsStream<S>, SessionMode, ControllerGuard), String> {
+    let mut tls = accept_tls(stream, tls_cfg)
+        .await
+        .map_err(|e| format!("TLS handshake failed: {e}"))?;
+
+    let hello_frame = read_frame_async(&mut tls)
+        .await
+        .map_err(|e| format!("read ClientHello: {e}"))?
+        .ok_or_else(|| "EOF waiting for ClientHello".to_string())?;
+    if hello_frame.channel != ChannelId::AuthControl {
+        return Err("expected AuthControl channel for ClientHello".into());
+    }
+    let ControlMsg::ClientHello {
+        proto_version,
+        client_nonce,
+        requested_mode,
+        client_name: _,
+    } = unpack_message::<ControlMsg>(&hello_frame).map_err(|e| e.to_string())?
+    else {
+        return Err("expected ClientHello message".into());
+    };
+
+    if proto_version != PROTO_VERSION {
+        let reject = pack_message(
+            ChannelId::AuthControl,
+            FLAG_URGENT,
+            &ControlMsg::AuthResult {
+                accepted: false,
+                server_proof: [0u8; 32],
+                granted_mode: requested_mode,
+                retry_after_secs: 0,
+                reason: format!("Unsupported protocol version {proto_version}."),
+            },
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+        let _ = write_frame_async(&mut tls, reject.channel, reject.flags, &reject.payload).await;
+        return Err("protocol version mismatch".into());
+    }
+
+    let cooldown = {
+        let mut lim = limiter.lock().expect("limiter mutex");
+        lim.check(peer_ip, Instant::now()).err()
+    };
+    if let Some(retry_after_secs) = cooldown {
+        let reject = pack_message(
+            ChannelId::AuthControl,
+            FLAG_URGENT,
+            &ControlMsg::AuthResult {
+                accepted: false,
+                server_proof: [0u8; 32],
+                granted_mode: requested_mode,
+                retry_after_secs,
+                reason: format!("Too many failed attempts. Try again in {retry_after_secs} seconds."),
+            },
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+        let _ = write_frame_async(&mut tls, reject.channel, reject.flags, &reject.payload).await;
+        return Err(format!("rate limited ({retry_after_secs}s)"));
+    }
+
+    let server_nonce = random_bytes::<NONCE_LEN>().map_err(|e| e.to_string())?;
+    let challenge = pack_message(
+        ChannelId::AuthControl,
+        FLAG_URGENT,
+        &ControlMsg::ServerChallenge {
+            server_nonce,
+            argon2_salt: cred.salt,
+            argon2_m_kib: cred.m_kib.max(ARGON2_M_KIB.min(1024)),
+            argon2_t: cred.t_cost.max(ARGON2_T_COST.min(1)),
+            argon2_p: cred.p_cost.max(ARGON2_P_COST.min(1)),
+        },
+        None,
+    )
+    .map_err(|e| e.to_string())?;
+    let _ = SALT_LEN;
+    write_frame_async(&mut tls, challenge.channel, challenge.flags, &challenge.payload)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let auth_frame = read_frame_async(&mut tls)
+        .await
+        .map_err(|e| format!("read ClientAuth: {e}"))?
+        .ok_or_else(|| "EOF waiting for ClientAuth".to_string())?;
+    if auth_frame.channel != ChannelId::AuthControl {
+        return Err("expected AuthControl for ClientAuth".into());
+    }
+    let ControlMsg::ClientAuth { client_proof } =
+        unpack_message::<ControlMsg>(&auth_frame).map_err(|e| e.to_string())?
+    else {
+        return Err("expected ClientAuth message".into());
+    };
+
+    if !verify_client_proof(&cred.auth_key, &client_nonce, &server_nonce, &cert_fp, &client_proof) {
+        let retry_after_secs = {
+            let mut lim = limiter.lock().expect("limiter mutex");
+            lim.record_failure(peer_ip, Instant::now())
+        };
+        let reject = pack_message(
+            ChannelId::AuthControl,
+            FLAG_URGENT,
+            &ControlMsg::AuthResult {
+                accepted: false,
+                server_proof: [0u8; 32],
+                granted_mode: requested_mode,
+                retry_after_secs,
+                reason: "Authentication failed. Check password and try again.".into(),
+            },
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+        let _ = write_frame_async(&mut tls, reject.channel, reject.flags, &reject.payload).await;
+        return Err("invalid client auth proof".into());
+    }
+
+    {
+        let mut lim = limiter.lock().expect("limiter mutex");
+        lim.record_success(peer_ip);
+    }
+
+    let mut guard = ControllerGuard::none();
+    let effective_requested = if policy.force_view_only && requested_mode == SessionMode::FullControl {
+        SessionMode::ViewOnly
+    } else {
+        requested_mode
+    };
+    if !policy.permissions.allows_mode(effective_requested) {
+        let reject = pack_message(
+            ChannelId::AuthControl,
+            FLAG_URGENT,
+            &ControlMsg::AuthResult {
+                accepted: false,
+                server_proof: [0u8; 32],
+                granted_mode: requested_mode,
+                retry_after_secs: 0,
+                reason: "Requested session mode is disabled by host administrator.".into(),
+            },
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+        let _ = write_frame_async(&mut tls, reject.channel, reject.flags, &reject.payload).await;
+        return Err("requested mode disallowed by host policy".into());
+    }
+
+    if policy.confirm_connect && !policy.suppress_os_prompts {
+        let timeout_secs = policy.confirm_timeout_secs;
+        let def_allow = policy.confirm_default_allow;
+        let approved = tokio::task::spawn_blocking(move || {
+            prompt_connection_confirmation(peer_ip, effective_requested, timeout_secs, def_allow)
+        })
+        .await
+        .unwrap_or(def_allow);
+        if !approved {
+            let reject = pack_message(
+                ChannelId::AuthControl,
+                FLAG_URGENT,
+                &ControlMsg::AuthResult {
+                    accepted: false,
+                    server_proof: [0u8; 32],
+                    granted_mode: requested_mode,
+                    retry_after_secs: 0,
+                    reason: "Connection declined by local desktop user.".into(),
+                },
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+            let _ = write_frame_async(&mut tls, reject.channel, reject.flags, &reject.payload).await;
+            return Err("connection rejected by local user confirmation".into());
+        }
+    }
+
+    let granted_mode = if effective_requested == SessionMode::FullControl && !guard.try_acquire(controller_lock) {
+        SessionMode::ViewOnly
+    } else {
+        effective_requested
+    };
+
+    let server_proof = compute_server_proof(&cred.auth_key, &server_nonce, &client_nonce, &cert_fp);
+    let ok = pack_message(
+        ChannelId::AuthControl,
+        FLAG_URGENT,
+        &ControlMsg::AuthResult {
+            accepted: true,
+            server_proof,
+            granted_mode,
+            retry_after_secs: 0,
+            reason: String::new(),
+        },
+        None,
+    )
+    .map_err(|e| e.to_string())?;
+    write_frame_async(&mut tls, ok.channel, ok.flags, &ok.payload)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok((tls, granted_mode, guard))
+}
+
+struct OutboundQueues {
+    high: VecDeque<Frame>,
+    clip: VecDeque<Frame>,
+    aux: VecDeque<Frame>,
+    video: VecDeque<Frame>,
+    bulk: VecDeque<Frame>,
+}
+
+impl OutboundQueues {
+    fn new() -> Self {
+        Self {
+            high: VecDeque::new(),
+            clip: VecDeque::new(),
+            aux: VecDeque::new(),
+            video: VecDeque::new(),
+            bulk: VecDeque::new(),
+        }
+    }
+
+    fn push(&mut self, frame: Frame, to_agent_tx: &mpsc::Sender<IpcMsg>) {
+        match frame.channel {
+            ChannelId::AuthControl
+            | ChannelId::Input
+            | ChannelId::Terminal
+            | ChannelId::Comms
+            | ChannelId::PowerControl => {
+                self.high.push_back(frame);
+            }
+            ChannelId::Clipboard => {
+                if self.clip.len() >= 4 {
+                    self.clip.pop_front();
+                }
+                self.clip.push_back(frame);
+            }
+            ChannelId::Tunnel | ChannelId::SysAdmin => {
+                self.aux.push_back(frame);
+            }
+            ChannelId::VideoTiles => {
+                if self.video.len() >= MAX_VIDEO_QUEUE {
+                    // Drop oldest stale video frame and request fresh keyframe recovery
+                    self.video.pop_front();
+                    let _ = to_agent_tx.try_send(IpcMsg::KeyframeRequest { monitor_id: 0 });
+                }
+                self.video.push_back(frame);
+            }
+            ChannelId::FileTransfer => self.bulk.push_back(frame),
+        }
+    }
+
+    fn pop_next(&mut self) -> Option<Frame> {
+        self.high
+            .pop_front()
+            .or_else(|| self.clip.pop_front())
+            .or_else(|| self.aux.pop_front())
+            .or_else(|| self.video.pop_front())
+            .or_else(|| self.bulk.pop_front())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    conn_id: u64,
+    peer_str: &str,
+    tls: ServerTlsStream<S>,
+    mode: &mut SessionMode,
+    hub: &AgentHub,
+    sas_enabled: bool,
+    controller_lock: Option<&Arc<AtomicBool>>,
+    ctrl_guard: &mut ControllerGuard,
+    policy: &Arc<ServerPolicy>,
+    chat_tx: broadcast::Sender<(u64, CommsMsg)>,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> Result<(), String> {
+    let (mut reader, mut writer) = tokio::io::split(tls);
+    let mut agent_rx = hub.from_agent_tx.subscribe();
+    let mut chat_rx = chat_tx.subscribe();
+    let mut file_handler = FileSessionHandler::new();
+    let (term_tx, mut term_rx) = mpsc::channel::<TerminalMsg>(64);
+    let mut term_handler = TerminalSessionHandler::new(term_tx);
+    let (tun_tx, mut tun_rx) = mpsc::channel::<TunnelMsg>(128);
+    let mut tun_handler = TunnelSessionHandler::new(tun_tx);
+    let (sys_tx, mut sys_rx) = mpsc::channel::<SysAdminMsg>(32);
+    let mut sys_handler = SysAdminHandler::new();
+    let (voice_tx, mut voice_rx) = mpsc::channel::<Vec<u8>>(64);
+    let mut voice_engine: Option<VoiceEngine> = None;
+
+    let (out_tx, mut out_rx) = mpsc::channel::<Frame>(128);
+    let wake_agent = hub.to_agent_tx.clone();
+    let writer_task = tokio::spawn(async move {
+        let mut queues = OutboundQueues::new();
+        loop {
+            let first = match out_rx.recv().await {
+                Some(f) => f,
+                None => break,
+            };
+            queues.push(first, &wake_agent);
+            while let Ok(more) = out_rx.try_recv() {
+                queues.push(more, &wake_agent);
+            }
+            while let Some(frame) = queues.pop_next() {
+                if write_frame_async(&mut writer, frame.channel, frame.flags, &frame.payload)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                while let Ok(more) = out_rx.try_recv() {
+                    queues.push(more, &wake_agent);
+                }
+            }
+        }
+    });
+
+    // Send current known monitor list immediately if not FileTransfer-only
+    if *mode != SessionMode::FileTransfer {
+        let (monitors, active) = hub.monitors_rx.borrow().clone();
+        if !monitors.is_empty()
+            && let Ok(frame) = pack_message(
+                ChannelId::AuthControl,
+                FLAG_NONE,
+                &ControlMsg::MonitorList {
+                    monitors,
+                    active_monitor_id: active,
+                },
+                None,
+            )
+        {
+            let _ = out_tx.send(frame).await;
+        }
+        let _ = hub.to_agent_tx.try_send(IpcMsg::KeyframeRequest { monitor_id: active });
+    }
+
+    let mut download_pump = tokio::time::interval(Duration::from_millis(25));
+    let mut keepalive_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(10),
+        Duration::from_secs(10),
+    );
+    let mut last_rx = Instant::now();
+
+    let result = loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    break Ok(());
+                }
+            }
+            _ = keepalive_tick.tick() => {
+                if last_rx.elapsed() > Duration::from_secs(35) {
+                    break Err("session keepalive timeout".into());
+                }
+                if let Ok(f) = pack_message(ChannelId::AuthControl, FLAG_NONE, &ControlMsg::Ping { timestamp_ms: 0 }, None) {
+                    let _ = out_tx.try_send(f);
+                }
+            }
+            _ = download_pump.tick() => {
+                let bursts = file_handler.poll_downloads().await;
+                for ft in bursts {
+                    if let Ok(f) = pack_message(ChannelId::FileTransfer, FLAG_NONE, &ft, None)
+                        && out_tx.send(f).await.is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+            Some(tmsg) = term_rx.recv() => {
+                if let Ok(f) = pack_message(ChannelId::Terminal, FLAG_NONE, &tmsg, None) {
+                    let _ = out_tx.send(f).await;
+                }
+            }
+            Some(tun_msg) = tun_rx.recv() => {
+                if let Ok(f) = pack_message(ChannelId::Tunnel, FLAG_NONE, &tun_msg, None) {
+                    let _ = out_tx.send(f).await;
+                }
+            }
+            Some(smsg) = sys_rx.recv() => {
+                if let Ok(f) = pack_message(ChannelId::SysAdmin, FLAG_NONE, &smsg, Some(1024)) {
+                    let _ = out_tx.send(f).await;
+                }
+            }
+            Some(pcm) = voice_rx.recv() => {
+                if let Ok(f) = pack_message(ChannelId::Comms, FLAG_NONE, &CommsMsg::VoiceFrame(pcm), None) {
+                    let _ = out_tx.try_send(f);
+                }
+            }
+            Ok((src_id, cmsg)) = chat_rx.recv() => {
+                if src_id != conn_id
+                    && policy.permissions.text_chat
+                    && let Ok(f) = pack_message(ChannelId::Comms, FLAG_NONE, &cmsg, None)
+                {
+                    let _ = out_tx.send(f).await;
+                }
+            }
+            ev = agent_rx.recv(), if *mode != SessionMode::FileTransfer => {
+                match ev {
+                    Ok(msg) => {
+                        if let Some(frame) = ipc_to_wire_frame(&msg) {
+                            let _ = out_tx.try_send(frame);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let active = hub.monitors_rx.borrow().1;
+                        let _ = hub.to_agent_tx.try_send(IpcMsg::KeyframeRequest { monitor_id: active });
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break Ok(()),
+                }
+            }
+            frame_res = read_frame_async(&mut reader) => {
+                match frame_res {
+                    Ok(None) => break Ok(()),
+                    Ok(Some(frame)) => {
+                        last_rx = Instant::now();
+                        if let Err(e) = dispatch_client_frame(
+                            conn_id,
+                            peer_str,
+                            frame,
+                            mode,
+                            hub,
+                            sas_enabled,
+                            controller_lock,
+                            ctrl_guard,
+                            policy,
+                            &chat_tx,
+                            &out_tx,
+                            &mut file_handler,
+                            &mut term_handler,
+                            &mut tun_handler,
+                            &mut sys_handler,
+                            &sys_tx,
+                            &mut voice_engine,
+                            &voice_tx,
+                        ).await {
+                            if e == "client requested disconnect" {
+                                break Ok(());
+                            }
+                            break Err(e);
+                        }
+                    }
+                    Err(e) => break Err(format!("read error: {e}")),
+                }
+            }
+        }
+    };
+
+    drop(voice_engine);
+    term_handler.cleanup_all();
+    tun_handler.cleanup_all().await;
+    file_handler.cleanup_all().await;
+    drop(out_tx);
+    let _ = writer_task.await;
+    result
+}
+
+fn ipc_to_wire_frame(msg: &IpcMsg) -> Option<Frame> {
+    match msg {
+        IpcMsg::AgentReady {
+            monitors,
+            active_monitor_id,
+            ..
+        }
+        | IpcMsg::MonitorList {
+            monitors,
+            active_monitor_id,
+        } => pack_message(
+            ChannelId::AuthControl,
+            FLAG_NONE,
+            &ControlMsg::MonitorList {
+                monitors: monitors.clone(),
+                active_monitor_id: *active_monitor_id,
+            },
+            None,
+        )
+        .ok(),
+        IpcMsg::ResolutionChange {
+            monitor_id,
+            width,
+            height,
+            dpi_scale,
+        } => pack_message(
+            ChannelId::AuthControl,
+            FLAG_NONE,
+            &ControlMsg::ResolutionChange {
+                monitor_id: *monitor_id,
+                width: *width,
+                height: *height,
+                dpi_scale: *dpi_scale,
+            },
+            None,
+        )
+        .ok(),
+        IpcMsg::DesktopStatus {
+            state,
+            desktop_name,
+        } => pack_message(
+            ChannelId::AuthControl,
+            FLAG_NONE,
+            &ControlMsg::SessionStatus {
+                desktop_state: *state,
+                message: desktop_name.clone(),
+            },
+            None,
+        )
+        .ok(),
+        IpcMsg::Video(v) => {
+            let flags = match v {
+                VideoMsg::H264Frame { is_keyframe: true, .. }
+                | VideoMsg::TileBatch { is_full_refresh: true, .. } => FLAG_KEYFRAME,
+                _ => FLAG_NONE,
+            };
+            pack_message(ChannelId::VideoTiles, flags, v, None).ok()
+        }
+        IpcMsg::Clipboard(c) => pack_message(ChannelId::Clipboard, FLAG_NONE, c, None).ok(),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_client_frame(
+    conn_id: u64,
+    peer_str: &str,
+    frame: Frame,
+    mode: &mut SessionMode,
+    hub: &AgentHub,
+    sas_enabled: bool,
+    controller_lock: Option<&Arc<AtomicBool>>,
+    ctrl_guard: &mut ControllerGuard,
+    policy: &ServerPolicy,
+    chat_tx: &broadcast::Sender<(u64, CommsMsg)>,
+    out_tx: &mpsc::Sender<Frame>,
+    file_handler: &mut FileSessionHandler,
+    term_handler: &mut TerminalSessionHandler,
+    tun_handler: &mut TunnelSessionHandler,
+    sys_handler: &mut SysAdminHandler,
+    sys_tx: &mpsc::Sender<SysAdminMsg>,
+    voice_engine: &mut Option<VoiceEngine>,
+    voice_tx: &mpsc::Sender<Vec<u8>>,
+) -> Result<(), String> {
+    match frame.channel {
+        ChannelId::AuthControl => {
+            let msg: ControlMsg = unpack_message(&frame).map_err(|e| e.to_string())?;
+            match msg {
+                ControlMsg::Ping { timestamp_ms } => {
+                    if let Ok(pong) = pack_message(
+                        ChannelId::AuthControl,
+                        FLAG_URGENT,
+                        &ControlMsg::Pong { timestamp_ms },
+                        None,
+                    ) {
+                        let _ = out_tx.try_send(pong);
+                    }
+                }
+                ControlMsg::MonitorSelect { monitor_id } if *mode != SessionMode::FileTransfer => {
+                    let _ = hub.to_agent_tx.try_send(IpcMsg::MonitorSelect { monitor_id });
+                }
+                ControlMsg::QualityPreset {
+                    mode: qm,
+                    target_fps,
+                    h264_bitrate_kbps,
+                } if *mode != SessionMode::FileTransfer => {
+                    let _ = hub.to_agent_tx.try_send(IpcMsg::QualityPreset {
+                        mode: qm,
+                        target_fps: target_fps.min(policy.max_fps),
+                        h264_bitrate_kbps,
+                    });
+                }
+                ControlMsg::KeyframeRequest { monitor_id } if *mode != SessionMode::FileTransfer => {
+                    let _ = hub.to_agent_tx.try_send(IpcMsg::KeyframeRequest { monitor_id });
+                }
+                ControlMsg::SessionModeSwitch { mode: next_mode } => {
+                    if *mode != SessionMode::FileTransfer && next_mode != SessionMode::FileTransfer {
+                        if policy.force_view_only && next_mode == SessionMode::FullControl {
+                            send_control_error(out_tx, "Host enforces View Only mode.");
+                            return Ok(());
+                        }
+                        if !policy.permissions.allows_mode(next_mode) {
+                            send_control_error(out_tx, "Requested session mode is disabled by host administrator.");
+                            return Ok(());
+                        }
+                        if *mode == SessionMode::FullControl && next_mode == SessionMode::ViewOnly {
+                            ctrl_guard.release();
+                            let _ = hub.to_agent_tx.try_send(IpcMsg::Input(InputMsg::ReleaseAllKeys));
+                            *mode = next_mode;
+                        } else if *mode == SessionMode::ViewOnly && next_mode == SessionMode::FullControl {
+                            if ctrl_guard.try_acquire(controller_lock) {
+                                *mode = next_mode;
+                            } else if let Ok(err) = pack_message(
+                                ChannelId::AuthControl,
+                                FLAG_URGENT,
+                                &ControlMsg::Error {
+                                    message: "Another viewer currently holds remote control.".into(),
+                                },
+                                None,
+                            ) {
+                                let _ = out_tx.try_send(err);
+                            }
+                        } else {
+                            *mode = next_mode;
+                        }
+                    }
+                }
+                ControlMsg::SpecialAction(action) => {
+                    if *mode != SessionMode::FullControl {
+                        if let Ok(err) = pack_message(
+                            ChannelId::AuthControl,
+                            FLAG_URGENT,
+                            &ControlMsg::Error {
+                                message: "Action not permitted in View Only mode.".into(),
+                            },
+                            None,
+                        ) {
+                            let _ = out_tx.try_send(err);
+                        }
+                        return Ok(());
+                    }
+                    match action {
+                        SpecialAction::SendCtrlAltDel => {
+                            if sas_enabled {
+                                if let Err(e) = trigger_send_sas()
+                                    && let Ok(err) = pack_message(
+                                        ChannelId::AuthControl,
+                                        FLAG_URGENT,
+                                        &ControlMsg::Error { message: e },
+                                        None,
+                                    )
+                                {
+                                    let _ = out_tx.try_send(err);
+                                }
+                            } else if let Ok(err) = pack_message(
+                                ChannelId::AuthControl,
+                                FLAG_URGENT,
+                                &ControlMsg::Error {
+                                    message: "Ctrl+Alt+Del requires running DeskBolt as a Windows Service.".into(),
+                                },
+                                None,
+                            ) {
+                                let _ = out_tx.try_send(err);
+                            }
+                        }
+                        SpecialAction::ReleaseAllKeys => {
+                            let _ = hub.to_agent_tx.try_send(IpcMsg::Input(InputMsg::ReleaseAllKeys));
+                        }
+                    }
+                }
+                ControlMsg::Disconnect { .. } => {
+                    return Err("client requested disconnect".into());
+                }
+                _ => {}
+            }
+        }
+        ChannelId::Input => {
+            if *mode != SessionMode::FullControl {
+                // Trust boundary enforcement: silently reject input in ViewOnly/FileTransfer mode
+                return Ok(());
+            }
+            let inp: InputMsg = unpack_message(&frame).map_err(|e| e.to_string())?;
+            let _ = hub.to_agent_tx.try_send(IpcMsg::Input(inp));
+        }
+        ChannelId::Clipboard => {
+            if *mode != SessionMode::FullControl {
+                return Ok(());
+            }
+            let clip: ClipboardSync = unpack_message(&frame).map_err(|e| e.to_string())?;
+            let _ = hub.to_agent_tx.try_send(IpcMsg::Clipboard(clip));
+        }
+        ChannelId::FileTransfer => {
+            if *mode == SessionMode::ViewOnly || !policy.permissions.file_transfer {
+                send_control_error(out_tx, "File transfer is disabled by current session policy.");
+                return Ok(());
+            }
+            let ft: FileTransferMsg = unpack_message(&frame).map_err(|e| e.to_string())?;
+            let replies = file_handler.handle_message(ft).await;
+            for reply in replies {
+                if let Ok(f) = pack_message(ChannelId::FileTransfer, FLAG_NONE, &reply, None) {
+                    let _ = out_tx.send(f).await;
+                }
+            }
+        }
+        ChannelId::Terminal => {
+            if *mode != SessionMode::FullControl || !policy.permissions.terminal {
+                send_control_error(out_tx, "Terminal and serial access are disabled by host policy or session mode.");
+                return Ok(());
+            }
+            let msg: TerminalMsg = unpack_message(&frame).map_err(|e| e.to_string())?;
+            term_handler.handle_message(msg).await;
+        }
+        ChannelId::Tunnel => {
+            if *mode != SessionMode::FullControl || !policy.permissions.tunnels {
+                send_control_error(out_tx, "Port forwarding tunnels are disabled by host policy or session mode.");
+                return Ok(());
+            }
+            let msg: TunnelMsg = unpack_message(&frame).map_err(|e| e.to_string())?;
+            tun_handler.handle_message(msg).await;
+        }
+        ChannelId::SysAdmin => {
+            if *mode != SessionMode::FullControl {
+                send_control_error(out_tx, "System administration requires Full Control mode.");
+                return Ok(());
+            }
+            let msg: SysAdminMsg = unpack_message(&frame).map_err(|e| e.to_string())?;
+            match msg {
+                SysAdminMsg::SystemSnapshotReq => {
+                    let _ = sys_tx.send(sys_handler.snapshot()).await;
+                }
+                SysAdminMsg::KillProcess(pid) => {
+                    let _ = sys_tx.send(sys_handler.kill_process(pid)).await;
+                }
+                SysAdminMsg::ServiceAction { name, action } => {
+                    let _ = sys_tx.send(sys_handler.control_service(&name, action)).await;
+                }
+                SysAdminMsg::BroadcastExecReq {
+                    command_id,
+                    command,
+                } => {
+                    let tx = sys_tx.clone();
+                    tokio::spawn(async move {
+                        let res = tokio::task::spawn_blocking(move || {
+                            execute_broadcast_command(command_id, &command)
+                        })
+                        .await
+                        .unwrap_or_else(|e| SysAdminMsg::BroadcastExecResp {
+                            command_id,
+                            exit_code: -1,
+                            output: String::new(),
+                            error: Some(format!("broadcast task failed: {e}")),
+                        });
+                        let _ = tx.send(res).await;
+                    });
+                }
+                _ => {}
+            }
+        }
+        ChannelId::Comms => {
+            let msg: CommsMsg = unpack_message(&frame).map_err(|e| e.to_string())?;
+            match msg {
+                CommsMsg::ChatMessage { .. } => {
+                    if !policy.permissions.text_chat {
+                        send_control_error(out_tx, "Text chat is disabled by host administrator.");
+                        return Ok(());
+                    }
+                    let _ = chat_tx.send((conn_id, msg));
+                }
+                CommsMsg::PopupMessage {
+                    title,
+                    body,
+                    urgent,
+                } => {
+                    if !policy.permissions.send_message {
+                        let ack = CommsMsg::PopupAck {
+                            shown: false,
+                            message: "Popup messaging is disabled by host administrator.".into(),
+                        };
+                        if let Ok(f) = pack_message(ChannelId::Comms, FLAG_NONE, &ack, None) {
+                            let _ = out_tx.send(f).await;
+                        }
+                        return Ok(());
+                    }
+                    log_audit_event(
+                        policy.audit_log_path.as_deref(),
+                        peer_str,
+                        "popup_message",
+                        &title,
+                    );
+                    let _ = hub.to_agent_tx.try_send(IpcMsg::ShowPopup {
+                        title: title.clone(),
+                        body: body.clone(),
+                        urgent,
+                    });
+                    let ack = if policy.suppress_os_prompts {
+                        CommsMsg::PopupAck {
+                            shown: true,
+                            message: format!("Popup '{title}' queued."),
+                        }
+                    } else {
+                        let t = title.clone();
+                        let b = body.clone();
+                        match tokio::task::spawn_blocking(move || show_desktop_popup(&t, &b, urgent))
+                            .await
+                        {
+                            Ok(Ok(())) => CommsMsg::PopupAck {
+                                shown: true,
+                                message: "Message delivered to remote desktop session.".into(),
+                            },
+                            Ok(Err(e)) => CommsMsg::PopupAck {
+                                shown: false,
+                                message: e,
+                            },
+                            Err(e) => CommsMsg::PopupAck {
+                                shown: false,
+                                message: format!("popup task failed: {e}"),
+                            },
+                        }
+                    };
+                    if let Ok(f) = pack_message(ChannelId::Comms, FLAG_NONE, &ack, None) {
+                        let _ = out_tx.send(f).await;
+                    }
+                }
+                CommsMsg::VoiceOffer { .. } => {
+                    if !policy.permissions.voice_chat {
+                        send_control_error(out_tx, "Voice chat is disabled by host administrator.");
+                        return Ok(());
+                    }
+                    if policy.suppress_os_prompts {
+                        if let Ok(f) = pack_message(ChannelId::Comms, FLAG_NONE, &CommsMsg::VoiceAccept, None) {
+                            let _ = out_tx.send(f).await;
+                        }
+                    } else {
+                        match VoiceEngine::start(None, None, voice_tx.clone(), Arc::new(VoiceControls::default())) {
+                            Ok(eng) => {
+                                *voice_engine = Some(eng);
+                                if let Ok(f) = pack_message(ChannelId::Comms, FLAG_NONE, &CommsMsg::VoiceAccept, None) {
+                                    let _ = out_tx.send(f).await;
+                                }
+                            }
+                            Err(e) => {
+                                send_control_error(out_tx, &format!("Host audio unavailable: {e}"));
+                                if let Ok(f) = pack_message(ChannelId::Comms, FLAG_NONE, &CommsMsg::VoiceEnd, None) {
+                                    let _ = out_tx.send(f).await;
+                                }
+                            }
+                        }
+                    }
+                }
+                CommsMsg::VoiceFrame(bytes) => {
+                    if policy.permissions.voice_chat
+                        && let Some(eng) = voice_engine.as_ref()
+                    {
+                        eng.push_remote_frame(&bytes);
+                    }
+                }
+                CommsMsg::VoiceEnd => {
+                    *voice_engine = None;
+                }
+                _ => {}
+            }
+        }
+        ChannelId::PowerControl => {
+            let PowerMsg::PowerCommand {
+                action,
+                force,
+                delay_secs,
+            } = unpack_message(&frame).map_err(|e| e.to_string())?
+            else {
+                return Ok(());
+            };
+            if *mode != SessionMode::FullControl || !policy.permissions.power_control {
+                let ack = PowerMsg::PowerAck {
+                    accepted: false,
+                    message: "Power control is disabled by host policy or requires Full Control.".into(),
+                };
+                if let Ok(f) = pack_message(ChannelId::PowerControl, FLAG_URGENT, &ack, None) {
+                    let _ = out_tx.send(f).await;
+                }
+                return Ok(());
+            }
+            log_audit_event(
+                policy.audit_log_path.as_deref(),
+                peer_str,
+                "power_command",
+                &format!("{action:?} force={force} delay={delay_secs}"),
+            );
+            let ack = if policy.suppress_os_prompts {
+                PowerMsg::PowerAck {
+                    accepted: true,
+                    message: format!("Power command {action:?} accepted."),
+                }
+            } else {
+                match tokio::task::spawn_blocking(move || execute_power_action(action, force, delay_secs))
+                    .await
+                {
+                    Ok(Ok(message)) => PowerMsg::PowerAck {
+                        accepted: true,
+                        message,
+                    },
+                    Ok(Err(message)) => PowerMsg::PowerAck {
+                        accepted: false,
+                        message,
+                    },
+                    Err(e) => PowerMsg::PowerAck {
+                        accepted: false,
+                        message: format!("power action task failed: {e}"),
+                    },
+                }
+            };
+            if let Ok(f) = pack_message(ChannelId::PowerControl, FLAG_URGENT, &ack, None) {
+                let _ = out_tx.send(f).await;
+            }
+        }
+        ChannelId::VideoTiles => {}
+    }
+    Ok(())
+}
+
+fn send_control_error(out_tx: &mpsc::Sender<Frame>, message: &str) {
+    if let Ok(err) = pack_message(
+        ChannelId::AuthControl,
+        FLAG_URGENT,
+        &ControlMsg::Error {
+            message: message.to_string(),
+        },
+        None,
+    ) {
+        let _ = out_tx.try_send(err);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use deskbolt_proto::{
+        MouseBtn, PointerEvent, TofuPinPolicy, TofuServerCertVerifier, compute_client_proof,
+        connect_tls, derive_auth_key, generate_self_signed_cert, verify_server_proof,
+    };
+    use tokio::net::TcpStream;
+
+    use super::*;
+
+    fn test_hub() -> (AgentHub, mpsc::Receiver<IpcMsg>) {
+        let (to_agent_tx, to_agent_rx) = mpsc::channel(32);
+        let (from_agent_tx, _) = broadcast::channel(16);
+        let (_mon_tx, monitors_rx) = watch::channel((Vec::new(), 0));
+        let (wake_tx, _wake_rx) = mpsc::unbounded_channel();
+        (
+            AgentHub {
+                to_agent_tx,
+                from_agent_tx,
+                monitors_rx,
+                viewer_wake_tx: wake_tx,
+            },
+            to_agent_rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn loopback_auth_timeout_rate_limit_and_viewonly_isolation() {
+        let id = generate_self_signed_cert(&[]).unwrap();
+        let salt = [0x55u8; SALT_LEN];
+        let auth_key = derive_auth_key(b"TopSecret!2026", &salt, 1024, 1, 1).unwrap();
+        let cred = Arc::new(StoredCredential {
+            salt,
+            m_kib: 1024,
+            t_cost: 1,
+            p_cost: 1,
+            auth_key,
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (hub, mut to_agent_rx) = test_hub();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let server_task = tokio::spawn(serve_listener(
+            listener,
+            id.cert_der.clone(),
+            id.key_der.clone(),
+            cred,
+            hub,
+            false,
+            false,
+            Duration::from_millis(300),
+            shutdown_rx,
+        ));
+
+        // 1. Silent TCP connection must be dropped by preauth deadline
+        let mut silent = TcpStream::connect(addr).await.unwrap();
+        let mut b = [0u8; 1];
+        let read_res = tokio::io::AsyncReadExt::read(&mut silent, &mut b).await.unwrap();
+        assert_eq!(read_res, 0);
+
+        // 2. ViewOnly session authenticates and CANNOT inject Input or SendCtrlAltDel
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let verifier = Arc::new(TofuServerCertVerifier::new(TofuPinPolicy::ExpectPinned(
+            id.fingerprint,
+        )));
+        let (mut tls, fp) = connect_tls(stream, "localhost", verifier).await.unwrap();
+        assert_eq!(fp, id.fingerprint);
+
+        let c_nonce = [0xAAu8; NONCE_LEN];
+        let hello = pack_message(
+            ChannelId::AuthControl,
+            FLAG_URGENT,
+            &ControlMsg::ClientHello {
+                proto_version: PROTO_VERSION,
+                client_nonce: c_nonce,
+                requested_mode: SessionMode::ViewOnly,
+                client_name: "TestViewer".into(),
+            },
+            None,
+        )
+        .unwrap();
+        write_frame_async(&mut tls, hello.channel, hello.flags, &hello.payload)
+            .await
+            .unwrap();
+
+        let ch_frame = read_frame_async(&mut tls).await.unwrap().unwrap();
+        let ControlMsg::ServerChallenge {
+            server_nonce,
+            argon2_salt,
+            argon2_m_kib,
+            argon2_t,
+            argon2_p,
+        } = unpack_message::<ControlMsg>(&ch_frame).unwrap()
+        else {
+            panic!("expected ServerChallenge");
+        };
+
+        let key = derive_auth_key(b"TopSecret!2026", &argon2_salt, argon2_m_kib, argon2_t, argon2_p).unwrap();
+        let proof = compute_client_proof(&key, &c_nonce, &server_nonce, &fp);
+        let auth = pack_message(
+            ChannelId::AuthControl,
+            FLAG_URGENT,
+            &ControlMsg::ClientAuth { client_proof: proof },
+            None,
+        )
+        .unwrap();
+        write_frame_async(&mut tls, auth.channel, auth.flags, &auth.payload)
+            .await
+            .unwrap();
+
+        let res_frame = read_frame_async(&mut tls).await.unwrap().unwrap();
+        let ControlMsg::AuthResult {
+            accepted,
+            server_proof,
+            granted_mode,
+            ..
+        } = unpack_message::<ControlMsg>(&res_frame).unwrap()
+        else {
+            panic!("expected AuthResult");
+        };
+        assert!(accepted);
+        assert_eq!(granted_mode, SessionMode::ViewOnly);
+        assert!(verify_server_proof(&key, &server_nonce, &c_nonce, &fp, &server_proof));
+
+        // Attempt unauthorized input injection in ViewOnly mode
+        let bad_inp = pack_message(
+            ChannelId::Input,
+            FLAG_URGENT,
+            &InputMsg::Pointer(PointerEvent::Button {
+                button: MouseBtn::Left,
+                down: true,
+                norm_x: 0.5,
+                norm_y: 0.5,
+            }),
+            None,
+        )
+        .unwrap();
+        write_frame_async(&mut tls, bad_inp.channel, bad_inp.flags, &bad_inp.payload)
+            .await
+            .unwrap();
+
+        let bad_sas = pack_message(
+            ChannelId::AuthControl,
+            FLAG_URGENT,
+            &ControlMsg::SpecialAction(SpecialAction::SendCtrlAltDel),
+            None,
+        )
+        .unwrap();
+        write_frame_async(&mut tls, bad_sas.channel, bad_sas.flags, &bad_sas.payload)
+            .await
+            .unwrap();
+
+        let err_frame = read_frame_async(&mut tls).await.unwrap().unwrap();
+        let err_msg: ControlMsg = unpack_message(&err_frame).unwrap();
+        assert!(matches!(err_msg, ControlMsg::Error { .. }));
+
+        // Verify agent received zero Input messages from ViewOnly session
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        while let Ok(msg) = to_agent_rx.try_recv() {
+            assert!(!matches!(msg, IpcMsg::Input(_)));
+        }
+
+        let _ = shutdown_tx.send(true);
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn loopback_server_video_broadcast_and_file_roundtrip() {
+        use deskbolt_proto::{
+            DirtyTile, H264VideoEncoder, TileRect, TransferDir, VideoMsg, encode_dirty_tile,
+        };
+        use ring::digest::{Context as ShaCtx, SHA256};
+
+        let id = generate_self_signed_cert(&[]).unwrap();
+        let salt = [0x33u8; SALT_LEN];
+        let auth_key = derive_auth_key(b"ServerPass#4", &salt, 1024, 1, 1).unwrap();
+        let cred = Arc::new(StoredCredential {
+            salt,
+            m_kib: 1024,
+            t_cost: 1,
+            p_cost: 1,
+            auth_key,
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (hub, mut to_agent_rx) = test_hub();
+        let hub_tx = hub.from_agent_tx.clone();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let server_task = tokio::spawn(serve_listener(
+            listener,
+            id.cert_der.clone(),
+            id.key_der.clone(),
+            cred,
+            hub,
+            false,
+            false,
+            Duration::from_secs(2),
+            shutdown_rx,
+        ));
+
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let verifier = Arc::new(TofuServerCertVerifier::new(TofuPinPolicy::ExpectPinned(
+            id.fingerprint,
+        )));
+        let (mut tls, _) = connect_tls(tcp, "localhost", verifier).await.unwrap();
+
+        let c_nonce = [0x11u8; NONCE_LEN];
+        let hello = pack_message(
+            ChannelId::AuthControl,
+            FLAG_URGENT,
+            &ControlMsg::ClientHello {
+                proto_version: PROTO_VERSION,
+                client_nonce: c_nonce,
+                requested_mode: SessionMode::FullControl,
+                client_name: "LoopbackTester".into(),
+            },
+            None,
+        )
+        .unwrap();
+        write_frame_async(&mut tls, hello.channel, hello.flags, &hello.payload)
+            .await
+            .unwrap();
+
+        let ch = read_frame_async(&mut tls).await.unwrap().unwrap();
+        let ControlMsg::ServerChallenge {
+            server_nonce,
+            argon2_salt,
+            argon2_m_kib,
+            argon2_t,
+            argon2_p,
+        } = unpack_message(&ch).unwrap()
+        else {
+            panic!("expected ServerChallenge");
+        };
+        let key = derive_auth_key(b"ServerPass#4", &argon2_salt, argon2_m_kib, argon2_t, argon2_p).unwrap();
+        let auth = pack_message(
+            ChannelId::AuthControl,
+            FLAG_URGENT,
+            &ControlMsg::ClientAuth {
+                client_proof: compute_client_proof(&key, &c_nonce, &server_nonce, &id.fingerprint),
+            },
+            None,
+        )
+        .unwrap();
+        write_frame_async(&mut tls, auth.channel, auth.flags, &auth.payload)
+            .await
+            .unwrap();
+
+        let res = read_frame_async(&mut tls).await.unwrap().unwrap();
+        let ControlMsg::AuthResult {
+            accepted,
+            granted_mode,
+            server_proof,
+            ..
+        } = unpack_message(&res).unwrap()
+        else {
+            panic!("expected AuthResult");
+        };
+        assert!(accepted);
+        assert_eq!(granted_mode, SessionMode::FullControl);
+        assert!(verify_server_proof(
+            &key,
+            &server_nonce,
+            &c_nonce,
+            &id.fingerprint,
+            &server_proof
+        ));
+
+        // Drain any wakeups triggered during setup
+        while let Ok(msg) = to_agent_rx.try_recv() {
+            if matches!(msg, IpcMsg::KeyframeRequest { .. }) {
+                break;
+            }
+        }
+
+        // 1. Zstd tile + OpenH264 broadcast delivery through serve_listener
+        let bgra = vec![0x44u8; 32 * 32 * 4];
+        let tile: DirtyTile = encode_dirty_tile(
+            &bgra,
+            32,
+            32,
+            TileRect {
+                x: 0,
+                y: 0,
+                width: 32,
+                height: 32,
+            },
+            3,
+        )
+        .unwrap();
+        hub_tx
+            .send(Arc::new(IpcMsg::Video(VideoMsg::TileBatch {
+                monitor_id: 0,
+                frame_seq: 1,
+                timestamp_us: 0,
+                width: 32,
+                height: 32,
+                is_full_refresh: true,
+                move_rects: Vec::new(),
+                tiles: vec![tile],
+            })))
+            .unwrap();
+        let f1 = read_frame_async(&mut tls).await.unwrap().unwrap();
+        assert!(matches!(
+            unpack_message::<VideoMsg>(&f1).unwrap(),
+            VideoMsg::TileBatch { frame_seq: 1, .. }
+        ));
+
+        let mut enc = H264VideoEncoder::new(32, 32, 1_000_000, 30.0).unwrap();
+        enc.force_keyframe();
+        let (annex_b, is_kf) = enc.encode_bgra(&bgra, 32, 32).unwrap();
+        hub_tx
+            .send(Arc::new(IpcMsg::Video(VideoMsg::H264Frame {
+                monitor_id: 0,
+                frame_seq: 2,
+                timestamp_us: 1,
+                width: 32,
+                height: 32,
+                is_keyframe: is_kf,
+                annex_b,
+            })))
+            .unwrap();
+        let f2 = read_frame_async(&mut tls).await.unwrap().unwrap();
+        assert!(matches!(
+            unpack_message::<VideoMsg>(&f2).unwrap(),
+            VideoMsg::H264Frame { frame_seq: 2, .. }
+        ));
+
+        // 2. Chunked SHA-256 upload & download round-trip via FileTransfer channel
+        let temp_dir = std::env::temp_dir().join(format!("deskbolt_net_ft_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let remote_path = temp_dir.join("payload.bin").to_string_lossy().into_owned();
+        let payload: Vec<u8> = (0..140_000u32).map(|i| ((i * 7) % 251) as u8).collect();
+        let mut expected_sha = [0u8; 32];
+        let mut h = ShaCtx::new(&SHA256);
+        h.update(&payload);
+        expected_sha.copy_from_slice(h.finish().as_ref());
+
+        let start = pack_message(
+            ChannelId::FileTransfer,
+            FLAG_NONE,
+            &deskbolt_proto::FileTransferMsg::TransferStart {
+                transfer_id: 1,
+                direction: TransferDir::Upload,
+                remote_path: remote_path.clone(),
+                total_bytes: payload.len() as u64,
+                modified_unix: 0,
+                overwrite: true,
+            },
+            None,
+        )
+        .unwrap();
+        write_frame_async(&mut tls, start.channel, start.flags, &start.payload)
+            .await
+            .unwrap();
+        let ack_f = read_frame_async(&mut tls).await.unwrap().unwrap();
+        assert!(matches!(
+            unpack_message::<deskbolt_proto::FileTransferMsg>(&ack_f).unwrap(),
+            deskbolt_proto::FileTransferMsg::TransferStartAck { accepted: true, .. }
+        ));
+
+        let mut offset = 0usize;
+        for (idx, chunk) in payload.chunks(64 * 1024).enumerate() {
+            let seq = (idx + 1) as u32;
+            let cf = pack_message(
+                ChannelId::FileTransfer,
+                FLAG_NONE,
+                &deskbolt_proto::FileTransferMsg::FileChunk {
+                    transfer_id: 1,
+                    offset: offset as u64,
+                    chunk_seq: seq,
+                    data: chunk.to_vec(),
+                },
+                None,
+            )
+            .unwrap();
+            write_frame_async(&mut tls, cf.channel, cf.flags, &cf.payload)
+                .await
+                .unwrap();
+            let ca = read_frame_async(&mut tls).await.unwrap().unwrap();
+            assert!(matches!(
+                unpack_message::<deskbolt_proto::FileTransferMsg>(&ca).unwrap(),
+                deskbolt_proto::FileTransferMsg::FileAck { acked_seq, .. } if acked_seq == seq
+            ));
+            offset += chunk.len();
+        }
+        let done = pack_message(
+            ChannelId::FileTransfer,
+            FLAG_NONE,
+            &deskbolt_proto::FileTransferMsg::FileComplete {
+                transfer_id: 1,
+                total_bytes: payload.len() as u64,
+                sha256: expected_sha,
+            },
+            None,
+        )
+        .unwrap();
+        write_frame_async(&mut tls, done.channel, done.flags, &done.payload)
+            .await
+            .unwrap();
+        let vr = read_frame_async(&mut tls).await.unwrap().unwrap();
+        assert!(matches!(
+            unpack_message::<deskbolt_proto::FileTransferMsg>(&vr).unwrap(),
+            deskbolt_proto::FileTransferMsg::FileVerifyResult { verified: true, .. }
+        ));
+
+        // Download same file back through serve_listener
+        let dl_start = pack_message(
+            ChannelId::FileTransfer,
+            FLAG_NONE,
+            &deskbolt_proto::FileTransferMsg::TransferStart {
+                transfer_id: 2,
+                direction: TransferDir::Download,
+                remote_path,
+                total_bytes: 0,
+                modified_unix: 0,
+                overwrite: true,
+            },
+            None,
+        )
+        .unwrap();
+        write_frame_async(&mut tls, dl_start.channel, dl_start.flags, &dl_start.payload)
+            .await
+            .unwrap();
+        let dl_ack = read_frame_async(&mut tls).await.unwrap().unwrap();
+        assert!(matches!(
+            unpack_message::<deskbolt_proto::FileTransferMsg>(&dl_ack).unwrap(),
+            deskbolt_proto::FileTransferMsg::TransferStartAck { accepted: true, .. }
+        ));
+
+        let mut downloaded = Vec::new();
+        loop {
+            let f = read_frame_async(&mut tls).await.unwrap().unwrap();
+            match unpack_message::<deskbolt_proto::FileTransferMsg>(&f).unwrap() {
+                deskbolt_proto::FileTransferMsg::FileChunk { chunk_seq, data, .. } => {
+                    downloaded.extend_from_slice(&data);
+                    let ack = pack_message(
+                        ChannelId::FileTransfer,
+                        FLAG_NONE,
+                        &deskbolt_proto::FileTransferMsg::FileAck {
+                            transfer_id: 2,
+                            acked_seq: chunk_seq,
+                        },
+                        None,
+                    )
+                    .unwrap();
+                    write_frame_async(&mut tls, ack.channel, ack.flags, &ack.payload)
+                        .await
+                        .unwrap();
+                }
+                deskbolt_proto::FileTransferMsg::FileComplete { total_bytes, sha256, .. } => {
+                    assert_eq!(total_bytes as usize, payload.len());
+                    assert_eq!(sha256, expected_sha);
+                    let vr = pack_message(
+                        ChannelId::FileTransfer,
+                        FLAG_NONE,
+                        &deskbolt_proto::FileTransferMsg::FileVerifyResult {
+                            transfer_id: 2,
+                            verified: true,
+                            error: None,
+                        },
+                        None,
+                    )
+                    .unwrap();
+                    write_frame_async(&mut tls, vr.channel, vr.flags, &vr.payload)
+                        .await
+                        .unwrap();
+                    break;
+                }
+                other => panic!("unexpected FileTransferMsg during download: {other:?}"),
+            }
+        }
+        assert_eq!(downloaded, payload);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _ = shutdown_tx.send(true);
+        let _ = server_task.await;
+    }
+
+    async fn test_auth_connect(
+        addr: SocketAddr,
+        fp: [u8; 32],
+        password: &[u8],
+        mode: SessionMode,
+    ) -> (deskbolt_proto::ClientTlsStream<TcpStream>, SessionMode) {
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let verifier = Arc::new(TofuServerCertVerifier::new(TofuPinPolicy::ExpectPinned(fp)));
+        let (mut tls, _) = connect_tls(tcp, "localhost", verifier).await.unwrap();
+        let c_nonce = [0x22u8; NONCE_LEN];
+        let hello = pack_message(
+            ChannelId::AuthControl,
+            FLAG_URGENT,
+            &ControlMsg::ClientHello {
+                proto_version: PROTO_VERSION,
+                client_nonce: c_nonce,
+                requested_mode: mode,
+                client_name: "LockTester".into(),
+            },
+            None,
+        )
+        .unwrap();
+        write_frame_async(&mut tls, hello.channel, hello.flags, &hello.payload)
+            .await
+            .unwrap();
+        let ch = read_frame_async(&mut tls).await.unwrap().unwrap();
+        let ControlMsg::ServerChallenge {
+            server_nonce,
+            argon2_salt,
+            argon2_m_kib,
+            argon2_t,
+            argon2_p,
+        } = unpack_message(&ch).unwrap()
+        else {
+            panic!("expected ServerChallenge");
+        };
+        let key = derive_auth_key(password, &argon2_salt, argon2_m_kib, argon2_t, argon2_p).unwrap();
+        let auth = pack_message(
+            ChannelId::AuthControl,
+            FLAG_URGENT,
+            &ControlMsg::ClientAuth {
+                client_proof: compute_client_proof(&key, &c_nonce, &server_nonce, &fp),
+            },
+            None,
+        )
+        .unwrap();
+        write_frame_async(&mut tls, auth.channel, auth.flags, &auth.payload)
+            .await
+            .unwrap();
+        let res = read_frame_async(&mut tls).await.unwrap().unwrap();
+        let ControlMsg::AuthResult {
+            accepted: true,
+            granted_mode,
+            ..
+        } = unpack_message(&res).unwrap()
+        else {
+            panic!("expected accepted AuthResult");
+        };
+        (tls, granted_mode)
+    }
+
+    #[tokio::test]
+    async fn single_controller_lock_downgrades_second_viewer_and_releases_on_drop() {
+        let id = generate_self_signed_cert(&[]).unwrap();
+        let salt = [0x66u8; SALT_LEN];
+        let auth_key = derive_auth_key(b"LockSecret!1", &salt, 1024, 1, 1).unwrap();
+        let cred = Arc::new(StoredCredential {
+            salt,
+            m_kib: 1024,
+            t_cost: 1,
+            p_cost: 1,
+            auth_key,
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (hub, _to_agent_rx) = test_hub();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let server_task = tokio::spawn(serve_listener(
+            listener,
+            id.cert_der.clone(),
+            id.key_der.clone(),
+            cred,
+            hub,
+            false,
+            true,
+            Duration::from_secs(2),
+            shutdown_rx,
+        ));
+
+        let (tls1, m1) = test_auth_connect(addr, id.fingerprint, b"LockSecret!1", SessionMode::FullControl).await;
+        assert_eq!(m1, SessionMode::FullControl);
+
+        let (mut tls2, m2) = test_auth_connect(addr, id.fingerprint, b"LockSecret!1", SessionMode::FullControl).await;
+        assert_eq!(m2, SessionMode::ViewOnly);
+
+        let sw = pack_message(
+            ChannelId::AuthControl,
+            FLAG_URGENT,
+            &ControlMsg::SessionModeSwitch {
+                mode: SessionMode::FullControl,
+            },
+            None,
+        )
+        .unwrap();
+        write_frame_async(&mut tls2, sw.channel, sw.flags, &sw.payload)
+            .await
+            .unwrap();
+        let err_f = read_frame_async(&mut tls2).await.unwrap().unwrap();
+        assert!(matches!(
+            unpack_message::<ControlMsg>(&err_f).unwrap(),
+            ControlMsg::Error { .. }
+        ));
+
+        // Disconnecting first viewer releases controller lock for new FullControl session
+        drop(tls1);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let (_tls3, m3) = test_auth_connect(addr, id.fingerprint, b"LockSecret!1", SessionMode::FullControl).await;
+        assert_eq!(m3, SessionMode::FullControl);
+
+        let _ = shutdown_tx.send(true);
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn admin_channels_enforced_by_session_mode_and_sysadmin_responds() {
+        let id = generate_self_signed_cert(&[]).unwrap();
+        let salt = [0x77u8; SALT_LEN];
+        let auth_key = derive_auth_key(b"AdminPass!1", &salt, 1024, 1, 1).unwrap();
+        let cred = Arc::new(StoredCredential {
+            salt,
+            m_kib: 1024,
+            t_cost: 1,
+            p_cost: 1,
+            auth_key,
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (hub, _to_agent_rx) = test_hub();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let server_task = tokio::spawn(serve_listener(
+            listener,
+            id.cert_der.clone(),
+            id.key_der.clone(),
+            cred,
+            hub,
+            false,
+            false,
+            Duration::from_secs(2),
+            shutdown_rx,
+        ));
+
+        // 1. ViewOnly viewer cannot open Terminal/Tunnel/SysAdmin channels
+        let (mut vo_tls, vo_mode) =
+            test_auth_connect(addr, id.fingerprint, b"AdminPass!1", SessionMode::ViewOnly).await;
+        assert_eq!(vo_mode, SessionMode::ViewOnly);
+        let req = pack_message(
+            ChannelId::SysAdmin,
+            FLAG_NONE,
+            &SysAdminMsg::SystemSnapshotReq,
+            None,
+        )
+        .unwrap();
+        write_frame_async(&mut vo_tls, req.channel, req.flags, &req.payload)
+            .await
+            .unwrap();
+        let vo_reply = read_frame_async(&mut vo_tls).await.unwrap().unwrap();
+        assert!(matches!(
+            unpack_message::<ControlMsg>(&vo_reply).unwrap(),
+            ControlMsg::Error { .. }
+        ));
+        drop(vo_tls);
+
+        // 2. FullControl viewer receives SystemSnapshotResp on Channel 0x08
+        let (mut fc_tls, fc_mode) =
+            test_auth_connect(addr, id.fingerprint, b"AdminPass!1", SessionMode::FullControl).await;
+        assert_eq!(fc_mode, SessionMode::FullControl);
+        let req2 = pack_message(
+            ChannelId::SysAdmin,
+            FLAG_NONE,
+            &SysAdminMsg::SystemSnapshotReq,
+            None,
+        )
+        .unwrap();
+        write_frame_async(&mut fc_tls, req2.channel, req2.flags, &req2.payload)
+            .await
+            .unwrap();
+        let snap_frame = read_frame_async(&mut fc_tls).await.unwrap().unwrap();
+        assert_eq!(snap_frame.channel, ChannelId::SysAdmin);
+        let snap_msg: SysAdminMsg = unpack_message(&snap_frame).unwrap();
+        assert!(matches!(
+            snap_msg,
+            SysAdminMsg::SystemSnapshotResp { error: None, .. }
+        ));
+
+        let _ = shutdown_tx.send(true);
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn server_policy_enforces_cidr_perms_comms_and_power() {
+        let id = generate_self_signed_cert(&[]).unwrap();
+        let salt = [0x66u8; SALT_LEN];
+        let auth_key = derive_auth_key(b"PolicyPass!8", &salt, 1024, 1, 1).unwrap();
+        let cred = Arc::new(StoredCredential {
+            salt,
+            m_kib: 1024,
+            t_cost: 1,
+            p_cost: 1,
+            auth_key,
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (hub, _to_agent_rx) = test_hub();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        // Policy: allowlist 127.0.0.1/32, force_view_only = false, power_control = false, send_message = true
+        let mut policy = ServerPolicy::for_test(false);
+        policy.ip_allowlist = vec!["127.0.0.1/32".into()];
+        policy.permissions.power_control = false;
+        policy.permissions.text_chat = true;
+        policy.permissions.send_message = true;
+
+        let server_task = tokio::spawn(serve_listener_with_policy(
+            listener,
+            id.cert_der.clone(),
+            id.key_der.clone(),
+            cred,
+            hub,
+            false,
+            policy,
+            Duration::from_secs(2),
+            shutdown_rx,
+        ));
+
+        let (mut tls_a, mode_a) =
+            test_auth_connect(addr, id.fingerprint, b"PolicyPass!8", SessionMode::FullControl).await;
+        assert_eq!(mode_a, SessionMode::FullControl);
+
+        let (mut tls_b, _) =
+            test_auth_connect(addr, id.fingerprint, b"PolicyPass!8", SessionMode::ViewOnly).await;
+
+        // 1. PowerCommand blocked when permissions.power_control == false
+        let p_cmd = pack_message(
+            ChannelId::PowerControl,
+            FLAG_NONE,
+            &PowerMsg::PowerCommand {
+                action: deskbolt_proto::PowerAction::Restart,
+                force: false,
+                delay_secs: 5,
+            },
+            None,
+        )
+        .unwrap();
+        write_frame_async(&mut tls_a, p_cmd.channel, p_cmd.flags, &p_cmd.payload)
+            .await
+            .unwrap();
+        let pack_reply = read_frame_async(&mut tls_a).await.unwrap().unwrap();
+        assert_eq!(pack_reply.channel, ChannelId::PowerControl);
+        assert!(matches!(
+            unpack_message::<PowerMsg>(&pack_reply).unwrap(),
+            PowerMsg::PowerAck { accepted: false, .. }
+        ));
+
+        // 2. PopupMessage acknowledged on Channel 0x09
+        let pop = pack_message(
+            ChannelId::Comms,
+            FLAG_NONE,
+            &CommsMsg::PopupMessage {
+                title: "Maintenance".into(),
+                body: "Rebooting soon".into(),
+                urgent: true,
+            },
+            None,
+        )
+        .unwrap();
+        write_frame_async(&mut tls_a, pop.channel, pop.flags, &pop.payload)
+            .await
+            .unwrap();
+        let pop_reply = read_frame_async(&mut tls_a).await.unwrap().unwrap();
+        assert!(matches!(
+            unpack_message::<CommsMsg>(&pop_reply).unwrap(),
+            CommsMsg::PopupAck { shown: true, .. }
+        ));
+
+        // 3. ChatMessage relayed from session A -> session B
+        let chat = pack_message(
+            ChannelId::Comms,
+            FLAG_NONE,
+            &CommsMsg::ChatMessage {
+                sender: "Ops".into(),
+                timestamp: 100,
+                text: "Hello desktop".into(),
+            },
+            None,
+        )
+        .unwrap();
+        write_frame_async(&mut tls_a, chat.channel, chat.flags, &chat.payload)
+            .await
+            .unwrap();
+        let chat_b = read_frame_async(&mut tls_b).await.unwrap().unwrap();
+        assert_eq!(
+            unpack_message::<CommsMsg>(&chat_b).unwrap(),
+            CommsMsg::ChatMessage {
+                sender: "Ops".into(),
+                timestamp: 100,
+                text: "Hello desktop".into(),
+            }
+        );
+
+        drop(tls_a);
+        drop(tls_b);
+        let _ = shutdown_tx.send(true);
+        let _ = server_task.await;
+    }
+}

@@ -1,0 +1,72 @@
+[package]
+name = "deskbolt-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "DeskBolt self-hosted remote desktop server and system service."
+
+[lib]
+name = "deskbolt_server_lib"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "deskbolt-server"
+path = "src/main.rs"
+
+[dependencies]
+deskbolt-proto = { path = "../deskbolt-proto" }
+tokio = { workspace = true }
+ring = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+sysinfo = { workspace = true }
+cpal = { workspace = true }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+portable-pty = { workspace = true }
+serialport = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true }
+windows-service = { workspace = true }
+dxgi-capture-rs = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+xcap = { workspace = true }
+enigo = { workspace = true, features = ["x11rb", "wayland"] }
+arboard = { workspace = true }
+libc = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+xcap = { workspace = true }
+enigo = { workspace = true }
+arboard = { workspace = true }
+libc = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { workspace = true }
+
+[package.metadata.deb]
+maintainer = "StackSync Solutions <jakepanlilio2000>"
+section = "net"
+priority = "optional"
+depends = "$auto, libc6, libx11-6, libxcb1, libxrandr2, libdbus-1-3"
+assets = [
+    ["target/release/deskbolt-server", "usr/bin/", "755"],
+    ["../../packaging/linux/deskbolt-server.service", "lib/systemd/system/deskbolt-server.service", "644"],
+    ["../../LICENSE", "usr/share/doc/deskbolt-server/copyright", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/deskbolt-server", dest = "/usr/bin/deskbolt-server", mode = "0755" },
+    { source = "../../packaging/linux/deskbolt-server.service", dest = "/usr/lib/systemd/system/deskbolt-server.service", mode = "0644" },
+    { source = "../../LICENSE", dest = "/usr/share/licenses/deskbolt-server/LICENSE", mode = "0644" },
+]
+
+[lints]
+workspace = true
