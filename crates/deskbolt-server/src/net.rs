@@ -1732,7 +1732,7 @@ mod tests {
         write_frame_async(&mut tls, start.channel, start.flags, &start.payload)
             .await
             .unwrap();
-        let ack_f = read_frame_async(&mut tls).await.unwrap().unwrap();
+        let ack_f = read_transfer_frame(&mut tls).await;
         assert!(matches!(
             unpack_message::<deskbolt_proto::FileTransferMsg>(&ack_f).unwrap(),
             deskbolt_proto::FileTransferMsg::TransferStartAck { accepted: true, .. }
@@ -1747,7 +1747,7 @@ mod tests {
                 drop(tls);
                 (tls, _) = test_auth_connect(addr, id.fingerprint, b"ServerPass#4", SessionMode::FileTransfer).await;
                 write_frame_async(&mut tls, start.channel, start.flags, &start.payload).await.unwrap();
-                let ack = read_frame_async(&mut tls).await.unwrap().unwrap();
+                let ack = read_transfer_frame(&mut tls).await;
                 let expected = ring::digest::digest(&SHA256, &payload[..offset]);
                 assert!(matches!(unpack_message::<FileTransferMsg>(&ack).unwrap(),
                     FileTransferMsg::TransferStartAck { accepted: true, resume_offset, prefix_sha256: Some(hash), .. }
@@ -1768,7 +1768,7 @@ mod tests {
             write_frame_async(&mut tls, cf.channel, cf.flags, &cf.payload)
                 .await
                 .unwrap();
-            let ca = read_frame_async(&mut tls).await.unwrap().unwrap();
+            let ca = read_transfer_frame(&mut tls).await;
             assert!(matches!(
                 unpack_message::<deskbolt_proto::FileTransferMsg>(&ca).unwrap(),
                 deskbolt_proto::FileTransferMsg::FileAck { acked_seq, .. } if acked_seq == seq
@@ -1789,7 +1789,7 @@ mod tests {
         write_frame_async(&mut tls, done.channel, done.flags, &done.payload)
             .await
             .unwrap();
-        let vr = read_frame_async(&mut tls).await.unwrap().unwrap();
+        let vr = read_transfer_frame(&mut tls).await;
         assert!(matches!(
             unpack_message::<deskbolt_proto::FileTransferMsg>(&vr).unwrap(),
             deskbolt_proto::FileTransferMsg::FileVerifyResult { verified: true, .. }
@@ -1817,7 +1817,7 @@ mod tests {
         write_frame_async(&mut tls, dl_start.channel, dl_start.flags, &dl_start.payload)
             .await
             .unwrap();
-        let dl_ack = read_frame_async(&mut tls).await.unwrap().unwrap();
+        let dl_ack = read_transfer_frame(&mut tls).await;
         assert!(matches!(
             unpack_message::<deskbolt_proto::FileTransferMsg>(&dl_ack).unwrap(),
             deskbolt_proto::FileTransferMsg::TransferStartAck { accepted: true, resume_offset, .. } if resume_offset == resume as u64
@@ -1825,7 +1825,7 @@ mod tests {
 
         let mut downloaded = payload[..resume].to_vec();
         loop {
-            let f = read_frame_async(&mut tls).await.unwrap().unwrap();
+            let f = read_transfer_frame(&mut tls).await;
             match unpack_message::<deskbolt_proto::FileTransferMsg>(&f).unwrap() {
                 deskbolt_proto::FileTransferMsg::FileChunk { chunk_seq, data, .. } => {
                     assert_ne!(f.flags & deskbolt_proto::FLAG_COMPRESSED, 0);
@@ -1890,7 +1890,7 @@ mod tests {
             };
             let frame = pack_message(ChannelId::FileTransfer, FLAG_NONE, &req, None).unwrap();
             write_frame_async(&mut tls, frame.channel, frame.flags, &frame.payload).await.unwrap();
-            let frame = read_frame_async(&mut tls).await.unwrap().unwrap();
+            let frame = read_transfer_frame(&mut tls).await;
             let FileTransferMsg::HashTreeResp { entries, next_cursor, error: None, .. } =
                 unpack_message(&frame).unwrap() else { panic!("invalid hash page"); };
             pages += 1;
@@ -1917,10 +1917,10 @@ mod tests {
             prefix_sha256: Some([0; 32]),
         }, None).unwrap();
         write_frame_async(&mut tls, fallback.channel, fallback.flags, &fallback.payload).await.unwrap();
-        let ack = read_frame_async(&mut tls).await.unwrap().unwrap();
+        let ack = read_transfer_frame(&mut tls).await;
         assert!(matches!(unpack_message::<FileTransferMsg>(&ack).unwrap(),
             FileTransferMsg::TransferStartAck { accepted: true, resume_offset: 0, prefix_sha256: None, .. }));
-        let first = read_frame_async(&mut tls).await.unwrap().unwrap();
+        let first = read_transfer_frame(&mut tls).await;
         assert!(matches!(unpack_message::<FileTransferMsg>(&first).unwrap(),
             FileTransferMsg::FileChunk { offset: 0, .. }));
 
@@ -1928,6 +1928,17 @@ mod tests {
         let _ = shutdown_tx.send(true);
         let _ = server_task.await;
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    async fn read_transfer_frame(tls: &mut deskbolt_proto::ClientTlsStream<TcpStream>) -> Frame {
+        loop {
+            let frame = read_frame_async(tls).await.unwrap().unwrap();
+            if frame.channel == ChannelId::FileTransfer {
+                return frame;
+            }
+            assert_eq!(frame.channel, ChannelId::AuthControl);
+            assert!(matches!(unpack_message(&frame).unwrap(), ControlMsg::Ping { .. }));
+        }
     }
 
     async fn test_auth_connect(
