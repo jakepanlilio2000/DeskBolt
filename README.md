@@ -31,6 +31,13 @@ Install the **Host** on the computer you want to reach and the **Viewer** on the
 
 The first connection shows the host certificate's SHA-256 fingerprint. Confirm it with the host administrator before accepting it. DeskBolt saves the approved fingerprint locally and alerts you if it changes.
 
+### Desktop session controls
+
+- **Cursor Sync** displays the host cursor over the remote desktop. Supported capture backends send its shape and position separately from the screen image.
+- **Clipboard → Send Local Clipboard** sends text, PNG images, HTML, or a list of file paths. **Auto-sync clipboard** receives clipboard changes from the active full-control session. Set the size limit under **Options → Display & Input** or with `clipboard_max_bytes` in the host's `config.toml`.
+- Drop local files on the remote desktop to upload them to the directory selected in **Files**, or to the host user's Desktop when no directory is selected. Transfer progress appears on the canvas.
+- **Type Clipboard** sends clipboard text as keystrokes in full-control sessions. The default shortcut is **Ctrl+Shift+V** and the default delay is **10 ms** per character. The shortcut and delay are configurable in **Options**. For firmware consoles and nested desktops, match the target keyboard layout to US scan codes. Unicode entry depends on the target application and input backend.
+
 ### Windows
 
 Download the x64 setup executable and select the components you need. When installing the host, set a password during setup. The installer registers and starts the host service.
@@ -96,9 +103,9 @@ TLS 1.3 carries multiplexed frames with a six-byte header. A big-endian 32-bit p
 | Channel | Contents |
 | --- | --- |
 | `0x01` | Authentication, session and monitor controls, keepalives, Windows secure attention |
-| `0x02` | Screen tiles, video, and frame acknowledgments |
+| `0x02` | Screen tiles, video, and cursor updates |
 | `0x03` | Keyboard and pointer input |
-| `0x04` | Clipboard updates |
+| `0x04` | Text, PNG, HTML, and file-list clipboard updates |
 | `0x05` | File operations, directory synchronization, and log tailing |
 | `0x06` | Host terminal and serial streams |
 | `0x07` | Forward and reverse TCP tunnels |
