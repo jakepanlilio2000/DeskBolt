@@ -263,6 +263,7 @@ pub enum SessionUiEvent {
     MonitorsUpdated { monitors: Vec<MonitorInfo>, active_id: u8 },
     RttUpdated(u64),
     StatusBanner(String),
+    DesktopAction { action: deskbolt_proto::SpecialAction, accepted: bool, message: String },
     RemoteClipboard(ClipboardSync),
     AndroidControls,
     Cursor(VideoMsg),
@@ -336,6 +337,7 @@ pub struct ViewerSession {
     pub(crate) monitor_frames: MonitorFrames,
     pub(crate) cursors: MonitorCursors,
     pub(crate) workspace: crate::monitor_workspace::Workspace,
+    pub(crate) window_match: crate::monitor_workspace::WindowMatch,
     pub file_transfer: FileTransferState,
     pub quick_edit: Option<QuickEditBuffer>,
     pub log_tail: Option<LogTailBuffer>,
@@ -433,6 +435,7 @@ impl ViewerSession {
             monitor_frames: surfaces.monitors,
             cursors: Arc::default(),
             workspace: crate::monitor_workspace::Workspace::default(),
+            window_match: crate::monitor_workspace::WindowMatch::default(),
             file_transfer: ft,
             quick_edit: None,
             log_tail: None,
@@ -522,6 +525,7 @@ impl ViewerSession {
                         self.cursors.lock().unwrap().clear();
                         self.monitor_frames.lock().unwrap().clear();
                         self.workspace = crate::monitor_workspace::Workspace::default();
+                        self.window_match = crate::monitor_workspace::WindowMatch::default();
                     }
                     if matches!(p, ConnectionPhase::Connected) {
                         if let Some(device) = self.system_audio_on_connect.take() {
@@ -544,6 +548,9 @@ impl ViewerSession {
                 }
                 SessionUiEvent::ModeUpdated(m) => {
                     self.mode = m;
+                    if m != SessionMode::FullControl {
+                        self.window_match.refused();
+                    }
                 }
                 SessionUiEvent::PinAccepted { host_id, fingerprint } => {
                     pin_to_save = Some((host_id, fingerprint));
@@ -562,6 +569,12 @@ impl ViewerSession {
                     self.last_rtt_ms = Some(ms);
                 }
                 SessionUiEvent::StatusBanner(msg) => self.status_banner = msg,
+                SessionUiEvent::DesktopAction { action, accepted, message } => {
+                    if !accepted && matches!(action, deskbolt_proto::SpecialAction::SetDisplayMode { .. }) {
+                        self.window_match.refused();
+                    }
+                    self.status_banner = message;
+                }
                 SessionUiEvent::RemoteClipboard(message) => {
                     if self.auto_clipboard && self.mode == SessionMode::FullControl {
                         clip_to_copy = Some(message);
@@ -1557,6 +1570,9 @@ async fn run_session_task(
                                         if timestamp_ms > 0 && now_ms >= timestamp_ms {
                                             notify(SessionUiEvent::RttUpdated(now_ms - timestamp_ms));
                                         }
+                                    }
+                                    ControlMsg::DesktopActionResult { action, accepted, message } => {
+                                        notify(SessionUiEvent::DesktopAction { action, accepted, message });
                                     }
                                     ControlMsg::ResolutionChange { width, height, .. } => {
                                         notify(SessionUiEvent::StatusBanner(format!("Display {width}x{height}")));

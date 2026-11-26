@@ -410,6 +410,75 @@ pub(crate) fn show_windows(ctx: &Context, session: &mut ViewerSession, show_curs
     }
 }
 
+#[derive(Default)]
+pub(crate) struct WindowMatch {
+    pub enabled: bool,
+    pending: Option<((u8, u16, u16), std::time::Instant)>,
+    last_requested: Option<(u8, u16, u16)>,
+}
+
+impl WindowMatch {
+    pub fn disable(&mut self, sender: &mpsc::Sender<SessionCommand>) {
+        self.enabled = false;
+        self.pending = None;
+        if self.last_requested.is_some()
+            && sender
+                .try_send(SessionCommand::Control(ControlMsg::SpecialAction(
+                    deskbolt_proto::SpecialAction::RestoreDisplayMode,
+                )))
+                .is_ok()
+        {
+            self.last_requested = None;
+        }
+    }
+
+    pub fn tick(&mut self, ui: &Ui, monitor_id: u8, sender: &mpsc::Sender<SessionCommand>) {
+        use std::time::{Duration, Instant};
+
+        if !self.enabled {
+            self.disable(sender);
+            return;
+        }
+        let pixels = ui.available_size() * ui.ctx().pixels_per_point();
+        if pixels.x < 320.0 || pixels.y < 200.0 {
+            return;
+        }
+        let width = pixels.x.round().clamp(320.0, 16_384.0) as u16;
+        let height = pixels.y.round().clamp(200.0, 16_384.0) as u16;
+        let target = (monitor_id, width, height);
+        if self.last_requested == Some(target) {
+            self.pending = None;
+            return;
+        }
+        let started = self
+            .pending
+            .filter(|(size, _)| *size == target)
+            .map_or_else(Instant::now, |(_, time)| time);
+        self.pending = Some((target, started));
+        if started.elapsed() >= Duration::from_millis(600)
+            && sender
+                .try_send(SessionCommand::Control(ControlMsg::SpecialAction(
+                    deskbolt_proto::SpecialAction::SetDisplayMode {
+                        monitor_id,
+                        width,
+                        height,
+                        refresh_hz: 0,
+                    },
+                )))
+                .is_ok()
+        {
+            self.last_requested = Some(target);
+            self.pending = None;
+        } else {
+            ui.ctx().request_repaint_after(Duration::from_millis(150));
+        }
+    }
+
+    pub fn refused(&mut self) {
+        *self = Self::default();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

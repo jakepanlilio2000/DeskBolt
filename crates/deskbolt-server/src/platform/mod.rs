@@ -254,6 +254,8 @@ pub fn prompt_connection_confirmation(
     imp::prompt_connection_confirmation(peer_ip, mode, timeout_secs, default_allow)
 }
 
+pub(crate) mod display_mode;
+
 pub fn set_curtain_mode(enabled: bool) -> Result<(), String> {
     imp::set_curtain_mode(enabled)
 }

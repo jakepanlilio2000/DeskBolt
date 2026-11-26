@@ -786,6 +786,13 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                 match ev {
                     Ok(msg) => {
                         match msg.as_ref() {
+                            IpcMsg::DesktopActionResult { viewer, action, accepted, message } if *viewer == conn_id => {
+                                let response = ControlMsg::DesktopActionResult { action: *action, accepted: *accepted, message: message.clone() };
+                                if let Ok(frame) = pack_message(ChannelId::AuthControl, FLAG_URGENT, &response, None) {
+                                    let _ = out_tx.send(frame).await;
+                                }
+                                continue;
+                            }
                             IpcMsg::SystemAudioReady { viewer, error } if *viewer == conn_id => {
                                 if system_audio == SystemAudioState::Pending {
                                     if let Some(error) = error {
@@ -903,6 +910,9 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
     if *mode != SessionMode::FileTransfer {
         let _ = hub.to_agent_tx.send(IpcMsg::VideoDecoderSupport { viewer: conn_id, capabilities: None }).await;
     }
+    if video_feedback.desktop_settings_used {
+        let _ = hub.to_agent_tx.send(IpcMsg::ReleaseDesktopSettings(conn_id)).await;
+    }
     if video_feedback.monitor_workspace {
         let _ = hub.to_agent_tx.send(IpcMsg::MonitorWorkspace { viewer: conn_id, enabled: false }).await;
     }
@@ -922,6 +932,7 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
 struct VideoFeedback {
     decoders: VideoCapabilities,
     monitor_workspace: bool,
+    desktop_settings_used: bool,
     probe: Option<(u64, Instant)>,
     next_probe: u64,
     rtt: Option<(u64, Instant)>,
@@ -1141,6 +1152,10 @@ async fn dispatch_client_frame(
                             if policy.curtain_on_control && policy.os_prompts_enabled() {
                                 let _ = hub.to_agent_tx.send(IpcMsg::SetCurtainMode(false)).await;
                             }
+                            if video_feedback.desktop_settings_used {
+                                let _ = hub.to_agent_tx.send(IpcMsg::ReleaseDesktopSettings(conn_id)).await;
+                                video_feedback.desktop_settings_used = false;
+                            }
                             ctrl_guard.release();
                             *mode = next_mode;
                         } else if *mode == SessionMode::ViewOnly && next_mode == SessionMode::FullControl {
@@ -1215,6 +1230,23 @@ async fn dispatch_client_frame(
                         }
                         SpecialAction::ReleaseAllKeys => {
                             let _ = hub.to_agent_tx.try_send(IpcMsg::Input(InputMsg::ReleaseAllKeys));
+                        }
+                        SpecialAction::SetDisplayMode { .. } | SpecialAction::RestoreDisplayMode => {
+                            let permission = policy.permissions.display_mode && policy.os_prompts_enabled();
+                            let failure = if !permission {
+                                Some("Changing display modes is disabled by the host.")
+                            } else if hub.to_agent_tx.try_send(IpcMsg::DesktopAction { viewer: conn_id, action }).is_err() {
+                                Some("The host desktop is temporarily unavailable.")
+                            } else {
+                                video_feedback.desktop_settings_used = true;
+                                None
+                            };
+                            if let Some(message) = failure {
+                                let response = ControlMsg::DesktopActionResult { action, accepted: false, message: message.into() };
+                                if let Ok(frame) = pack_message(ChannelId::AuthControl, FLAG_URGENT, &response, None) {
+                                    let _ = out_tx.try_send(frame);
+                                }
+                            }
                         }
                     }
                 }

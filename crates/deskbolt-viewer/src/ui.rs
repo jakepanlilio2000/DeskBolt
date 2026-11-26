@@ -1440,6 +1440,14 @@ impl DeskBoltViewerApp {
                             s.workspace.toggle_windows(&s.monitors);
                         }
                         s.workspace.synchronize(&s.monitors, &s.cmd_tx);
+                        if s.workspace.stitched {
+                            s.window_match.disable(&s.cmd_tx);
+                        }
+                        if ui.add_enabled(is_full && !s.workspace.stitched, egui::Checkbox::new(
+                            &mut s.window_match.enabled, "Match Viewer Window Size",
+                        )).changed() && !s.window_match.enabled {
+                            s.window_match.disable(&s.cmd_tx);
+                        }
                     }
                     if s.android_controls && is_full {
                         use deskbolt_proto::DeviceAction;
@@ -1552,6 +1560,9 @@ impl DeskBoltViewerApp {
                         if s.workspace.stitched {
                             crate::monitor_workspace::paint_stitched(ui, s, self.settings.remote_cursor_sync);
                             return;
+                        }
+                        if s.mode == SessionMode::FullControl && !s.monitors.is_empty() {
+                            s.window_match.tick(ui, s.active_monitor_id, &s.cmd_tx);
                         }
                         let latest_opt = s.monitor_frames.lock().unwrap().get(&s.active_monitor_id).cloned();
                         let Some(frame) = latest_opt else {

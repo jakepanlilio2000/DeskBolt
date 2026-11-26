@@ -1582,6 +1582,7 @@ dependencies = [
  "rmcp",
  "rustls",
  "schemars 0.8.22",
+ "serde",
  "serialport",
  "sysinfo",
  "tempfile",

@@ -45,6 +45,8 @@ pub struct MonitorInfo {
 pub enum SpecialAction {
     SendCtrlAltDel,
     ReleaseAllKeys,
+    SetDisplayMode { monitor_id: u8, width: u16, height: u16, refresh_hz: u16 },
+    RestoreDisplayMode,
 }
 
 /// Channel `0x01` authentication, session lifecycle, and control messages.
@@ -122,6 +124,7 @@ pub enum ControlMsg {
     AndroidControls,
     VideoCapabilities(crate::video_pipeline::VideoCapabilities),
     MonitorWorkspace { enabled: bool },
+    DesktopActionResult { action: SpecialAction, accepted: bool, message: String },
 }
 
 /// Screen region copied from `(src_x, src_y)` to `(dst_x, dst_y)` before dirty tiles paint.
@@ -739,10 +742,25 @@ pub enum IpcMsg {
     VideoCongestion { viewer: u64, level: u8 },
     VideoDecoderSupport { viewer: u64, capabilities: Option<crate::video_pipeline::VideoCapabilities> },
     MonitorWorkspace { viewer: u64, enabled: bool },
+    DesktopAction { viewer: u64, action: SpecialAction },
+    DesktopActionResult { viewer: u64, action: SpecialAction, accepted: bool, message: String },
+    ReleaseDesktopSettings(u64),
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn display_actions_round_trip_on_control_channel() {
+        for action in [
+            SpecialAction::SetDisplayMode { monitor_id: 4, width: 1600, height: 900, refresh_hz: 60 },
+            SpecialAction::RestoreDisplayMode,
+        ] {
+            let message = ControlMsg::SpecialAction(action);
+            let frame = pack_message(ChannelId::AuthControl, FLAG_NONE, &message, None).unwrap();
+            assert_eq!(unpack_message::<ControlMsg>(&frame).unwrap(), message);
+        }
+    }
+
     #[test]
     fn android_actions_round_trip_on_input_channel() {
         use crate::{ChannelId, FLAG_NONE, pack_message, unpack_message};

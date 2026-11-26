@@ -133,6 +133,7 @@ struct SharedAgentState {
     congestion: Mutex<HashMap<u64, (u8, Instant)>>,
     decoder_support: Mutex<HashMap<u64, VideoCapabilities>>,
     all_displays: AtomicBool,
+    capture_reinit: AtomicBool,
     force_keyframe: AtomicBool,
     desktop_switched: AtomicBool,
     capture_cursor: AtomicBool,
@@ -163,7 +164,8 @@ fn run_agent_workers(
         bitrate_kbps: Mutex::new(4000),
         congestion: Mutex::new(HashMap::new()),
     decoder_support: Mutex::new(HashMap::new()),
-        all_displays: AtomicBool::new(false),
+    all_displays: AtomicBool::new(false),
+        capture_reinit: AtomicBool::new(false),
         force_keyframe: AtomicBool::new(true),
         desktop_switched: AtomicBool::new(true),
         capture_cursor: AtomicBool::new(true),
@@ -209,6 +211,11 @@ fn run_agent_workers(
 
     let mut audio_viewers = std::collections::HashSet::new();
     let mut workspace_viewers = HashSet::new();
+    let display_backend = crate::display_modes::Native;
+    let mut display = crate::display_modes::DisplayController::new(crate::display_modes::recovery_path());
+    if let Err(error) = display.recover(&display_backend) {
+        warn!("Could not restore display mode: {error}");
+    }
     let mut system_audio: Option<deskbolt_proto::system_audio::SystemAudioCapture> = None;
     while let Some(cmd) = cmd_rx.blocking_recv() {
         match cmd {
@@ -232,6 +239,33 @@ fn run_agent_workers(
                 *shared.target_fps.lock().unwrap() = target_fps.clamp(15, 120);
                 *shared.bitrate_kbps.lock().unwrap() = h264_bitrate_kbps.max(250);
                 shared.force_keyframe.store(true, Ordering::SeqCst);
+            }
+            IpcMsg::DesktopAction { viewer, action } => {
+                use deskbolt_proto::SpecialAction;
+                let result = match action {
+                    SpecialAction::SetDisplayMode { monitor_id, width, height, refresh_hz } => {
+                        let monitor = shared.monitors.lock().unwrap().iter().find(|m| m.id == monitor_id).cloned();
+                        monitor.ok_or_else(|| "The display is no longer connected.".into())
+                            .and_then(|m| display.set(&display_backend, viewer, &m, (width, height, refresh_hz)))
+                            .map(|mode| format!("Display set to {} × {}.", mode.width, mode.height))
+                    }
+                    SpecialAction::RestoreDisplayMode => display.release(&display_backend, viewer)
+                        .map(|()| "Host display mode restored.".into()),
+                    _ => Err("The desktop action is unavailable.".into()),
+                };
+                let accepted = result.is_ok();
+                if accepted {
+                    shared.capture_reinit.store(true, Ordering::Release);
+                }
+                let message = result.unwrap_or_else(|error| error);
+                let _ = ev_tx.blocking_send(IpcMsg::DesktopActionResult { viewer, action, accepted, message });
+            }
+            IpcMsg::ReleaseDesktopSettings(viewer) => {
+                match display.disconnected(&display_backend, viewer) {
+                    Ok(true) => shared.capture_reinit.store(true, Ordering::Release),
+                    Ok(false) => {}
+                    Err(error) => warn!("Could not restore display mode: {error}"),
+                }
             }
             IpcMsg::MonitorWorkspace { viewer, enabled } => {
                 let changed = if enabled { workspace_viewers.insert(viewer) } else { workspace_viewers.remove(&viewer) };
@@ -312,6 +346,9 @@ fn run_agent_workers(
         }
     }
 
+    if let Err(error) = display.shutdown(&display_backend) {
+        warn!("Could not restore display mode: {error}");
+    }
     stop.store(true, Ordering::SeqCst);
     slot.cv.notify_all();
     drop(input_tx);
@@ -386,6 +423,11 @@ fn capture_loop(
     let mut secondary: HashMap<u8, SecondaryCapture> = HashMap::new();
 
     while !stop.load(Ordering::SeqCst) {
+        if shared.capture_reinit.swap(false, Ordering::Acquire) {
+            capturer = None;
+            secondary.clear();
+            slot.data.lock().unwrap().clear();
+        }
         let wanted_mon = *shared.active_monitor.lock().unwrap();
         let level = shared.congestion_level();
         if level != last_level {
