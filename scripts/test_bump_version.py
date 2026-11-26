@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Unit tests for `scripts/bump_version.py`."""
 
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from bump_version import (
     compute_next_version,
