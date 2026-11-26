@@ -40,7 +40,7 @@ use crate::platform::{
 
 pub fn cli_main() -> i32 {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).with_target(false).try_init();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args.iter().any(|a| a == "--service") {
@@ -81,8 +81,8 @@ pub fn cli_main() -> i32 {
             print_usage();
             0
         }
-        unknown => {
-            eprintln!("Unknown option: {unknown}");
+        _ => {
+            eprintln!("Unknown option.");
             print_usage();
             2
         }
@@ -225,8 +225,7 @@ fn print_usage() {
          \tdeskbolt-server --set-password [options]   Configure password (--password-stdin | --password-env <var>, --port <port>)\n\
          \tdeskbolt-server --regen-cert               Regenerate host TLS identity certificate\n\
          \tdeskbolt-server --console                  Run interactively in foreground console\n\
-         \tdeskbolt-server --service                  Run under OS service manager\n\
-         \tdeskbolt-server --agent [--pipe <name>]    Internal Windows desktop session worker",
+         \tdeskbolt-server --service                  Run under OS service manager",
         env!("CARGO_PKG_VERSION")
     );
 }

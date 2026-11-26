@@ -80,7 +80,7 @@ fn build_viewer_app(
 #[cfg(not(target_os = "android"))]
 pub fn run_desktop() -> eframe::Result<()> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).with_target(false).try_init();
 
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     let startup = parse_viewer_cli_args(&raw_args);
@@ -112,7 +112,7 @@ pub fn run_desktop() -> eframe::Result<()> {
 #[unsafe(no_mangle)]
 fn android_main(app: android_activity::AndroidApp) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).with_target(false).try_init();
 
     if let Some(dir) = app.internal_data_path() {
         db::init_android_phonebook_dir(dir);
