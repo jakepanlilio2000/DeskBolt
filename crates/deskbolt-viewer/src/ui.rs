@@ -1401,6 +1401,24 @@ impl DeskBoltViewerApp {
                                 }
                             });
                     }
+                    if s.android_controls && is_full {
+                        use deskbolt_proto::DeviceAction;
+                        ui.menu_button("Device", |ui| {
+                            for (label, action) in [
+                                ("Home", DeviceAction::Home),
+                                ("Back", DeviceAction::Back),
+                                ("Recent Apps", DeviceAction::Recents),
+                                ("Notifications", DeviceAction::Notifications),
+                                ("Quick Settings", DeviceAction::QuickSettings),
+                                ("Lock Screen", DeviceAction::LockScreen),
+                            ] {
+                                if ui.button(label).clicked() {
+                                    s.send_cmd(SessionCommand::Input(InputMsg::DeviceAction(action)));
+                                    ui.close();
+                                }
+                            }
+                        });
+                    }
                     ui.menu_button("Clipboard", |ui| {
                         ui.checkbox(&mut s.auto_clipboard, "Auto-sync clipboard");
                         #[cfg(not(target_os = "android"))]

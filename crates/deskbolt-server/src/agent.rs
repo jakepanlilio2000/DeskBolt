@@ -205,6 +205,10 @@ fn run_agent_workers(
             clip @ (IpcMsg::Clipboard(_) | IpcMsg::SetClipboardLimit(_)) => {
                 let _ = clip_tx.send(clip);
             }
+            #[cfg(target_os = "android")]
+            IpcMsg::Clipboard(clip) => platform::android::write_clipboard(clip),
+            #[cfg(target_os = "android")]
+            IpcMsg::SetClipboardLimit(bytes) => platform::android::set_clipboard_limit(bytes as usize),
             IpcMsg::QualityPreset {
                 mode,
                 target_fps,
@@ -786,6 +790,7 @@ fn input_loop(
             InputMsg::ReleaseAllKeys => injector.release_all_keys(),
             InputMsg::Unicode(ch) if !ch.is_control() => injector.inject_unicode(ch),
             InputMsg::Unicode(_) => {}
+            InputMsg::DeviceAction(action) => injector.device_action(action),
         }
     }
     injector.release_all_keys();

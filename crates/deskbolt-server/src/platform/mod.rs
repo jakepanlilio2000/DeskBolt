@@ -2,7 +2,7 @@ use std::net::IpAddr;
 use std::path::Path;
 
 use deskbolt_proto::{
-    CursorSnapshot, DesktopState, KeyEvent, MonitorInfo, MoveRect, PointerEvent, PowerAction,
+    CursorSnapshot, DesktopState, DeviceAction, KeyEvent, MonitorInfo, MoveRect, PointerEvent, PowerAction,
     SessionMode,
 };
 use tokio::sync::watch;
@@ -82,6 +82,7 @@ pub trait InputInjector: Send {
     fn inject_pointer(&mut self, ev: PointerEvent, active_mon: &MonitorInfo);
     fn inject_key(&mut self, ev: KeyEvent);
     fn inject_unicode(&mut self, _ch: char) {}
+    fn device_action(&mut self, _action: DeviceAction) {}
     fn release_all_keys(&mut self);
 }
 

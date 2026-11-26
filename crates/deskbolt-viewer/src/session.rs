@@ -252,6 +252,7 @@ pub enum SessionUiEvent {
     RttUpdated(u64),
     StatusBanner(String),
     RemoteClipboard(ClipboardSync),
+    AndroidControls,
     Cursor(VideoMsg),
     TypingChanged(bool),
     FileRoots(Vec<DriveEntry>),
@@ -295,6 +296,7 @@ pub struct ViewerSession {
     pub capture_system_keys: bool,
     pub auto_clipboard: bool,
     pub typing_clipboard: bool,
+    pub android_controls: bool,
     pub headless_admin: bool,
     pub phase: ConnectionPhase,
     pub monitors: Vec<MonitorInfo>,
@@ -378,6 +380,7 @@ impl ViewerSession {
             capture_system_keys: false,
             auto_clipboard: true,
             typing_clipboard: false,
+            android_controls: false,
             headless_admin: false,
             phase: ConnectionPhase::Connecting,
             monitors: Vec::new(),
@@ -439,6 +442,7 @@ impl ViewerSession {
                     self.phase = p.clone();
                     if !matches!(p, ConnectionPhase::Connected) {
                         self.typing_clipboard = false;
+                        self.android_controls = false;
                         self.cursor = crate::cursor::CursorOverlay::default();
                     }
                     if matches!(p, ConnectionPhase::Connected) {
@@ -477,6 +481,7 @@ impl ViewerSession {
                     }
                 }
                 SessionUiEvent::TypingChanged(active) => self.typing_clipboard = active,
+                SessionUiEvent::AndroidControls => self.android_controls = true,
                 SessionUiEvent::Cursor(update) => self.cursor.update(update),
                 SessionUiEvent::FileRoots(roots) => {
                     let need_initial_dir = self.file_transfer.remote_path.is_empty();
@@ -1370,6 +1375,7 @@ async fn run_session_task(
                                     ControlMsg::MonitorList { monitors, active_monitor_id } => {
                                         notify(SessionUiEvent::MonitorsUpdated { monitors, active_id: active_monitor_id });
                                     }
+                                    ControlMsg::AndroidControls => notify(SessionUiEvent::AndroidControls),
                                     ControlMsg::Pong { timestamp_ms } => {
                                         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
                                         if timestamp_ms > 0 && now_ms >= timestamp_ms {

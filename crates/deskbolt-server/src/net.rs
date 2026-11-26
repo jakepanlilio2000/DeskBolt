@@ -667,6 +667,10 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
 
     // Send current known monitor list immediately if not FileTransfer-only
     if *mode != SessionMode::FileTransfer {
+        #[cfg(target_os = "android")]
+        if let Ok(frame) = pack_message(ChannelId::AuthControl, FLAG_NONE, &ControlMsg::AndroidControls, None) {
+            let _ = out_tx.send(frame).await;
+        }
         let (monitors, active) = hub.monitors_rx.borrow().clone();
         if !monitors.is_empty()
             && let Ok(frame) = pack_message(
@@ -1019,6 +1023,12 @@ async fn dispatch_client_frame(
                 return Ok(());
             }
             let inp: InputMsg = unpack_message(&frame).map_err(|e| e.to_string())?;
+            if matches!(inp, InputMsg::DeviceAction(deskbolt_proto::DeviceAction::LockScreen))
+                && !policy.permissions.power_control
+            {
+                send_control_error(out_tx, "Remote lock is disabled by the host.");
+                return Ok(());
+            }
             let _ = hub.to_agent_tx.try_send(IpcMsg::Input(inp));
         }
         ChannelId::Clipboard => {

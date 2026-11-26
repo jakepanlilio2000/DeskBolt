@@ -118,6 +118,7 @@ pub enum ControlMsg {
     Disconnect {
         reason: String,
     },
+    AndroidControls,
 }
 
 /// Screen region copied from `(src_x, src_y)` to `(dst_x, dst_y)` before dirty tiles paint.
@@ -220,6 +221,17 @@ pub enum InputMsg {
     Key(KeyEvent),
     ReleaseAllKeys,
     Unicode(char),
+    DeviceAction(DeviceAction),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeviceAction {
+    Home,
+    Back,
+    Recents,
+    Notifications,
+    QuickSettings,
+    LockScreen,
 }
 
 pub const DEFAULT_CLIPBOARD_MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -698,6 +710,24 @@ pub enum IpcMsg {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn android_actions_round_trip_on_input_channel() {
+        use crate::{ChannelId, FLAG_NONE, pack_message, unpack_message};
+        use super::{DeviceAction, InputMsg};
+
+        for action in [
+            DeviceAction::Home,
+            DeviceAction::Back,
+            DeviceAction::Recents,
+            DeviceAction::Notifications,
+            DeviceAction::QuickSettings,
+            DeviceAction::LockScreen,
+        ] {
+            let input = InputMsg::DeviceAction(action);
+            let frame = pack_message(ChannelId::Input, FLAG_NONE, &input, None).unwrap();
+            assert_eq!(unpack_message::<InputMsg>(&frame).unwrap(), input);
+        }
+    }
     use super::*;
     use crate::frame::{ChannelId, FLAG_NONE, decode_bincode, encode_bincode, pack_message, unpack_message};
 

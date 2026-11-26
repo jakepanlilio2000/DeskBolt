@@ -1,10 +1,16 @@
 use std::path::{Path, PathBuf};
-use std::sync::{Condvar, Mutex, OnceLock, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    Arc, Condvar, Mutex, OnceLock,
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+};
 use std::thread;
 
-use deskbolt_proto::{KeyEvent, MonitorInfo, MouseBtn, PointerEvent};
+use deskbolt_proto::{
+    ClipboardMsg, ClipboardSync, DEFAULT_CLIPBOARD_MAX_BYTES, DeviceAction, IpcMsg, KeyEvent,
+    MonitorInfo, MouseBtn, PointerEvent,
+};
 use jni::objects::{Global, JByteArray, JClass, JObject, JString, JValue};
-use jni::sys::{jfloat, jint};
+use jni::sys::jint;
 use jni::{EnvUnowned, JavaVM, jni_sig, jni_str};
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{info, warn};
@@ -28,8 +34,11 @@ static ANDROID_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 static FRAME_INGRESS: OnceLock<FrameIngress> = OnceLock::new();
 static ACCESSIBILITY_TARGET: OnceLock<Mutex<Option<(JavaVM, Global<JObject<'static>>)>>> =
     OnceLock::new();
-static HOST_STOP: OnceLock<watch::Sender<bool>> = OnceLock::new();
+static HOST_STOP: Mutex<Option<watch::Sender<bool>>> = Mutex::new(None);
 static HOST_RUNNING: AtomicBool = AtomicBool::new(false);
+static CLIPBOARD_BUS: Mutex<Option<broadcast::Sender<Arc<IpcMsg>>>> = Mutex::new(None);
+static CLIPBOARD_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_CLIPBOARD_MAX_BYTES);
+static CLIPBOARD_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn ingress() -> &'static FrameIngress {
     FRAME_INGRESS.get_or_init(|| FrameIngress {
@@ -116,55 +125,185 @@ impl ScreenCapturer for AndroidCapturer {
     }
 }
 
+fn with_accessibility(
+    call: impl FnOnce(&mut jni::Env<'_>, &JObject<'static>) -> jni::errors::Result<()>,
+) {
+    if let Some((vm, service)) = a11y_target().lock().unwrap().as_ref() {
+        let _ = vm.attach_current_thread(|env| call(env, service.as_obj()));
+    }
+}
+
+pub(crate) fn set_clipboard_limit(bytes: usize) {
+    CLIPBOARD_LIMIT.store(bytes, Ordering::Relaxed);
+}
+
+pub(crate) fn write_clipboard(message: ClipboardSync) {
+    // Binder shares one transaction buffer between clipboard data and other app traffic.
+    // UTF-16 text can occupy twice as many bytes as the wire representation.
+    const CLIPBOARD_WRITE_LIMIT: usize = 192 * 1024;
+    if !message.within_limit(
+        CLIPBOARD_LIMIT
+            .load(Ordering::Relaxed)
+            .min(CLIPBOARD_WRITE_LIMIT),
+    ) {
+        return;
+    }
+    let (kind, value) = match &message {
+        ClipboardSync::SetText { utf8_text, .. } => (0, utf8_text.as_str()),
+        ClipboardSync::SetData {
+            data: ClipboardMsg::Utf8Text(text),
+            ..
+        } => (0, text.as_str()),
+        ClipboardSync::SetData {
+            data: ClipboardMsg::Html(html),
+            ..
+        } => (1, html.as_str()),
+        ClipboardSync::Clear { .. } => (2, ""),
+        _ => return,
+    };
+    with_accessibility(|env, service| {
+        let text = env.new_string(value)?;
+        env.call_method(
+            service,
+            jni_str!("onRemoteClipboard"),
+            jni_sig!("(ILjava/lang/String;)V"),
+            &[JValue::Int(kind), JValue::Object(&text)],
+        )?;
+        Ok(())
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_stacksync_deskbolt_DeskBoltHostBridge_nativeOnClipboardText<
+    'caller,
+>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    text: JString<'caller>,
+    html: JString<'caller>,
+) {
+    env.with_env(|_| -> Result<(), jni::errors::Error> {
+        let data = if html.as_raw().is_null() {
+            ClipboardMsg::Utf8Text(text.to_string())
+        } else {
+            ClipboardMsg::Html(html.to_string())
+        };
+        let seq = CLIPBOARD_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
+        let message = ClipboardSync::set(seq, data);
+        if message.within_limit(CLIPBOARD_LIMIT.load(Ordering::Relaxed))
+            && let Some(bus) = CLIPBOARD_BUS.lock().unwrap().as_ref()
+        {
+            let _ = bus.send(Arc::new(IpcMsg::Clipboard(message)));
+        }
+        Ok(())
+    })
+    .resolve::<jni::errors::ThrowRuntimeExAndDefault>();
+}
+
 struct AndroidA11yInjector;
 
 impl InputInjector for AndroidA11yInjector {
     fn inject_pointer(&mut self, ev: PointerEvent, _mon: &MonitorInfo) {
-        let guard = a11y_target().lock().unwrap();
-        let Some((vm, obj)) = guard.as_ref() else {
-            return;
-        };
-        if let PointerEvent::Button {
-            button,
-            down,
-            norm_x,
-            norm_y,
-        } = ev
-        {
-            if button == MouseBtn::Left && down {
-                let _ = vm.attach_current_thread(|env| -> Result<(), jni::errors::Error> {
-                    let _ = env.call_method(
-                        obj.as_obj(),
-                        jni_str!("onRemoteTap"),
-                        jni_sig!("(FF)V"),
-                        &[JValue::Float(norm_x as jfloat), JValue::Float(norm_y as jfloat)],
-                    );
-                    Ok(())
-                });
+        with_accessibility(|env, service| {
+            match ev {
+                PointerEvent::MoveAbs { norm_x, norm_y } => {
+                    env.call_method(
+                        service,
+                        jni_str!("onRemotePointer"),
+                        jni_sig!("(IFF)V"),
+                        &[JValue::Int(0), JValue::Float(norm_x), JValue::Float(norm_y)],
+                    )?;
+                }
+                PointerEvent::Button {
+                    button,
+                    down,
+                    norm_x,
+                    norm_y,
+                } => {
+                    let action = match (button, down) {
+                        (MouseBtn::Left, true) => 1,
+                        (MouseBtn::Left, false) => 2,
+                        (MouseBtn::Right, true) => 3,
+                        _ => return Ok(()),
+                    };
+                    env.call_method(
+                        service,
+                        jni_str!("onRemotePointer"),
+                        jni_sig!("(IFF)V"),
+                        &[
+                            JValue::Int(action),
+                            JValue::Float(norm_x),
+                            JValue::Float(norm_y),
+                        ],
+                    )?;
+                }
+                PointerEvent::Wheel { delta_x, delta_y } => {
+                    env.call_method(
+                        service,
+                        jni_str!("onRemoteScroll"),
+                        jni_sig!("(II)V"),
+                        &[
+                            JValue::Int(i32::from(delta_x)),
+                            JValue::Int(i32::from(delta_y)),
+                        ],
+                    )?;
+                }
             }
-        }
-    }
-
-    fn inject_key(&mut self, ev: KeyEvent) {
-        let guard = a11y_target().lock().unwrap();
-        let Some((vm, obj)) = guard.as_ref() else {
-            return;
-        };
-        let _ = vm.attach_current_thread(|env| -> Result<(), jni::errors::Error> {
-            let _ = env.call_method(
-                obj.as_obj(),
-                jni_str!("onRemoteKey"),
-                jni_sig!("(IZ)V"),
-                &[
-                    JValue::Int(ev.vk_code as jint),
-                    JValue::Bool(ev.down),
-                ],
-            );
             Ok(())
         });
     }
 
-    fn release_all_keys(&mut self) {}
+    fn inject_key(&mut self, ev: KeyEvent) {
+        with_accessibility(|env, service| {
+            env.call_method(
+                service,
+                jni_str!("onRemoteKey"),
+                jni_sig!("(IZ)V"),
+                &[JValue::Int(i32::from(ev.vk_code)), JValue::Bool(ev.down)],
+            )?;
+            Ok(())
+        });
+    }
+
+    fn inject_unicode(&mut self, ch: char) {
+        with_accessibility(|env, service| {
+            let text = env.new_string(ch.encode_utf8(&mut [0; 4]))?;
+            env.call_method(
+                service,
+                jni_str!("onRemoteText"),
+                jni_sig!("(Ljava/lang/String;)V"),
+                &[JValue::Object(&text)],
+            )?;
+            Ok(())
+        });
+    }
+
+    fn device_action(&mut self, action: DeviceAction) {
+        let id = match action {
+            DeviceAction::Home => 0,
+            DeviceAction::Back => 1,
+            DeviceAction::Recents => 2,
+            DeviceAction::Notifications => 3,
+            DeviceAction::QuickSettings => 4,
+            DeviceAction::LockScreen => 5,
+        };
+        with_accessibility(|env, service| {
+            env.call_method(
+                service,
+                jni_str!("onRemoteAction"),
+                jni_sig!("(I)V"),
+                &[JValue::Int(id)],
+            )?;
+            Ok(())
+        });
+    }
+
+    fn release_all_keys(&mut self) {
+        with_accessibility(|env, service| {
+            env.call_method(service, jni_str!("onRemoteCancel"), jni_sig!("()V"), &[])?;
+            Ok(())
+        });
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -192,15 +331,20 @@ pub extern "system" fn Java_com_stacksync_deskbolt_DeskBoltHostBridge_nativeOnFr
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_stacksync_deskbolt_DeskBoltHostBridge_nativeRegisterAccessibility<'caller>(
+pub extern "system" fn Java_com_stacksync_deskbolt_DeskBoltHostBridge_nativeRegisterAccessibility<
+    'caller,
+>(
     mut unowned_env: EnvUnowned<'caller>,
     _class: JClass<'caller>,
     service_obj: JObject<'caller>,
 ) {
     let outcome = unowned_env.with_env(|env| -> Result<(), jni::errors::Error> {
-        let vm = env.get_java_vm()?;
-        let global = env.new_global_ref(service_obj)?;
-        *a11y_target().lock().unwrap() = Some((vm, global));
+        let target = if service_obj.as_raw().is_null() {
+            None
+        } else {
+            Some((env.get_java_vm()?, env.new_global_ref(service_obj)?))
+        };
+        *a11y_target().lock().unwrap() = target;
         Ok(())
     });
     outcome.resolve::<jni::errors::ThrowRuntimeExAndDefault>();
@@ -218,37 +362,43 @@ pub extern "system" fn Java_com_stacksync_deskbolt_DeskBoltHostBridge_nativeStar
         let password_str: String = password_j.to_string();
         let _ = ANDROID_DATA_DIR.set(PathBuf::from(&data_dir_str));
         if HOST_RUNNING.swap(true, Ordering::SeqCst) {
-            return Ok(0);
+            return Ok(1);
         }
 
         let dir = android_data_dir();
-        if !password_str.is_empty()
-            && let Ok(mut cfg) = ServerConfig::load_or_default(&dir)
-            && cfg.set_password_bytes(password_str.as_bytes()).is_ok()
-        {
-            let _ = cfg.save(&dir);
-        }
+        let prepare = (|| {
+            let mut cfg = ServerConfig::load_or_default(&dir)?;
+            cfg.set_password_bytes(password_str.as_bytes())?;
+            cfg.save(&dir)?;
+            let identity = load_or_generate_identity(&cfg, false)?;
+            Ok::<_, String>((cfg, identity))
+        })();
+        let (cfg, identity) = match prepare {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                warn!("Could not start screen sharing: {error}");
+                HOST_RUNNING.store(false, Ordering::SeqCst);
+                return Ok(1);
+            }
+        };
+        *ingress().latest.lock().unwrap() = None;
 
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        *HOST_STOP.lock().unwrap() = Some(shutdown_tx.clone());
         thread::spawn(move || {
-            let Ok(rt) = tokio::runtime::Builder::new_multi_thread().enable_all().build() else {
+            let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            else {
+                *HOST_STOP.lock().unwrap() = None;
                 HOST_RUNNING.store(false, Ordering::SeqCst);
                 return;
             };
             let _ = rt.block_on(async move {
-                let cfg = match ServerConfig::load_or_default(&dir) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        warn!("Android host config error: {e}");
-                        return;
-                    }
-                };
-                let Ok(identity) = load_or_generate_identity(&cfg, false) else {
-                    return;
-                };
-                let (shutdown_tx, shutdown_rx) = watch::channel(false);
-                let _ = HOST_STOP.set(shutdown_tx);
                 let (to_agent_tx, to_agent_rx) = mpsc::channel(256);
                 let (from_agent_tx, _) = broadcast::channel(32);
+                set_clipboard_limit(cfg.clipboard_max_bytes);
+                *CLIPBOARD_BUS.lock().unwrap() = Some(from_agent_tx.clone());
                 let (monitors_tx, monitors_rx) = watch::channel((Vec::new(), 0));
                 let (activity_tx, activity_rx) = mpsc::unbounded_channel();
                 let hub = AgentHub {
@@ -264,7 +414,7 @@ pub extern "system" fn Java_com_stacksync_deskbolt_DeskBoltHostBridge_nativeStar
                     activity_rx,
                     shutdown_rx.clone(),
                 ));
-                let _ = run_tcp_server(
+                if let Err(error) = run_tcp_server(
                     cfg,
                     identity.cert_der,
                     identity.key_der,
@@ -272,13 +422,19 @@ pub extern "system" fn Java_com_stacksync_deskbolt_DeskBoltHostBridge_nativeStar
                     false,
                     shutdown_rx,
                 )
-                .await;
+                .await
+                {
+                    warn!("Screen sharing stopped: {error}");
+                }
+                let _ = shutdown_tx.send(true);
+                *CLIPBOARD_BUS.lock().unwrap() = None;
                 let _ = agent_task.await;
             });
+            *HOST_STOP.lock().unwrap() = None;
             HOST_RUNNING.store(false, Ordering::SeqCst);
         });
         info!("Android MediaProjection host started");
-        Ok(1)
+        Ok(0)
     });
     outcome.resolve::<jni::errors::ThrowRuntimeExAndDefault>()
 }
@@ -288,10 +444,9 @@ pub extern "system" fn Java_com_stacksync_deskbolt_DeskBoltHostBridge_nativeStop
     _env: EnvUnowned<'caller>,
     _class: JClass<'caller>,
 ) {
-    if let Some(tx) = HOST_STOP.get() {
+    if let Some(tx) = HOST_STOP.lock().unwrap().as_ref() {
         let _ = tx.send(true);
     }
-    HOST_RUNNING.store(false, Ordering::SeqCst);
 }
 
 pub fn create_capturer(_monitor_idx: u8) -> Result<Box<dyn ScreenCapturer>, String> {
