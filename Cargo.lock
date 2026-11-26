@@ -1471,7 +1471,7 @@ dependencies = [
 
 [[package]]
 name = "deskbolt-proto"
-version = "0.1.0-beta4"
+version = "0.1.0-beta5"
 dependencies = [
  "argon2 0.5.3",
  "bincode",
@@ -1489,7 +1489,7 @@ dependencies = [
 
 [[package]]
 name = "deskbolt-server"
-version = "0.1.0-beta4"
+version = "0.1.0-beta5"
 dependencies = [
  "arboard",
  "cpal",
@@ -1519,7 +1519,7 @@ dependencies = [
 
 [[package]]
 name = "deskbolt-viewer"
-version = "0.1.0-beta4"
+version = "0.1.0-beta5"
 dependencies = [
  "android-activity",
  "arboard",
