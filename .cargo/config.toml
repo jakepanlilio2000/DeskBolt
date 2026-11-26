@@ -1,3 +1,7 @@
+[env]
+LIBOPUS_NO_PKG = "1"
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"
+
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
 

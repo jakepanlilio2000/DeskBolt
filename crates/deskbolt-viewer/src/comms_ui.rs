@@ -345,6 +345,7 @@ impl DeskBoltViewerApp {
                         ui.separator();
                         ui.horizontal(|ui| {
                             if !s.voice_active {
+                                ctrl.bitrate_kbps.store(self.settings.voice_bitrate_kbps, Ordering::Relaxed);
                                 if ui.add_enabled(connected, egui::Button::new("Start Voice Call")).clicked() {
                                     ctrl.noise_gate_milli.store((self.settings.noise_gate * 1000.0).round() as u32, Ordering::Relaxed);
                                     s.send_cmd(SessionCommand::StartVoice {
@@ -829,6 +830,9 @@ impl DeskBoltViewerApp {
                                             ui.selectable_value(&mut opt.draft.speaker_device, dev.clone(), dev);
                                         }
                                     });
+                                ui.end_row();
+                                ui.label("Voice bitrate");
+                                ui.add(egui::Slider::new(&mut opt.draft.voice_bitrate_kbps, 24..=48).suffix(" kbps"));
                                 ui.end_row();
                                 ui.label("Noise Gate Threshold:");
                                 ui.add(egui::Slider::new(&mut opt.draft.noise_gate, 0.0..=0.2));

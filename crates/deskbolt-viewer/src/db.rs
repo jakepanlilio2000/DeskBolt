@@ -367,6 +367,7 @@ pub struct ViewerSettings {
     pub multimonitor_mode: MultimonitorViewMode,
     pub mic_device: String,
     pub speaker_device: String,
+    pub voice_bitrate_kbps: u32,
     pub noise_gate: f32,
     pub ptt_hotkey: String,
     pub chat_sound: bool,
@@ -403,6 +404,7 @@ impl Default for ViewerSettings {
             multimonitor_mode: MultimonitorViewMode::Switch,
             mic_device: "Default".into(),
             speaker_device: "Default".into(),
+            voice_bitrate_kbps: 32,
             noise_gate: 0.015,
             ptt_hotkey: "V".into(),
             chat_sound: true,
@@ -944,6 +946,7 @@ impl PhonebookDb {
                 "multimonitor_mode" => s.multimonitor_mode = MultimonitorViewMode::from_key(&v),
                 "mic_device" => s.mic_device = v,
                 "speaker_device" => s.speaker_device = v,
+                "voice_bitrate_kbps" => s.voice_bitrate_kbps = v.parse::<u32>().unwrap_or(32).clamp(24, 48),
                 "noise_gate" => s.noise_gate = v.parse::<f32>().unwrap_or(0.015).clamp(0.0, 0.3),
                 "ptt_hotkey" => s.ptt_hotkey = v,
                 "chat_sound" => s.chat_sound = v != "0",
@@ -983,6 +986,7 @@ impl PhonebookDb {
             ("multimonitor_mode", s.multimonitor_mode.as_str().into()),
             ("mic_device", s.mic_device.clone()),
             ("speaker_device", s.speaker_device.clone()),
+            ("voice_bitrate_kbps", s.voice_bitrate_kbps.to_string()),
             ("noise_gate", format!("{:.4}", s.noise_gate)),
             ("ptt_hotkey", s.ptt_hotkey.clone()),
             ("chat_sound", i32::from(s.chat_sound).to_string()),
@@ -1470,6 +1474,7 @@ mod tests {
         settings.texture_filter = TextureFilterMode::Nearest;
         settings.theme = ThemeChoice::Light;
         settings.auto_save_chat = true;
+        settings.voice_bitrate_kbps = 42;
         settings.noise_gate = 0.04;
         settings.hotkey_fullscreen = "F10".into();
         settings.clipboard_max_bytes = 42_000;
@@ -1481,6 +1486,7 @@ mod tests {
         assert_eq!(reloaded.texture_filter, TextureFilterMode::Nearest);
         assert_eq!(reloaded.theme, ThemeChoice::Light);
         assert!(reloaded.auto_save_chat);
+        assert_eq!(reloaded.voice_bitrate_kbps, 42);
         assert!((reloaded.noise_gate - 0.04).abs() < 0.001);
         assert_eq!(reloaded.hotkey_fullscreen, "F10");
         assert_eq!(reloaded.clipboard_max_bytes, 42_000);

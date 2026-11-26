@@ -744,8 +744,8 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                     let _ = out_tx.send(f).await;
                 }
             }
-            Some(pcm) = voice_rx.recv() => {
-                if let Ok(f) = pack_message(ChannelId::Comms, FLAG_NONE, &CommsMsg::VoiceFrame(pcm), None) {
+            Some(packet) = voice_rx.recv() => {
+                if let Ok(f) = pack_message(ChannelId::Comms, FLAG_NONE, &CommsMsg::VoiceFrame(packet), None) {
                     let _ = out_tx.try_send(f);
                 }
             }
@@ -1214,7 +1214,11 @@ async fn dispatch_client_frame(
                         let _ = out_tx.send(f).await;
                     }
                 }
-                CommsMsg::VoiceOffer { .. } => {
+                CommsMsg::VoiceOffer { sample_rate, channels } => {
+                    if sample_rate != deskbolt_proto::VOICE_SAMPLE_RATE || channels != 1 {
+                        send_control_error(out_tx, "The host requires 48 kHz mono voice.");
+                        return Ok(());
+                    }
                     if !policy.permissions.voice_chat {
                         send_control_error(out_tx, "Voice chat is disabled by host administrator.");
                         return Ok(());
@@ -1226,7 +1230,9 @@ async fn dispatch_client_frame(
                         }
                         return Ok(());
                     }
-                    match VoiceEngine::start(None, None, voice_tx.clone(), Arc::new(VoiceControls::default())) {
+                    let controls = VoiceControls::default();
+                    controls.bitrate_kbps.store(policy.voice_bitrate_kbps, Ordering::Relaxed);
+                    match VoiceEngine::start(None, None, voice_tx.clone(), Arc::new(controls)) {
                         Ok(eng) => {
                             *voice_engine = Some(eng);
                             if let Ok(f) = pack_message(ChannelId::Comms, FLAG_NONE, &CommsMsg::VoiceAccept, None) {

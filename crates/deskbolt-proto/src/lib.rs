@@ -1,3 +1,6 @@
+mod audio_codec;
+mod audio_io;
+mod echo;
 pub mod auth;
 pub mod codec;
 pub mod cursor;

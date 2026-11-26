@@ -694,7 +694,7 @@ impl ViewerSession {
                     }
                     CommsMsg::VoiceAccept => {
                         self.voice_active = true;
-                        self.voice_status = "Voice connected (16 kHz PCM)".into();
+                        self.voice_status = "Voice connected".into();
                     }
                     CommsMsg::VoiceEnd => {
                         self.voice_active = false;
@@ -1119,8 +1119,8 @@ async fn run_session_task(
                     let _ = write_frame_async(&mut writer, f.channel, f.flags, &f.payload).await;
                 }
             }
-            Some(pcm) = voice_rx.recv() => {
-                if let Ok(f) = pack_message(ChannelId::Comms, FLAG_NONE, &CommsMsg::VoiceFrame(pcm), None) {
+            Some(packet) = voice_rx.recv() => {
+                if let Ok(f) = pack_message(ChannelId::Comms, FLAG_NONE, &CommsMsg::VoiceFrame(packet), None) {
                     let _ = write_frame_async(&mut writer, f.channel, f.flags, &f.payload).await;
                 }
             }
