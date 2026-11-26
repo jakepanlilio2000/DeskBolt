@@ -1,6 +1,8 @@
 use crate::VideoMsg;
 
 pub const MAX_CURSOR_SIDE: u16 = 256;
+/// Transparent pixels with this value invert the desktop pixel under a monochrome cursor.
+pub const CURSOR_INVERT_PIXEL: [u8; 4] = [1, 0, 0, 0];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CursorShape {

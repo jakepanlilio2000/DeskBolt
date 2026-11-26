@@ -1,6 +1,6 @@
 use std::mem::size_of;
 
-use deskbolt_proto::{CursorShape, CursorSnapshot, MAX_CURSOR_SIDE, MonitorInfo};
+use deskbolt_proto::{CURSOR_INVERT_PIXEL, CursorShape, CursorSnapshot, MAX_CURSOR_SIDE, MonitorInfo};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDC, GetDIBits,
     GetObjectW, HBITMAP, HDC, ReleaseDC,
@@ -81,11 +81,11 @@ fn read_shape_bitmaps(dc: HDC, icon: &ICONINFO) -> Option<CursorShape> {
         monochrome_pixels(&bits)
     } else {
         let color = bitmap_bgra(dc, icon.hbmColor, width, height)?;
-        let has_alpha = color.chunks_exact(4).any(|pixel| pixel[3] != 0);
+        let has_alpha = color.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0);
         let mask = (!has_alpha).then(|| bitmap_bgra(dc, icon.hbmMask, width, height)).flatten();
-        color.chunks_exact(4).enumerate().flat_map(|(i, pixel)| {
+        color.as_chunks::<4>().0.iter().enumerate().flat_map(|(i, pixel)| {
             let alpha = if has_alpha { pixel[3] } else if mask.as_ref().is_some_and(|m| m[i * 4] != 0) { 0 } else { 255 };
-            [pixel[2], pixel[1], pixel[0], alpha]
+            if alpha == 0 { [0; 4] } else { [pixel[2], pixel[1], pixel[0], alpha] }
         }).collect()
     };
     Some(CursorShape { width, height, hotspot_x, hotspot_y, rgba })
@@ -114,11 +114,13 @@ fn bitmap_bgra(dc: HDC, source: HBITMAP, width: u16, height: u16) -> Option<Vec<
 
 fn monochrome_pixels(bits: &[u8]) -> Vec<u8> {
     let (and, xor) = bits.split_at(bits.len() / 2);
-    and.chunks_exact(4).zip(xor.chunks_exact(4)).flat_map(|(and, xor)| {
-        // shortcut: Draw the invert mask in white, add exact background inversion with a compositing mask.
+    and.as_chunks::<4>().0.iter().zip(xor.as_chunks::<4>().0).flat_map(|(and, xor)| {
         let shade = if xor[0] == 0 { 0 } else { 255 };
-        let alpha = if and[0] != 0 && xor[0] == 0 { 0 } else { 255 };
-        [shade, shade, shade, alpha]
+        match (and[0] != 0, xor[0] != 0) {
+            (true, true) => CURSOR_INVERT_PIXEL,
+            (true, false) => [0; 4],
+            (false, _) => [shade, shade, shade, 255],
+        }
     }).collect()
 }
 
@@ -130,6 +132,6 @@ mod tests {
     fn monochrome_mask_maps_opaque_and_transparent_pixels() {
         let bits = [0, 0, 0, 0, 255, 255, 255, 0, 0, 0, 0, 0, 255, 255, 255, 0,
             0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 0, 255, 255, 255, 0];
-        assert_eq!(monochrome_pixels(&bits), [0, 0, 0, 255, 0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255]);
+        assert_eq!(monochrome_pixels(&bits), [0, 0, 0, 255, 0, 0, 0, 0, 255, 255, 255, 255, 1, 0, 0, 0]);
     }
 }

@@ -19,7 +19,7 @@ pub use codec::{
     bgra_to_rgba_into, encode_dirty_tile,
 };
 pub use error::ProtoError;
-pub use cursor::{CursorDelta, CursorShape, CursorSnapshot, MAX_CURSOR_SIDE};
+pub use cursor::{CURSOR_INVERT_PIXEL, CursorDelta, CursorShape, CursorSnapshot, MAX_CURSOR_SIDE};
 pub use frame::{
     AsyncFrameReader, ChannelId, FLAG_COMPRESSED, FLAG_END_OF_STREAM, FLAG_KEYFRAME, FLAG_NONE, FLAG_URGENT, Frame,
     HEADER_LEN, MAX_DECOMPRESSED_PAYLOAD, MAX_FRAME_PAYLOAD, bincode_options, decode_bincode,

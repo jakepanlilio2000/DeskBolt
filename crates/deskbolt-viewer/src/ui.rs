@@ -1602,7 +1602,7 @@ impl DeskBoltViewerApp {
                                     } else {
                                         None
                                     };
-                                    if s.cursor.paint(ui, display_rect, (s.active_monitor_id, frame.width, frame.height), local)
+                                    if s.cursor.paint(ui, display_rect, s.active_monitor_id, &frame, local)
                                         && local.is_some()
                                     {
                                         ui.ctx().set_cursor_icon(egui::CursorIcon::None);
