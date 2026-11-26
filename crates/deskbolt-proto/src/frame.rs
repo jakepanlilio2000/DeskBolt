@@ -140,6 +140,26 @@ pub fn pack_message<T: Serialize>(
     Frame::new(channel, flags, payload)
 }
 
+/// Compress only chunks of file types that typically benefit from Zstd.
+pub fn pack_file_message(
+    message: &crate::FileTransferMsg,
+    source: Option<&std::path::Path>,
+) -> Result<Frame, ProtoError> {
+    let compress = matches!(message, crate::FileTransferMsg::FileChunk { .. })
+        && source.and_then(std::path::Path::extension)
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(),
+                "txt" | "log" | "json" | "toml" | "xml" | "csv" | "sql" | "exe" | "dll" | "so" | "db"));
+    let raw = pack_message(ChannelId::FileTransfer, FLAG_NONE, message, None)?;
+    if compress {
+        let compressed = pack_message(ChannelId::FileTransfer, FLAG_NONE, message, Some(0))?;
+        if compressed.payload.len() < raw.payload.len() {
+            return Ok(compressed);
+        }
+    }
+    Ok(raw)
+}
+
 /// Unpacks a `Frame`, performing bounded Zstd decompression if `FLAG_COMPRESSED` is set.
 pub fn unpack_message<T: DeserializeOwned>(frame: &Frame) -> Result<T, ProtoError> {
     if frame.flags & FLAG_COMPRESSED != 0 {

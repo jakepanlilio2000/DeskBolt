@@ -69,6 +69,7 @@ struct ActiveUpload {
 }
 
 struct ActiveDownload {
+    path: PathBuf,
     transfer_id: u64,
     file: File,
     hasher: Context,
@@ -97,6 +98,15 @@ impl FileSessionHandler {
             uploads: HashMap::new(),
             downloads: HashMap::new(),
         }
+    }
+
+    pub fn pack_reply(&self, message: &FileTransferMsg) -> Result<deskbolt_proto::Frame, deskbolt_proto::ProtoError> {
+        let source = match message {
+            FileTransferMsg::FileChunk { transfer_id, .. } =>
+                self.downloads.get(transfer_id).map(|download| download.path.as_path()),
+            _ => None,
+        };
+        deskbolt_proto::frame::pack_file_message(message, source)
     }
 
     /// Processes a single incoming `FileTransferMsg`, returning zero or more immediate response messages.
@@ -343,6 +353,7 @@ impl FileSessionHandler {
                         self.downloads.insert(
                             transfer_id,
                             ActiveDownload {
+                                path: validated,
                                 transfer_id,
                                 file,
                                 hasher: Context::new(&SHA256),

@@ -1102,7 +1102,7 @@ async fn run_session_task(
             _ = upload_tick.tick() => {
                 let msgs = ft_client.pump_uploads(&notifier).await;
                 for m in msgs {
-                    if let Ok(f) = pack_message(ChannelId::FileTransfer, FLAG_NONE, &m, None)
+                    if let Ok(f) = ft_client.pack_upload(&m)
                         && write_frame_async(&mut writer, f.channel, f.flags, &f.payload).await.is_err()
                     {
                         break;
@@ -1898,6 +1898,7 @@ fn run_decode_worker(
 }
 
 struct ActiveUploadJob {
+    path: PathBuf,
     file: File,
     hasher: Context,
     bytes_sent: u64,
@@ -1931,6 +1932,15 @@ impl FileClientQueue {
             downloads: HashMap::new(),
             pending_overwrites: VecDeque::new(),
         }
+    }
+
+    fn pack_upload(&self, message: &FileTransferMsg) -> Result<Frame, deskbolt_proto::ProtoError> {
+        let source = match message {
+            FileTransferMsg::FileChunk { transfer_id, .. } =>
+                self.uploads.get(transfer_id).map(|upload| upload.path.as_path()),
+            _ => None,
+        };
+        deskbolt_proto::frame::pack_file_message(message, source)
     }
 
     fn emit_progress(&self, notify: &UiNotifier) {
@@ -2207,6 +2217,7 @@ impl FileClientQueue {
                                     self.uploads.insert(
                                         transfer_id,
                                         ActiveUploadJob {
+                                            path: it.local_path.clone(),
                                             file,
                                             hasher: Context::new(&SHA256),
                                             bytes_sent: 0,

@@ -722,7 +722,7 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
             _ = download_pump.tick() => {
                 let bursts = file_handler.poll_downloads().await;
                 for ft in bursts {
-                    if let Ok(f) = pack_message(ChannelId::FileTransfer, FLAG_NONE, &ft, None)
+                    if let Ok(f) = file_handler.pack_reply(&ft)
                         && out_tx.send(f).await.is_err()
                     {
                         break;
@@ -1082,7 +1082,7 @@ async fn dispatch_client_frame(
             let ft: FileTransferMsg = unpack_message(&frame).map_err(|e| e.to_string())?;
             let replies = file_handler.handle_message(ft).await;
             for reply in replies {
-                if let Ok(f) = pack_message(ChannelId::FileTransfer, FLAG_NONE, &reply, None) {
+                if let Ok(f) = file_handler.pack_reply(&reply) {
                     let _ = out_tx.send(f).await;
                 }
             }
@@ -1700,7 +1700,7 @@ mod tests {
         let temp_dir = std::env::temp_dir().join(format!("deskbolt_net_ft_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp_dir);
         std::fs::create_dir_all(&temp_dir).unwrap();
-        let remote_path = temp_dir.join("payload.bin").to_string_lossy().into_owned();
+        let remote_path = temp_dir.join("payload.TXT").to_string_lossy().into_owned();
         let payload: Vec<u8> = (0..140_000u32).map(|i| ((i * 7) % 251) as u8).collect();
         let mut expected_sha = [0u8; 32];
         let mut h = ShaCtx::new(&SHA256);
@@ -1733,18 +1733,17 @@ mod tests {
         let mut offset = 0usize;
         for (idx, chunk) in payload.chunks(64 * 1024).enumerate() {
             let seq = (idx + 1) as u32;
-            let cf = pack_message(
-                ChannelId::FileTransfer,
-                FLAG_NONE,
+            let cf = deskbolt_proto::frame::pack_file_message(
                 &deskbolt_proto::FileTransferMsg::FileChunk {
                     transfer_id: 1,
                     offset: offset as u64,
                     chunk_seq: seq,
                     data: chunk.to_vec(),
                 },
-                None,
+                Some(std::path::Path::new(if idx == 1 { "payload.zip" } else { "payload.TXT" })),
             )
             .unwrap();
+            assert_eq!(cf.flags & deskbolt_proto::FLAG_COMPRESSED != 0, idx != 1);
             write_frame_async(&mut tls, cf.channel, cf.flags, &cf.payload)
                 .await
                 .unwrap();
@@ -1804,6 +1803,7 @@ mod tests {
             let f = read_frame_async(&mut tls).await.unwrap().unwrap();
             match unpack_message::<deskbolt_proto::FileTransferMsg>(&f).unwrap() {
                 deskbolt_proto::FileTransferMsg::FileChunk { chunk_seq, data, .. } => {
+                    assert_ne!(f.flags & deskbolt_proto::FLAG_COMPRESSED, 0);
                     downloaded.extend_from_slice(&data);
                     let ack = pack_message(
                         ChannelId::FileTransfer,
