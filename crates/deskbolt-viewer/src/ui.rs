@@ -7,8 +7,10 @@ use deskbolt_proto::{
 };
 use egui::{
     Align, Color32, ColorImage, Context, Key, Layout, Pos2, Rect, ScrollArea, Sense, TextureHandle,
-    TextureOptions, Vec2, ViewportBuilder, ViewportId, Window,
+    TextureOptions, Vec2, Window,
 };
+#[cfg(not(target_os = "android"))]
+use egui::{ViewportBuilder, ViewportId};
 
 use crate::StartupConnectArgs;
 use crate::admin_ui::{AdminUiState, NetToolTab};

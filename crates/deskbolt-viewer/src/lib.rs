@@ -11,7 +11,6 @@ pub mod terminal;
 pub mod ui;
 
 use deskbolt_proto::SessionMode;
-use eframe::egui;
 use tracing_subscriber::EnvFilter;
 
 use crate::db::{PhonebookDb, default_phonebook_path};

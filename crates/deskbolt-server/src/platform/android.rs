@@ -5,7 +5,7 @@ use std::thread;
 
 use deskbolt_proto::{ClipboardSync, IpcMsg, KeyEvent, MonitorInfo, MouseBtn, PointerEvent};
 use jni::objects::{Global, JByteArray, JClass, JObject, JString, JValue};
-use jni::sys::{jboolean, jfloat, jint};
+use jni::sys::{jfloat, jint};
 use jni::{EnvUnowned, JavaVM, jni_sig, jni_str};
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{info, warn};
@@ -158,7 +158,7 @@ impl InputInjector for AndroidA11yInjector {
                 jni_sig!("(IZ)V"),
                 &[
                     JValue::Int(ev.vk_code as jint),
-                    JValue::Bool(if ev.down { 1 } else { 0 } as jboolean),
+                    JValue::Bool(ev.down),
                 ],
             );
             Ok(())
@@ -177,12 +177,12 @@ pub extern "system" fn Java_com_stacksync_deskbolt_DeskBoltHostBridge_nativeOnFr
     height: jint,
 ) {
     let outcome = unowned_env.with_env(|env| -> Result<(), jni::errors::Error> {
-        let len = env.get_array_length(&rgba_bytes)? as usize;
+        let len = rgba_bytes.len(env)?;
         if len == 0 || width <= 0 || height <= 0 {
             return Ok(());
         }
         let mut raw_i8 = vec![0i8; len];
-        env.get_byte_array_region(&rgba_bytes, 0, &mut raw_i8)?;
+        rgba_bytes.get_region(env, 0, &mut raw_i8)?;
         let rgba: Vec<u8> = raw_i8.into_iter().map(|b| b as u8).collect();
         let ing = ingress();
         *ing.latest.lock().unwrap() = Some((width as u32, height as u32, rgba));
@@ -214,7 +214,7 @@ pub extern "system" fn Java_com_stacksync_deskbolt_DeskBoltHostBridge_nativeStar
     data_dir_j: JString<'caller>,
     password_j: JString<'caller>,
 ) -> jint {
-    let outcome = unowned_env.with_env(|env| -> Result<jint, jni::errors::Error> {
+    let outcome = unowned_env.with_env(|_env| -> Result<jint, jni::errors::Error> {
         let data_dir_str: String = data_dir_j.to_string();
         let password_str: String = password_j.to_string();
         let _ = ANDROID_DATA_DIR.set(PathBuf::from(&data_dir_str));

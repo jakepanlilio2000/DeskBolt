@@ -1,15 +1,16 @@
-use std::time::Duration;
-
 use deskbolt_proto::{
-    DiskStat, ProcessStat, ServiceOp, ServiceStat, ServiceStateKind, SysAdminMsg, SystemSnapshot,
+    DiskStat, ProcessStat, ServiceOp, ServiceStat, SysAdminMsg, SystemSnapshot,
 };
+#[cfg(not(target_os = "android"))]
+use deskbolt_proto::ServiceStateKind;
 use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, Pid, ProcessesToUpdate, RefreshKind, System};
 
 #[cfg(not(target_os = "android"))]
-use std::io::Read;
+use std::{io::Read, time::Duration};
 
 const MAX_SNAPSHOT_PROCESSES: usize = 150;
 const MAX_SNAPSHOT_SERVICES: usize = 300;
+#[cfg(not(target_os = "android"))]
 const BROADCAST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Headless host diagnostics, process/service actions, and broadcast command runner (`0x08`).

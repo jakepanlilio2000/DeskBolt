@@ -7,7 +7,9 @@ use deskbolt_proto::{
     FileEntry, FileTransferMsg, SerialParity, ServiceOp, ServiceStateKind, SyncEntry, SysAdminMsg,
     TerminalMsg,
 };
-use egui::{Color32, Context, Key, RichText, ScrollArea, Vec2, ViewportBuilder, ViewportId, Window};
+use egui::{Color32, Context, Key, RichText, ScrollArea, Vec2, Window};
+#[cfg(not(target_os = "android"))]
+use egui::{ViewportBuilder, ViewportId};
 use tokio::sync::mpsc;
 
 use crate::db::{CommandSnippet, HostInput, HostProtocol, HostRow};

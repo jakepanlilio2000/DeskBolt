@@ -1,19 +1,21 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
-use std::time::Duration;
-
 use deskbolt_proto::{SerialParity, TerminalMsg};
 use tokio::sync::mpsc;
 
 #[cfg(not(target_os = "android"))]
-use std::io::{Read, Write};
+use std::{
+    io::{Read, Write},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 #[cfg(not(target_os = "android"))]
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 /// Maximum terminal or serial payload bytes per frame.
+#[cfg(not(target_os = "android"))]
 const IO_READ_BUF: usize = 4096;
 
 #[cfg(not(target_os = "android"))]

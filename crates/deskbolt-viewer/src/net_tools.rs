@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -426,7 +426,7 @@ fn read_arp_table_platform() -> Result<Vec<ArpEntry>, String> {
                 }
                 f if f == AF_INET6 => {
                     let bytes = row.Address.Ipv6.sin6_addr.u.Byte;
-                    IpAddr::V6(Ipv6Addr::from(bytes)).to_string()
+                    IpAddr::V6(std::net::Ipv6Addr::from(bytes)).to_string()
                 }
                 _ => continue,
             };
