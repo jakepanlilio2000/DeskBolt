@@ -1066,17 +1066,22 @@ async fn dispatch_client_frame(
         ChannelId::FileTransfer => {
             if *mode == SessionMode::ViewOnly || !policy.permissions.file_transfer {
                 let message = "File transfer is disabled by current session policy.";
-                if let Ok(FileTransferMsg::TransferStart { transfer_id, .. }) = unpack_message(&frame) {
-                    let reply = FileTransferMsg::TransferStartAck {
+                let reply = match unpack_message(&frame) {
+                    Ok(FileTransferMsg::TransferStart { transfer_id, .. }) => FileTransferMsg::TransferStartAck {
                         transfer_id, accepted: false, exists: false, existing_size: 0,
                         existing_modified_unix: 0, resume_offset: 0, prefix_sha256: None,
                         error: Some(message.into()),
-                    };
-                    if let Ok(f) = pack_message(ChannelId::FileTransfer, FLAG_NONE, &reply, None) {
-                        let _ = out_tx.send(f).await;
+                    },
+                    Ok(FileTransferMsg::HashTreeReq { root, .. }) => FileTransferMsg::HashTreeResp {
+                        root, entries: Vec::new(), next_cursor: None, error: Some(message.into()),
+                    },
+                    _ => {
+                        send_control_error(out_tx, message);
+                        return Ok(());
                     }
-                } else {
-                    send_control_error(out_tx, message);
+                };
+                if let Ok(f) = pack_message(ChannelId::FileTransfer, FLAG_NONE, &reply, None) {
+                    let _ = out_tx.send(f).await;
                 }
                 return Ok(());
             }

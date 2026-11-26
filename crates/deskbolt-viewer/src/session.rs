@@ -115,6 +115,7 @@ pub struct FileTransferState {
     pub pending_overwrite: Option<OverwritePrompt>,
     pub remote_hash_tree: Option<Vec<SyncEntry>>,
     pub remote_hash_error: Option<String>,
+    pub remote_hash_pending: bool,
     pub hash_tree_error: Option<String>,
 }
 
@@ -177,6 +178,7 @@ impl FileTransferState {
             pending_overwrite: None,
             remote_hash_tree: None,
             remote_hash_error: None,
+            remote_hash_pending: false,
             hash_tree_error: None,
         };
         st.refresh_local();
@@ -438,6 +440,20 @@ impl ViewerSession {
         let _ = self.cmd_tx.try_send(cmd);
     }
 
+    pub fn request_hash_scan(&mut self, root: String, exclude_globs: Vec<String>) -> bool {
+        if self.file_transfer.remote_hash_pending || !matches!(self.phase, ConnectionPhase::Connected)
+            || self.cmd_tx.try_send(SessionCommand::File(FileTransferMsg::HashTreeReq {
+                root, cursor: None, page_size: deskbolt_proto::hash_tree::HASH_PAGE_SIZE, exclude_globs,
+            })).is_err()
+        {
+            return false;
+        }
+        self.file_transfer.remote_hash_tree = None;
+        self.file_transfer.remote_hash_error = None;
+        self.file_transfer.remote_hash_pending = true;
+        true
+    }
+
     pub fn poll_events(&mut self) -> (Option<(Option<i64>, String)>, Option<ClipboardSync>) {
         let mut pin_to_save = None;
         let mut clip_to_copy = None;
@@ -446,6 +462,7 @@ impl ViewerSession {
                 SessionUiEvent::PhaseChanged(p) => {
                     self.phase = p.clone();
                     if !matches!(p, ConnectionPhase::Connected) {
+                        self.file_transfer.remote_hash_pending = false;
                         self.typing_clipboard = false;
                         self.android_controls = false;
                         self.cursor = crate::cursor::CursorOverlay::default();
@@ -533,6 +550,7 @@ impl ViewerSession {
                 SessionUiEvent::HashTree { entries, error } => {
                     self.file_transfer.remote_hash_tree = error.is_none().then_some(entries);
                     self.file_transfer.remote_hash_error = error.clone();
+                    self.file_transfer.remote_hash_pending = false;
                     self.file_transfer.hash_tree_error = error;
                 }
                 SessionUiEvent::TailChunk {

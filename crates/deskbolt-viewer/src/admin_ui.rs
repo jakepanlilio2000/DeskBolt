@@ -2032,19 +2032,20 @@ impl DeskBoltViewerApp {
                     && let Some(session) = self.sessions.iter_mut().find(|session| session.id == id)
                 {
                     ui.label("Exclude paths (one rule per line)");
-                    ui.text_edit_multiline(&mut modal.exclude_globs);
-                    let remote_pending = session.file_transfer.remote_hash_tree.is_none()
-                        && session.file_transfer.remote_hash_error.is_none()
-                        && modal.status.starts_with("Computing");
-                    if ui.add_enabled(!remote_pending && modal.local_rx.is_none(), egui::Button::new("Scan folders")).clicked() {
+                    let ready_to_scan = !session.file_transfer.remote_hash_pending && modal.local_rx.is_none();
+                    if ui.add_enabled(ready_to_scan, egui::TextEdit::multiline(&mut modal.exclude_globs)).changed() {
+                        modal.local_tree = None;
+                        modal.remote_tree = None;
+                        modal.diffs.clear();
+                        modal.status = "Scan both folders to apply exclusions.".into();
+                    }
+                    if ui.add_enabled(ready_to_scan, egui::Button::new("Scan folders")).clicked() {
                         use deskbolt_proto::hash_tree::{HASH_PAGE_SIZE, scan_hash_page};
                         let globs: Vec<String> = modal.exclude_globs.lines().map(str::to_owned).collect();
-                        session.file_transfer.remote_hash_tree = None;
-                        session.file_transfer.remote_hash_error = None;
-                        session.send_cmd(SessionCommand::File(FileTransferMsg::HashTreeReq {
-                            root: modal.remote_dir.clone(), cursor: None, page_size: HASH_PAGE_SIZE,
-                            exclude_globs: globs.clone(),
-                        }));
+                        if !session.request_hash_scan(modal.remote_dir.clone(), globs.clone()) {
+                            modal.status = "Could not start the remote scan.".into();
+                            return;
+                        }
                         let (tx, rx) = std::sync::mpsc::channel();
                         let root = modal.local_dir.clone();
                         self.runtime.spawn(async move {
