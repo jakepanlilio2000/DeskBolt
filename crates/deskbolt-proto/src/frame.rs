@@ -203,22 +203,47 @@ pub async fn write_frame_async<W: AsyncWrite + Unpin>(
 pub async fn read_frame_async<R: AsyncRead + Unpin>(
     reader: &mut R,
 ) -> Result<Option<Frame>, ProtoError> {
-    let mut header = [0u8; HEADER_LEN];
-    let first = reader.read(&mut header[..1]).await?;
-    if first == 0 {
-        return Ok(None);
+    AsyncFrameReader::default().read(reader).await
+}
+
+/// Retains partial headers and payloads when another branch wins a session's select.
+#[derive(Default)]
+pub struct AsyncFrameReader {
+    header: [u8; HEADER_LEN],
+    header_read: usize,
+    payload: Option<(Frame, usize)>,
+}
+
+impl AsyncFrameReader {
+    pub async fn read<R: AsyncRead + Unpin>(
+        &mut self,
+        reader: &mut R,
+    ) -> Result<Option<Frame>, ProtoError> {
+        while self.header_read < HEADER_LEN {
+            let n = reader.read(&mut self.header[self.header_read..]).await?;
+            if n == 0 && self.header_read == 0 {
+                return Ok(None);
+            }
+            if n == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+            }
+            self.header_read += n;
+        }
+        if self.payload.is_none() {
+            let (len, channel, flags) = parse_header(self.header)?;
+            self.payload = Some((Frame { channel, flags, payload: vec![0; len] }, 0));
+        }
+        let (frame, bytes_read) = self.payload.as_mut().unwrap();
+        while *bytes_read < frame.payload.len() {
+            let n = reader.read(&mut frame.payload[*bytes_read..]).await?;
+            if n == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+            }
+            *bytes_read += n;
+        }
+        self.header_read = 0;
+        Ok(self.payload.take().map(|(frame, _)| frame))
     }
-    reader.read_exact(&mut header[1..]).await?;
-    let (len, channel, flags) = parse_header(header)?;
-    let mut payload = vec![0u8; len];
-    if len > 0 {
-        reader.read_exact(&mut payload).await?;
-    }
-    Ok(Some(Frame {
-        channel,
-        flags,
-        payload,
-    }))
 }
 
 /// Writes a framed packet to a synchronous stream (useful for Win32 named-pipe helpers).
@@ -263,6 +288,23 @@ mod tests {
 
     use super::*;
     use crate::messages::{ControlMsg, SessionMode};
+
+    #[tokio::test]
+    async fn async_reader_retains_partial_frame_across_cancellation() {
+        let (mut tx, mut rx) = duplex(32);
+        let mut reader = AsyncFrameReader::default();
+        let header = build_header(4, ChannelId::Clipboard, FLAG_NONE).unwrap();
+        let wait = std::time::Duration::from_millis(5);
+        tx.write_all(&header[..2]).await.unwrap();
+        assert!(tokio::time::timeout(wait, reader.read(&mut rx)).await.is_err());
+        tx.write_all(&header[2..]).await.unwrap();
+        tx.write_all(b"ab").await.unwrap();
+        assert!(tokio::time::timeout(wait, reader.read(&mut rx)).await.is_err());
+        tx.write_all(b"cd").await.unwrap();
+        assert_eq!(reader.read(&mut rx).await.unwrap().unwrap().payload, b"abcd");
+        drop(tx);
+        assert!(reader.read(&mut rx).await.unwrap().is_none());
+    }
 
     #[tokio::test]
     async fn frame_roundtrip_and_zero_length_eof() {

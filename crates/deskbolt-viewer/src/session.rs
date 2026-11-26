@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use deskbolt_proto::{
-    ChannelId, ClipboardSync, CommsMsg, ControlMsg, DriveEntry, FLAG_NONE, FLAG_URGENT, FileEntry,
+    AsyncFrameReader, ChannelId, ClipboardSync, CommsMsg, ControlMsg, DriveEntry, FLAG_NONE, FLAG_URGENT, FileEntry,
     FileTransferMsg, Frame, H264VideoDecoder, InputMsg, MonitorInfo, NONCE_LEN, PROTO_VERSION,
     PowerMsg, SessionMode, SyncEntry, SysAdminMsg, SystemSnapshot, TerminalMsg, TofuPinPolicy,
     TofuServerCertVerifier, TransferDir, TunnelMsg, VOICE_SAMPLE_RATE, VideoMsg, VideoQualityMode,
@@ -1033,6 +1033,7 @@ async fn run_session_task(
     });
 
     let (mut reader, mut writer) = tokio::io::split(tls);
+    let mut frames = AsyncFrameReader::default();
     let mut ft_client = FileClientQueue::new();
     let mut next_transfer_id: u64 = 1;
     let mut quick_edit_pending: Option<String> = None;
@@ -1290,7 +1291,7 @@ async fn run_session_task(
                     _ => {}
                 }
             }
-            frame_res = read_frame_async(&mut reader) => {
+            frame_res = frames.read(&mut reader) => {
                 match frame_res {
                     Ok(None) => {
                         notify(SessionUiEvent::PhaseChanged(ConnectionPhase::Disconnected("Host closed connection.".into())));

@@ -19,7 +19,7 @@ pub use codec::{
 };
 pub use error::ProtoError;
 pub use frame::{
-    ChannelId, FLAG_COMPRESSED, FLAG_END_OF_STREAM, FLAG_KEYFRAME, FLAG_NONE, FLAG_URGENT, Frame,
+    AsyncFrameReader, ChannelId, FLAG_COMPRESSED, FLAG_END_OF_STREAM, FLAG_KEYFRAME, FLAG_NONE, FLAG_URGENT, Frame,
     HEADER_LEN, MAX_DECOMPRESSED_PAYLOAD, MAX_FRAME_PAYLOAD, bincode_options, decode_bincode,
     encode_bincode, pack_message, read_frame_async, read_frame_sync, unpack_message,
     write_frame_async, write_frame_sync,

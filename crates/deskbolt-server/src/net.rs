@@ -7,7 +7,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use deskbolt_proto::{
-    ARGON2_M_KIB, ARGON2_P_COST, ARGON2_T_COST, ChannelId, ClipboardSync, CommsMsg, ControlMsg,
+    ARGON2_M_KIB, ARGON2_P_COST, ARGON2_T_COST, AsyncFrameReader, ChannelId, ClipboardSync, CommsMsg, ControlMsg,
     FLAG_KEYFRAME, FLAG_NONE, FLAG_URGENT, FileTransferMsg, Frame, InputMsg, IpRateLimiter,
     IpcMsg, NONCE_LEN, PROTO_VERSION, PowerMsg, SALT_LEN, ServerTlsStream, SessionMode,
     SpecialAction, StoredCredential, SysAdminMsg, TerminalMsg, TlsServerConfig, TunnelMsg,
@@ -624,6 +624,7 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> Result<(), String> {
     let (mut reader, mut writer) = tokio::io::split(tls);
+    let mut frames = AsyncFrameReader::default();
     let mut agent_rx = hub.from_agent_tx.subscribe();
     let mut chat_rx = chat_tx.subscribe();
     let mut file_handler = FileSessionHandler::new();
@@ -761,7 +762,7 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                     Err(broadcast::error::RecvError::Closed) => break Ok(()),
                 }
             }
-            frame_res = read_frame_async(&mut reader) => {
+            frame_res = frames.read(&mut reader) => {
                 match frame_res {
                     Ok(None) => break Ok(()),
                     Ok(Some(frame)) => {
