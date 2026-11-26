@@ -222,10 +222,10 @@ impl InputInjector for EnigoInjector {
             self.depressed.remove(&(ev.vk_code, ev.extended));
         }
         let dir = if ev.down { Direction::Press } else { Direction::Release };
-        if let Some(key) = vk_to_enigo_key(ev.vk_code) {
-            if let Err(e) = self.enigo.key(key, dir) {
-                warn!("enigo key error: {e}");
-            }
+        if let Some(key) = vk_to_enigo_key(ev.vk_code)
+            && let Err(e) = self.enigo.key(key, dir)
+        {
+            warn!("Could not deliver the key event: {e}");
         }
     }
 

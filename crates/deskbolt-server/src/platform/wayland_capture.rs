@@ -454,7 +454,7 @@ unsafe fn read_pixels(buffer: &spa::spa_buffer, info: &VideoInfoRaw) -> Option<F
     for row in bytes.chunks(stride) {
         bgra.extend_from_slice(&row[..width as usize * 4]);
     }
-    for pixel in bgra.chunks_exact_mut(4) {
+    for pixel in bgra.as_chunks_mut::<4>().0 {
         if swap_red_blue {
             pixel.swap(0, 2);
         }
@@ -547,7 +547,7 @@ fn cursor_bitmap(bytes: &[u8], cursor: &spa::spa_meta_cursor) -> Option<CursorSh
         rgba.extend_from_slice(&line[..row]);
     }
     if swap_red_blue {
-        for pixel in rgba.chunks_exact_mut(4) {
+        for pixel in rgba.as_chunks_mut::<4>().0 {
             pixel.swap(0, 2);
         }
     }

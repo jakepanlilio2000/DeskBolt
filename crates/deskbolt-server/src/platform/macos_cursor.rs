@@ -65,7 +65,7 @@ pub fn sample(monitor: &MonitorInfo, frame: (u32, u32)) -> Option<CursorSnapshot
             Some(&image),
         );
         drop(context);
-        for pixel in rgba.chunks_exact_mut(4) {
+        for pixel in rgba.as_chunks_mut::<4>().0 {
             unpremultiply(pixel);
         }
         Some(CursorSnapshot {

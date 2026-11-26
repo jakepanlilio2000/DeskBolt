@@ -576,7 +576,7 @@ fn send_system_dbus_call(
 
 #[cfg(target_os = "linux")]
 fn push_dbus_str(buf: &mut Vec<u8>, s: &str) {
-    while buf.len() % 4 != 0 {
+    while !buf.len().is_multiple_of(4) {
         buf.push(0);
     }
     buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
@@ -601,7 +601,7 @@ fn build_dbus_call_sig(
 ) -> Vec<u8> {
     let mut fields = Vec::new();
     let push_field = |f: &mut Vec<u8>, code: u8, val_type: u8, s: &str| {
-        while f.len() % 8 != 0 {
+        while !f.len().is_multiple_of(8) {
             f.push(0);
         }
         f.push(code);
