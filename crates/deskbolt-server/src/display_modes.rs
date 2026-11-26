@@ -178,7 +178,7 @@ pub(crate) fn recovery_path() -> PathBuf {
                 .join("DeskBolt")
                 .join(format!("display-{session}.bin"));
         }
-        return crate::config::default_data_dir().join(format!("display-{session}.bin"));
+        crate::config::default_data_dir().join(format!("display-{session}.bin"))
     }
     #[cfg(target_os = "linux")]
     {
@@ -188,7 +188,7 @@ pub(crate) fn recovery_path() -> PathBuf {
             .filter(|c| c.is_ascii_alphanumeric() || *c == '.')
             .take(80)
             .collect();
-        return crate::config::default_data_dir().join(format!("display-{display}.bin"));
+        crate::config::default_data_dir().join(format!("display-{display}.bin"))
     }
     #[cfg(any(target_os = "macos", target_os = "android"))]
     crate::config::default_data_dir().join("display-mode.bin")

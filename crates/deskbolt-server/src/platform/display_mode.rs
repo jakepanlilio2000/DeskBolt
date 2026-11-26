@@ -169,11 +169,9 @@ mod native {
                 (mode.width, mode.height)
             };
             let clocks = u64::from(mode.htotal) * u64::from(mode.vtotal);
-            let hz = if clocks == 0 {
-                0
-            } else {
-                ((u64::from(mode.dot_clock) + clocks / 2) / clocks) as u32
-            };
+            let hz = (u64::from(mode.dot_clock) + clocks / 2)
+                .checked_div(clocks)
+                .unwrap_or_default() as u32;
             DisplayMode {
                 output: self.name.clone(),
                 id: u64::from(mode.id),
