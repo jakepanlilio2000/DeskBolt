@@ -1,0 +1,319 @@
+name: DeskBolt Release Pipeline
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: "Version bump rule (leave auto to derive from commit message)"
+        required: true
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - patch-beta
+          - minor-beta
+          - stable
+          - overhaul
+
+permissions:
+  contents: write
+
+jobs:
+  version-bump:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' &&
+       !startsWith(github.ref, 'refs/tags/') &&
+       !contains(github.event.head_commit.message, '[skip ci]'))
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Run version bumper unit tests
+        run: python3 -m unittest scripts/test_bump_version.py
+
+      - name: Compute and apply next workspace version
+        id: bump
+        run: |
+          NEXT_VER=$(python3 scripts/bump_version.py --bump "${{ inputs.release_type || 'auto' }}")
+          cargo metadata --format-version 1 > /dev/null
+          echo "version=${NEXT_VER}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${NEXT_VER}" >> "$GITHUB_OUTPUT"
+
+      - name: Commit, tag, and push release version
+        run: |
+          VER="${{ steps.bump.outputs.version }}"
+          TAG="${{ steps.bump.outputs.tag }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(release): bump version to ${TAG} [skip ci]"
+            git push origin HEAD:main
+          fi
+          git tag -a "${TAG}" -m "DeskBolt ${TAG}"
+          git push origin "${TAG}"
+
+  build-matrix:
+    needs: [version-bump]
+    if: >-
+      always() &&
+      (startsWith(github.ref, 'refs/tags/v') ||
+       (needs.version-bump.result == 'success' && needs.version-bump.outputs.version != ''))
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows
+            os: windows-latest
+          - platform: linux
+            os: ubuntu-latest
+          - platform: macos
+            os: macos-latest
+          - platform: android
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Resolve release ref
+        id: rel
+        shell: bash
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="${{ needs.version-bump.outputs.tag }}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.rel.outputs.tag }}
+
+      - name: Build Windows x64 archive & NSIS installer
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          choco install -y nasm
+          $env:PATH = "C:\Program Files\NASM;" + $env:PATH
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
+            if (Test-Path "C:\Program Files (x86)\NSIS\makensis.exe") {
+              $env:PATH = "C:\Program Files (x86)\NSIS;" + $env:PATH
+            } else {
+              choco install -y nsis
+              $env:PATH = "C:\Program Files (x86)\NSIS;" + $env:PATH
+            }
+          }
+          cargo build --release --workspace --locked
+          $ver = "${{ steps.rel.outputs.version }}"
+          $tag = "${{ steps.rel.outputs.tag }}"
+          New-Item -ItemType Directory -Force -Path dist/windows | Out-Null
+          Copy-Item target/release/deskbolt-server.exe, target/release/deskbolt-viewer.exe, LICENSE, README.md dist/windows/
+          Compress-Archive -Path dist/windows/* -DestinationPath "DeskBolt-$tag-windows-x64.zip" -Force
+          makensis "/DVERSION=$ver" packaging/windows/deskbolt.nsi
+          Move-Item -Force "packaging/windows/DeskBolt-v$ver-windows-x64-setup.exe" .
+
+      - name: Build Linux packages (.deb, .rpm, Arch .pkg.tar.zst, .tar.gz, AppImage)
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxcb1-dev libxrandr-dev libdbus-1-dev libpipewire-0.3-dev \
+            libwayland-dev libegl-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libasound2-dev libclang-dev clang nasm \
+            rpm zstd file desktop-file-utils
+          rustup update stable
+          cargo install --locked cargo-deb cargo-generate-rpm
+          cargo build --release --workspace --locked
+
+          VER="${{ steps.rel.outputs.version }}"
+          TAG="${{ steps.rel.outputs.tag }}"
+          mkdir -p dist/linux-out
+
+          # Debian/Ubuntu/Mint .deb
+          cargo deb -p deskbolt-server --no-build -o "dist/linux-out/deskbolt-server_${VER}_amd64.deb"
+          cargo deb -p deskbolt-viewer --no-build -o "dist/linux-out/deskbolt-viewer_${VER}_amd64.deb"
+
+          # Fedora/RHEL/openSUSE .rpm
+          cargo generate-rpm -p crates/deskbolt-server -o "dist/linux-out/deskbolt-server-${VER}-1.x86_64.rpm"
+          cargo generate-rpm -p crates/deskbolt-viewer -o "dist/linux-out/deskbolt-viewer-${VER}-1.x86_64.rpm"
+
+          # Universal portable tarball (Alpine, NixOS, Gentoo, Void)
+          STAGE="dist/DeskBolt-${TAG}-linux-x86_64"
+          mkdir -p "${STAGE}"
+          cp target/release/deskbolt-server target/release/deskbolt-viewer \
+             packaging/linux/deskbolt-server.service packaging/linux/deskbolt-viewer.desktop \
+             LICENSE README.md "${STAGE}/"
+          tar -C dist -czf "dist/linux-out/DeskBolt-${TAG}-linux-x86_64.tar.gz" "DeskBolt-${TAG}-linux-x86_64"
+
+          # Arch Linux .pkg.tar.zst archive
+          ARCH_VER="${VER//-/_}"
+          ARCH_ROOT="dist/arch-pkg"
+          install -Dm755 target/release/deskbolt-server "${ARCH_ROOT}/usr/bin/deskbolt-server"
+          install -Dm755 target/release/deskbolt-viewer "${ARCH_ROOT}/usr/bin/deskbolt-viewer"
+          install -Dm644 packaging/linux/deskbolt-server.service "${ARCH_ROOT}/usr/lib/systemd/system/deskbolt-server.service"
+          install -Dm644 packaging/linux/deskbolt-viewer.desktop "${ARCH_ROOT}/usr/share/applications/deskbolt-viewer.desktop"
+          install -Dm644 LICENSE "${ARCH_ROOT}/usr/share/licenses/deskbolt/LICENSE"
+          cat > "${ARCH_ROOT}/.PKGINFO" <<EOF
+          pkgname = deskbolt
+          pkgver = ${ARCH_VER}-1
+          pkgdesc = Native self-hosted remote desktop server and viewer
+          url = https://github.com/jakepanlilio2000/DeskBolt
+          arch = x86_64
+          license = MPL-2.0
+          depend = glibc
+          depend = libxcb
+          depend = libxrandr
+          depend = dbus
+          depend = libxkbcommon
+          depend = libxkbcommon-x11
+          depend = libglvnd
+          depend = alsa-lib
+          EOF
+          tar -C "${ARCH_ROOT}" --zstd -cf "dist/linux-out/deskbolt-${ARCH_VER}-1-x86_64.pkg.tar.zst" .PKGINFO usr
+
+          # Universal AppImage
+          APPDIR="dist/DeskBolt.AppDir"
+          install -Dm755 target/release/deskbolt-viewer "${APPDIR}/usr/bin/deskbolt-viewer"
+          install -Dm755 target/release/deskbolt-server "${APPDIR}/usr/bin/deskbolt-server"
+          install -Dm644 packaging/linux/deskbolt-viewer.desktop "${APPDIR}/deskbolt-viewer.desktop"
+          cat > "${APPDIR}/AppRun" <<'EOF'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "${HERE}/usr/bin/deskbolt-viewer" "$@"
+          EOF
+          chmod 755 "${APPDIR}/AppRun"
+          printf '\211PNG\r\n\032\n\000\000\000\rIHDR\000\000\000\001\000\000\000\001\010\006\000\000\000\037\025\304\211\000\000\000\nIDATx\234c\000\001\000\000\005\000\001\r\n-\264\000\000\000\000IEND\256B`\202' > "${APPDIR}/deskbolt.png"
+          sed -i 's/^Exec=.*/Exec=deskbolt-viewer\nIcon=deskbolt/' "${APPDIR}/deskbolt-viewer.desktop"
+          curl -fsSL -o appimagetool "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+          chmod +x appimagetool
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run "${APPDIR}" "dist/linux-out/DeskBolt-${TAG}-linux-x86_64.AppImage"
+
+      - name: Build macOS Universal .dmg
+        if: matrix.platform == 'macos'
+        run: |
+          brew install nasm
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin --workspace --locked
+          cargo build --release --target x86_64-apple-darwin --workspace --locked
+
+          TAG="${{ steps.rel.outputs.tag }}"
+          VER="${{ steps.rel.outputs.version }}"
+          APP="dist/macos/DeskBolt Viewer.app"
+          mkdir -p "${APP}/Contents/MacOS" "${APP}/Contents/Resources" dist/macos/bin
+
+          lipo -create \
+            target/aarch64-apple-darwin/release/deskbolt-viewer \
+            target/x86_64-apple-darwin/release/deskbolt-viewer \
+            -output "${APP}/Contents/MacOS/deskbolt-viewer"
+          lipo -create \
+            target/aarch64-apple-darwin/release/deskbolt-server \
+            target/x86_64-apple-darwin/release/deskbolt-server \
+            -output "dist/macos/bin/deskbolt-server"
+          chmod +x "${APP}/Contents/MacOS/deskbolt-viewer" "dist/macos/bin/deskbolt-server"
+
+          cat > "${APP}/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>DeskBolt Viewer</string>
+            <key>CFBundleIdentifier</key><string>com.stacksync.deskbolt.viewer</string>
+            <key>CFBundleVersion</key><string>${VER}</string>
+            <key>CFBundleShortVersionString</key><string>${VER}</string>
+            <key>CFBundleExecutable</key><string>deskbolt-viewer</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
+          cp LICENSE README.md dist/macos/
+          hdiutil create -volname "DeskBolt ${TAG}" -srcfolder dist/macos -ov -format UDZO "DeskBolt-${TAG}-macos-universal.dmg"
+
+      - uses: actions/setup-java@v4
+        if: matrix.platform == 'android'
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+        if: matrix.platform == 'android'
+
+      - uses: gradle/actions/setup-gradle@v4
+        if: matrix.platform == 'android'
+        with:
+          gradle-version: "8.11.1"
+
+      - name: Build Android APK (16 KB page-aligned)
+        if: matrix.platform == 'android'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nasm clang
+          sdkmanager "ndk;27.2.12479018" "platforms;android-35" "build-tools;35.0.0"
+          export ANDROID_NDK_HOME="${ANDROID_HOME}/ndk/27.2.12479018"
+          rustup target add aarch64-linux-android x86_64-linux-android
+          cargo install --locked cargo-ndk
+          cargo ndk -t arm64-v8a -t x86_64 -p 26 -o android/app/src/main/jniLibs \
+            build --release -p deskbolt-viewer -p deskbolt-server --locked
+          cd android
+          gradle assembleRelease -PdeskboltVersionName="${{ steps.rel.outputs.version }}"
+          cp app/build/outputs/apk/release/app-release.apk "../DeskBolt-${{ steps.rel.outputs.tag }}-android.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deskbolt-${{ matrix.platform }}
+          path: |
+            DeskBolt-v*.zip
+            DeskBolt-v*.exe
+            DeskBolt-v*.dmg
+            DeskBolt-v*.apk
+            dist/linux-out/*
+
+  publish-release:
+    needs: [version-bump, build-matrix]
+    if: always() && needs.build-matrix.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag & version
+        id: ver
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="${{ needs.version-bump.outputs.tag }}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        working-directory: release-artifacts
+        run: sha256sum * > "DeskBolt-${{ steps.ver.outputs.tag }}-SHA256SUMS.txt"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: DeskBolt ${{ steps.ver.outputs.tag }}
+          prerelease: ${{ contains(steps.ver.outputs.version, '-beta') }}
+          generate_release_notes: true
+          files: release-artifacts/*
