@@ -13,7 +13,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector, client, server};
 
 use crate::error::ProtoError;
 
-pub const PROTO_VERSION: u16 = 5;
+pub const PROTO_VERSION: u16 = 6;
 pub const DEFAULT_PORT: u16 = 4899;
 
 pub type TlsServerConfig = ServerConfig;

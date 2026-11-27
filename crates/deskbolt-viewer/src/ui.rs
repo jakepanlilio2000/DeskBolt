@@ -1327,18 +1327,46 @@ impl DeskBoltViewerApp {
                 let s = &mut self.sessions[idx];
                 ui.horizontal_wrapped(|ui| {
                     let is_full = s.mode == SessionMode::FullControl;
-                    if ui.selectable_label(is_full, "Full Control").clicked() {
-                        s.mode = SessionMode::FullControl;
-                        s.send_cmd(SessionCommand::Control(ControlMsg::SessionModeSwitch {
-                            mode: SessionMode::FullControl,
-                        }));
+                    let connected = matches!(s.phase, ConnectionPhase::Connected);
+                    if is_full {
+                        ui.label("Full Control");
+                        if ui.add_enabled(connected, egui::Button::new("View Only")).clicked() {
+                            s.send_cmd(SessionCommand::Control(ControlMsg::SessionModeSwitch {
+                                mode: SessionMode::ViewOnly,
+                            }));
+                        }
+                    } else {
+                        let waiting = s.control_request == Some(s.self_id);
+                        let label = if waiting { "Control Requested" } else { "Request Control" };
+                        if ui.add_enabled(connected && !waiting, egui::Button::new(label)).clicked() {
+                            s.send_cmd(SessionCommand::Control(ControlMsg::RequestControl));
+                        }
                     }
-                    if ui.selectable_label(!is_full, "View Only").clicked() {
-                        s.mode = SessionMode::ViewOnly;
-                        s.capture_system_keys = false;
-                        s.send_cmd(SessionCommand::Control(ControlMsg::SessionModeSwitch {
-                            mode: SessionMode::ViewOnly,
-                        }));
+                    if !s.viewers.is_empty() {
+                        ui.menu_button(format!("Viewers ({})", s.viewers.len()), |ui| {
+                            for viewer in &s.viewers {
+                                ui.horizontal(|ui| {
+                                    ui.label(&viewer.name);
+                                    if viewer.id == s.self_id {
+                                        ui.weak("You");
+                                    }
+                                    if viewer.controlling {
+                                        ui.strong("Controller");
+                                    }
+                                });
+                            }
+                        });
+                    }
+                    if is_full && s.exclusive_control
+                        && let Some(id) = s.control_request
+                        && let Some(viewer) = s.viewers.iter().find(|v| v.id == id)
+                    {
+                        ui.label(format!("{} requests control", viewer.name));
+                        for (label, approved) in [("Hand Off Control", true), ("Decline", false)] {
+                            if ui.button(label).clicked() {
+                                s.send_cmd(SessionCommand::Control(ControlMsg::HandOffControl { viewer: id, approved }));
+                            }
+                        }
                     }
                     if ui.button("File Transfer").clicked() {
                         s.file_transfer.open = true;

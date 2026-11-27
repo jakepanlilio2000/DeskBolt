@@ -12,6 +12,7 @@ pub mod ipc;
 #[cfg(all(feature = "dev-mcp", not(target_os = "android")))]
 pub mod loopback;
 pub mod net;
+mod collaboration;
 pub mod platform;
 #[cfg(not(target_os = "android"))]
 pub mod settings_ui;

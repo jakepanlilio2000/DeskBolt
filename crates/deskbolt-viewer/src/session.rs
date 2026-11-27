@@ -17,7 +17,7 @@ use deskbolt_proto::{
     FileTransferMsg, Frame, H264VideoDecoder, InputMsg, MonitorInfo, NONCE_LEN, PROTO_VERSION,
     PowerMsg, SessionMode, SyncEntry, SysAdminMsg, SystemSnapshot, TerminalMsg, TofuPinPolicy,
     TofuServerCertVerifier, TransferDir, TunnelMsg, VOICE_SAMPLE_RATE, VideoMsg, VideoQualityMode,
-    VoiceControls, VoiceEngine, compute_client_proof, connect_tls,
+    ViewerPresence, VoiceControls, VoiceEngine, compute_client_proof, connect_tls,
     derive_auth_key, format_fingerprint, pack_message, parse_fingerprint, random_bytes,
     read_frame_async, unpack_message, verify_server_proof, write_frame_async,
 };
@@ -259,6 +259,7 @@ pub struct ChatLine {
 pub enum SessionUiEvent {
     PhaseChanged(ConnectionPhase),
     ModeUpdated(SessionMode),
+    Viewers { self_id: u64, exclusive: bool, viewers: Vec<ViewerPresence>, request: Option<u64> },
     PinAccepted { host_id: Option<i64>, fingerprint: String },
     MonitorsUpdated { monitors: Vec<MonitorInfo>, active_id: u8 },
     RttUpdated(u64),
@@ -338,6 +339,10 @@ pub struct ViewerSession {
     pub(crate) cursors: MonitorCursors,
     pub(crate) workspace: crate::monitor_workspace::Workspace,
     pub(crate) window_match: crate::monitor_workspace::WindowMatch,
+    pub(crate) self_id: u64,
+    pub(crate) exclusive_control: bool,
+    pub(crate) viewers: Vec<ViewerPresence>,
+    pub(crate) control_request: Option<u64>,
     pub(crate) privacy_curtain: bool,
     pub(crate) local_input_lock: bool,
     pub file_transfer: FileTransferState,
@@ -438,6 +443,10 @@ impl ViewerSession {
             cursors: Arc::default(),
             workspace: crate::monitor_workspace::Workspace::default(),
             window_match: crate::monitor_workspace::WindowMatch::default(),
+            self_id: 0,
+            exclusive_control: false,
+            viewers: Vec::new(),
+            control_request: None,
             privacy_curtain: false,
             local_input_lock: false,
             file_transfer: ft,
@@ -530,6 +539,8 @@ impl ViewerSession {
                         self.monitor_frames.lock().unwrap().clear();
                         self.workspace = crate::monitor_workspace::Workspace::default();
                         self.window_match = crate::monitor_workspace::WindowMatch::default();
+                        self.viewers.clear();
+                        self.control_request = None;
                         self.privacy_curtain = false;
                         self.local_input_lock = false;
                     }
@@ -551,6 +562,15 @@ impl ViewerSession {
                             }));
                         }
                     }
+                }
+                SessionUiEvent::Viewers { self_id, exclusive, viewers, request } => {
+                    if self.control_request == Some(self_id) && request.is_none() && self.mode != SessionMode::FullControl {
+                        self.status_banner = "Control request closed.".into();
+                    }
+                    self.self_id = self_id;
+                    self.exclusive_control = exclusive;
+                    self.viewers = viewers;
+                    self.control_request = request;
                 }
                 SessionUiEvent::ModeUpdated(m) => {
                     self.mode = m;
@@ -987,7 +1007,8 @@ async fn run_session_task(
                 proto_version: PROTO_VERSION,
                 client_nonce: c_nonce,
                 requested_mode: mode,
-                client_name: std::env::var("COMPUTERNAME").unwrap_or_else(|_| "DeskBoltViewer".into()),
+                client_name: std::env::var("USERNAME").or_else(|_| std::env::var("USER"))
+                    .unwrap_or_default().chars().take(64).collect(),
                 video_decoders,
             },
             None,
@@ -1104,9 +1125,6 @@ async fn run_session_task(
                 if granted_mode != mode {
                     mode = granted_mode;
                     notify(SessionUiEvent::ModeUpdated(granted_mode));
-                    notify(SessionUiEvent::StatusBanner(
-                        "View Only mode (control held by another viewer)".into(),
-                    ));
                 }
                 break stream;
             }
@@ -1176,6 +1194,12 @@ async fn run_session_task(
         )
     {
         let _ = write_frame_async(&mut tls, qframe.channel, qframe.flags, &qframe.payload).await;
+    }
+
+    if mode != SessionMode::FileTransfer
+        && let Ok(frame) = pack_message(ChannelId::AuthControl, FLAG_NONE, &ControlMsg::WatchViewers, None)
+    {
+        let _ = write_frame_async(&mut tls, frame.channel, frame.flags, &frame.payload).await;
     }
 
     // Spawn dedicated video decode worker thread
@@ -1589,6 +1613,20 @@ async fn run_session_task(
                                 match ctrl {
                                     ControlMsg::MonitorList { monitors, active_monitor_id } => {
                                         notify(SessionUiEvent::MonitorsUpdated { monitors, active_id: active_monitor_id });
+                                    }
+                                    ControlMsg::SessionModeSwitch { mode: granted } => {
+                                        mode = granted;
+                                        if granted != SessionMode::FullControl {
+                                            typing.clear();
+                                            notify(SessionUiEvent::TypingChanged(false));
+                                        }
+                                        notify(SessionUiEvent::ModeUpdated(granted));
+                                    }
+                                    ControlMsg::ViewerPresenceList { self_id, exclusive, viewers, request } => {
+                                        notify(SessionUiEvent::Viewers { self_id, exclusive, viewers, request });
+                                    }
+                                    ControlMsg::ControlRequestResult { message } => {
+                                        notify(SessionUiEvent::StatusBanner(message));
                                     }
                                     ControlMsg::AndroidControls => notify(SessionUiEvent::AndroidControls),
                                     ControlMsg::Ping { timestamp_ms } => {

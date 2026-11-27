@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -21,6 +21,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, broadcast, mpsc, watch};
 use tracing::{info, warn};
 
+use crate::collaboration::{Roster, ViewerLease};
 use crate::config::{ServerConfig, ServerPolicy, evaluate_ip_access, log_audit_event};
 use crate::files::FileSessionHandler;
 use crate::ipc::{AgentHub, ViewerActivity};
@@ -32,45 +33,6 @@ use crate::tunnel::TunnelSessionHandler;
 const DEFAULT_PREAUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PREAUTH_CONNS: usize = 32;
 const MAX_VIDEO_QUEUE: usize = 2;
-
-/// Tracks exclusive keyboard/mouse ownership when `single_controller_lock = true`.
-struct ControllerGuard(Option<Arc<AtomicBool>>);
-
-impl ControllerGuard {
-    fn none() -> Self {
-        Self(None)
-    }
-
-    fn try_acquire(&mut self, lock: Option<&Arc<AtomicBool>>) -> bool {
-        if self.0.is_some() {
-            return true;
-        }
-        let Some(flag) = lock else {
-            return true;
-        };
-        if flag
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            self.0 = Some(flag.clone());
-            true
-        } else {
-            false
-        }
-    }
-
-    fn release(&mut self) {
-        if let Some(flag) = self.0.take() {
-            flag.store(false, Ordering::Release);
-        }
-    }
-}
-
-impl Drop for ControllerGuard {
-    fn drop(&mut self) {
-        self.release();
-    }
-}
 
 /// Runs the TLS 1.3 TCP listener (`port`, default `4899`) with auth, rate limiting, and session mux.
 pub async fn run_tcp_server(
@@ -156,9 +118,7 @@ pub async fn serve_listener_with_policy(
         None => IpRateLimiter::new(),
     }));
     let preauth_sem = Arc::new(Semaphore::new(MAX_PREAUTH_CONNS));
-    let controller_lock = policy
-        .single_controller_lock
-        .then(|| Arc::new(AtomicBool::new(false)));
+    let (roster, _) = watch::channel(Roster::new(policy.single_controller_lock));
     let policy = Arc::new(policy);
     let (chat_tx, _) = broadcast::channel::<(u64, CommsMsg)>(64);
     let next_conn_id = Arc::new(AtomicU64::new(1));
@@ -184,7 +144,7 @@ pub async fn serve_listener_with_policy(
                         let cred = cred.clone();
                         let limiter = limiter.clone();
                         let hub = hub.clone();
-                        let controller_lock = controller_lock.clone();
+                        let roster = roster.clone();
                         let policy_c = policy.clone();
                         let chat_tx_c = chat_tx.clone();
                         let sess_shutdown = shutdown_rx.clone();
@@ -199,7 +159,7 @@ pub async fn serve_listener_with_policy(
                                 limiter,
                                 hub,
                                 sas_enabled,
-                                controller_lock,
+                                roster,
                                 policy_c,
                                 chat_tx_c,
                                 preauth_timeout,
@@ -231,7 +191,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     limiter: Arc<Mutex<IpRateLimiter>>,
     hub: AgentHub,
     sas_enabled: bool,
-    controller_lock: Option<Arc<AtomicBool>>,
+    roster: watch::Sender<Roster>,
     policy: Arc<ServerPolicy>,
     chat_tx: broadcast::Sender<(u64, CommsMsg)>,
     preauth_timeout: Duration,
@@ -249,7 +209,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         return Err(reason);
     }
 
-    let (tls, mut mode, mut ctrl_guard, video_decoders) = match tokio::time::timeout(
+    let (tls, mut mode, lease, video_decoders) = match tokio::time::timeout(
         preauth_timeout,
         authenticate_stream(
             stream,
@@ -258,7 +218,8 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             cert_fp,
             &cred,
             &limiter,
-            controller_lock.as_ref(),
+            roster,
+            conn_id,
             &policy,
         ),
     )
@@ -310,8 +271,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         &mut mode,
         &hub,
         sas_enabled,
-        controller_lock.as_ref(),
-        &mut ctrl_guard,
+        &lease,
         &policy,
         chat_tx,
         &mut shutdown_rx,
@@ -334,7 +294,7 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         "disconnect",
         res.as_ref().err().map(String::as_str).unwrap_or("clean"),
     );
-    drop(ctrl_guard);
+    drop(lease);
 
     res
 }
@@ -363,9 +323,10 @@ async fn authenticate_stream<S: AsyncRead + AsyncWrite + Unpin>(
     cert_fp: [u8; 32],
     cred: &StoredCredential,
     limiter: &Mutex<IpRateLimiter>,
-    controller_lock: Option<&Arc<AtomicBool>>,
+    roster: watch::Sender<Roster>,
+    conn_id: u64,
     policy: &ServerPolicy,
-) -> Result<(ServerTlsStream<S>, SessionMode, ControllerGuard, VideoCapabilities), String> {
+) -> Result<(ServerTlsStream<S>, SessionMode, ViewerLease, VideoCapabilities), String> {
     let mut tls = accept_tls(stream, tls_cfg)
         .await
         .map_err(|e| format!("TLS handshake failed: {e}"))?;
@@ -381,7 +342,7 @@ async fn authenticate_stream<S: AsyncRead + AsyncWrite + Unpin>(
         proto_version,
         client_nonce,
         requested_mode,
-        client_name: _,
+        client_name,
         video_decoders,
     } = unpack_message::<ControlMsg>(&hello_frame).map_err(|e| e.to_string())?
     else {
@@ -487,7 +448,6 @@ async fn authenticate_stream<S: AsyncRead + AsyncWrite + Unpin>(
         lim.record_success(peer_ip);
     }
 
-    let mut guard = ControllerGuard::none();
     let effective_requested = if policy.force_view_only && requested_mode == SessionMode::FullControl {
         SessionMode::ViewOnly
     } else {
@@ -529,11 +489,10 @@ async fn authenticate_stream<S: AsyncRead + AsyncWrite + Unpin>(
         return Err("connection rejected by local user confirmation".into());
     }
 
-    let granted_mode = if effective_requested == SessionMode::FullControl && !guard.try_acquire(controller_lock) {
-        SessionMode::ViewOnly
-    } else {
-        effective_requested
-    };
+    let (lease, granted_mode) = ViewerLease::join(roster, conn_id, &client_name, effective_requested)?;
+    if granted_mode != effective_requested && !policy.permissions.allows_mode(granted_mode) {
+        return Err("View Only mode is disabled by the host.".into());
+    }
 
     let server_proof = compute_server_proof(&cred.auth_key, &server_nonce, &client_nonce, &cert_fp);
     let ok = pack_message(
@@ -553,7 +512,7 @@ async fn authenticate_stream<S: AsyncRead + AsyncWrite + Unpin>(
         .await
         .map_err(|e| e.to_string())?;
 
-    Ok((tls, granted_mode, guard, video_decoders))
+    Ok((tls, granted_mode, lease, video_decoders))
 }
 
 struct OutboundQueues {
@@ -624,8 +583,7 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
     mode: &mut SessionMode,
     hub: &AgentHub,
     sas_enabled: bool,
-    controller_lock: Option<&Arc<AtomicBool>>,
-    ctrl_guard: &mut ControllerGuard,
+    lease: &ViewerLease,
     policy: &Arc<ServerPolicy>,
     chat_tx: broadcast::Sender<(u64, CommsMsg)>,
     shutdown_rx: &mut watch::Receiver<bool>,
@@ -707,6 +665,8 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
         tokio::time::Instant::now() + Duration::from_secs(2), Duration::from_secs(2),
     );
     probe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut roster = lease.subscribe();
+    let mut watching_viewers = false;
     let mut last_rx = Instant::now();
     let mut disconnect = crate::platform::subscribe_disconnect();
 
@@ -716,6 +676,21 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
                     break Ok(());
+                }
+            }
+            changed = roster.changed(), if *mode != SessionMode::FileTransfer => {
+                if changed.is_err() {
+                    break Ok(());
+                }
+                let (controlling, snapshot) = {
+                    let current = roster.borrow_and_update();
+                    (current.controlling(conn_id), watching_viewers.then(|| current.snapshot(conn_id)))
+                };
+                if controlling && *mode == SessionMode::ViewOnly {
+                    activate_control(mode, hub, conn_id, policy, &out_tx).await;
+                }
+                if let Some(snapshot) = snapshot {
+                    send_control(&out_tx, snapshot).await;
                 }
             }
             _ = keepalive_tick.tick() => {
@@ -873,8 +848,8 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                             mode,
                             hub,
                             sas_enabled,
-                            controller_lock,
-                            ctrl_guard,
+                            lease,
+                            &mut watching_viewers,
                             policy,
                             &chat_tx,
                             &out_tx,
@@ -1071,8 +1046,8 @@ async fn dispatch_client_frame(
     mode: &mut SessionMode,
     hub: &AgentHub,
     sas_enabled: bool,
-    controller_lock: Option<&Arc<AtomicBool>>,
-    ctrl_guard: &mut ControllerGuard,
+    lease: &ViewerLease,
+    watching_viewers: &mut bool,
     policy: &ServerPolicy,
     chat_tx: &broadcast::Sender<(u64, CommsMsg)>,
     out_tx: &mpsc::Sender<Frame>,
@@ -1133,57 +1108,62 @@ async fn dispatch_client_frame(
                 ControlMsg::KeyframeRequest { monitor_id } if *mode != SessionMode::FileTransfer => {
                     let _ = hub.to_agent_tx.try_send(IpcMsg::KeyframeRequest { monitor_id });
                 }
-                ControlMsg::SessionModeSwitch { mode: next_mode } => {
-                    if *mode != SessionMode::FileTransfer && next_mode != SessionMode::FileTransfer {
-                        if policy.force_view_only && next_mode == SessionMode::FullControl {
-                            send_control_error(out_tx, "Host enforces View Only mode.");
-                            return Ok(());
-                        }
-                        if !policy.permissions.allows_mode(next_mode) {
-                            send_control_error(out_tx, "Requested session mode is disabled by host administrator.");
-                            return Ok(());
-                        }
-                        if *mode == SessionMode::FullControl && next_mode == SessionMode::ViewOnly {
-                            let _ = hub.to_agent_tx.try_send(IpcMsg::Input(InputMsg::ReleaseAllKeys));
-                            if policy.curtain_on_control && policy.os_prompts_enabled() {
-                                let _ = hub.to_agent_tx.send(IpcMsg::PolicyCurtain { viewer: conn_id, enabled: false }).await;
-                            }
-                            if video_feedback.desktop_settings_used {
-                                let _ = hub.to_agent_tx.send(IpcMsg::ReleaseDesktopSettings(conn_id)).await;
-                                video_feedback.desktop_settings_used = false;
-                            }
-                            ctrl_guard.release();
-                            *mode = next_mode;
-                        } else if *mode == SessionMode::ViewOnly && next_mode == SessionMode::FullControl {
-                            if ctrl_guard.try_acquire(controller_lock) {
-                                let peer_ip = peer_str.parse::<SocketAddr>().ok().map(|peer| peer.ip());
-                                if !approve_local_access(peer_ip, next_mode, policy).await {
-                                    ctrl_guard.release();
-                                    send_control_error(out_tx, "Control request declined by the host.");
-                                    return Ok(());
-                                }
-                                if policy.curtain_on_control && policy.os_prompts_enabled() {
-                                    let _ = hub.to_agent_tx.send(IpcMsg::PolicyCurtain { viewer: conn_id, enabled: true }).await;
-                                }
-                                *mode = next_mode;
-                            } else if let Ok(err) = pack_message(
-                                ChannelId::AuthControl,
-                                FLAG_URGENT,
-                                &ControlMsg::Error {
-                                    message: "Another viewer currently holds remote control.".into(),
-                                },
-                                None,
-                            ) {
-                                let _ = out_tx.try_send(err);
-                            }
-                        } else {
-                            *mode = next_mode;
-                        }
-                        if *mode == SessionMode::FileTransfer && *system_audio != SystemAudioState::Idle {
-                            *system_audio = SystemAudioState::Idle;
-                            let _ = hub.to_agent_tx.send(IpcMsg::SystemAudioStop(conn_id)).await;
-                            send_system_audio(out_tx, CommsMsg::SystemAudioStop).await;
-                        }
+                ControlMsg::WatchViewers if *mode != SessionMode::FileTransfer => {
+                    *watching_viewers = true;
+                    let snapshot = lease.subscribe().borrow().snapshot(conn_id);
+                    send_control(out_tx, snapshot).await;
+                }
+                ControlMsg::RequestControl | ControlMsg::SessionModeSwitch { mode: SessionMode::FullControl }
+                    if *mode == SessionMode::ViewOnly =>
+                {
+                    if policy.force_view_only || !policy.permissions.allows_mode(SessionMode::FullControl) {
+                        send_control_error(out_tx, "Host does not allow Full Control.");
+                        return Ok(());
+                    }
+                    let peer_ip = peer_str.parse::<SocketAddr>().ok().map(|peer| peer.ip());
+                    if !approve_local_access(peer_ip, SessionMode::FullControl, policy).await {
+                        send_control_error(out_tx, "Control request declined by the host.");
+                        return Ok(());
+                    }
+                    match lease.acquire_or_request(matches!(msg, ControlMsg::RequestControl)) {
+                        Ok(true) => activate_control(mode, hub, conn_id, policy, out_tx).await,
+                        Ok(false) => send_control(out_tx, ControlMsg::ControlRequestResult {
+                            message: "Control requested. Waiting for the current controller.".into(),
+                        }).await,
+                        Err(reason) => send_control_error(out_tx, reason),
+                    }
+                }
+                ControlMsg::SessionModeSwitch { mode: SessionMode::ViewOnly }
+                    if *mode == SessionMode::FullControl =>
+                {
+                    if !policy.permissions.allows_mode(SessionMode::ViewOnly) {
+                        send_control_error(out_tx, "Host does not allow View Only.");
+                        return Ok(());
+                    }
+                    relinquish_control(hub, conn_id, policy, video_feedback).await;
+                    term_handler.cleanup_all();
+                    tun_handler.cleanup_all().await;
+                    file_handler.cleanup_all();
+                    lease.release();
+                    *mode = SessionMode::ViewOnly;
+                    send_control(out_tx, ControlMsg::SessionModeSwitch { mode: *mode }).await;
+                }
+                ControlMsg::HandOffControl { viewer, approved }
+                    if *mode == SessionMode::FullControl && lease.can_handoff(viewer) =>
+                {
+                    if !approved {
+                        lease.handoff(viewer, false);
+                        return Ok(());
+                    }
+                    relinquish_control(hub, conn_id, policy, video_feedback).await;
+                    term_handler.cleanup_all();
+                    tun_handler.cleanup_all().await;
+                    file_handler.cleanup_all();
+                    if lease.handoff(viewer, true) {
+                        *mode = SessionMode::ViewOnly;
+                        send_control(out_tx, ControlMsg::SessionModeSwitch { mode: *mode }).await;
+                    } else if policy.curtain_on_control && policy.os_prompts_enabled() {
+                        let _ = hub.to_agent_tx.send(IpcMsg::PolicyCurtain { viewer: conn_id, enabled: true }).await;
                     }
                 }
                 ControlMsg::SpecialAction(action) => {
@@ -1543,6 +1523,33 @@ async fn send_power_ack(out_tx: &mpsc::Sender<Frame>, result: Result<String, Str
     let ack = PowerMsg::PowerAck { accepted, message };
     if let Ok(f) = pack_message(ChannelId::PowerControl, FLAG_URGENT, &ack, None) {
         let _ = out_tx.send(f).await;
+    }
+}
+
+async fn send_control(out: &mpsc::Sender<Frame>, message: ControlMsg) {
+    if let Ok(frame) = pack_message(ChannelId::AuthControl, FLAG_URGENT, &message, None) {
+        let _ = out.send(frame).await;
+    }
+}
+
+async fn activate_control(
+    mode: &mut SessionMode, hub: &AgentHub, id: u64, policy: &ServerPolicy, out: &mpsc::Sender<Frame>,
+) {
+    if policy.curtain_on_control && policy.os_prompts_enabled() {
+        let _ = hub.to_agent_tx.send(IpcMsg::PolicyCurtain { viewer: id, enabled: true }).await;
+    }
+    *mode = SessionMode::FullControl;
+    send_control(out, ControlMsg::SessionModeSwitch { mode: *mode }).await;
+}
+
+async fn relinquish_control(hub: &AgentHub, id: u64, policy: &ServerPolicy, feedback: &mut VideoFeedback) {
+    let _ = hub.to_agent_tx.send(IpcMsg::Input(InputMsg::ReleaseAllKeys)).await;
+    if policy.curtain_on_control && policy.os_prompts_enabled() {
+        let _ = hub.to_agent_tx.send(IpcMsg::PolicyCurtain { viewer: id, enabled: false }).await;
+    }
+    if feedback.desktop_settings_used {
+        let _ = hub.to_agent_tx.send(IpcMsg::ReleaseDesktopSettings(id)).await;
+        feedback.desktop_settings_used = false;
     }
 }
 
@@ -2344,7 +2351,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn single_controller_lock_downgrades_second_viewer_and_releases_on_drop() {
+    async fn single_controller_lock_hands_off_to_an_approved_viewer_and_releases_on_drop() {
         let id = generate_self_signed_cert(&[]).unwrap();
         let salt = [0x66u8; SALT_LEN];
         let auth_key = derive_auth_key(b"LockSecret!1", &salt, 1024, 1, 1).unwrap();
@@ -2372,7 +2379,7 @@ mod tests {
             shutdown_rx,
         ));
 
-        let (tls1, m1) = test_auth_connect(addr, id.fingerprint, b"LockSecret!1", SessionMode::FullControl).await;
+        let (mut tls1, m1) = test_auth_connect(addr, id.fingerprint, b"LockSecret!1", SessionMode::FullControl).await;
         assert_eq!(m1, SessionMode::FullControl);
 
         let (mut tls2, m2) = test_auth_connect(addr, id.fingerprint, b"LockSecret!1", SessionMode::FullControl).await;
@@ -2396,9 +2403,35 @@ mod tests {
             ControlMsg::Error { .. }
         ));
 
-        // Disconnecting first viewer releases controller lock for new FullControl session
-        drop(tls1);
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        async fn send(stream: &mut deskbolt_proto::ClientTlsStream<TcpStream>, message: ControlMsg) {
+            let frame = pack_message(ChannelId::AuthControl, FLAG_URGENT, &message, None).unwrap();
+            write_frame_async(stream, frame.channel, frame.flags, &frame.payload).await.unwrap();
+        }
+        async fn wait_for(
+            stream: &mut deskbolt_proto::ClientTlsStream<TcpStream>,
+            predicate: impl Fn(&ControlMsg) -> bool,
+        ) -> ControlMsg {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let frame = read_frame_async(stream).await.unwrap().unwrap();
+                    if frame.channel == ChannelId::AuthControl {
+                        let msg = unpack_message::<ControlMsg>(&frame).unwrap();
+                        if predicate(&msg) {
+                            break msg;
+                        }
+                    }
+                }
+            }).await.unwrap()
+        }
+        send(&mut tls1, ControlMsg::WatchViewers).await;
+        send(&mut tls2, ControlMsg::RequestControl).await;
+        let prompt = wait_for(&mut tls1, |msg| matches!(msg, ControlMsg::ViewerPresenceList { request: Some(_), .. })).await;
+        let ControlMsg::ViewerPresenceList { request: Some(requester), .. } = prompt else { unreachable!() };
+        send(&mut tls1, ControlMsg::HandOffControl { viewer: requester, approved: true }).await;
+        wait_for(&mut tls1, |msg| matches!(msg, ControlMsg::SessionModeSwitch { mode: SessionMode::ViewOnly })).await;
+        wait_for(&mut tls2, |msg| matches!(msg, ControlMsg::SessionModeSwitch { mode: SessionMode::FullControl })).await;
+        drop(tls2);
+        wait_for(&mut tls1, |msg| matches!(msg, ControlMsg::ViewerPresenceList { viewers, .. } if viewers.len() == 1)).await;
         let (_tls3, m3) = test_auth_connect(addr, id.fingerprint, b"LockSecret!1", SessionMode::FullControl).await;
         assert_eq!(m3, SessionMode::FullControl);
 

@@ -51,6 +51,13 @@ pub enum SpecialAction {
     LockLocalInput { enabled: bool },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewerPresence {
+    pub id: u64,
+    pub name: String,
+    pub controlling: bool,
+}
+
 /// Channel `0x01` authentication, session lifecycle, and control messages.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ControlMsg {
@@ -127,6 +134,16 @@ pub enum ControlMsg {
     VideoCapabilities(crate::video_pipeline::VideoCapabilities),
     MonitorWorkspace { enabled: bool },
     DesktopActionResult { action: SpecialAction, accepted: bool, message: String },
+    WatchViewers,
+    ViewerPresenceList {
+        self_id: u64,
+        exclusive: bool,
+        viewers: Vec<ViewerPresence>,
+        request: Option<u64>,
+    },
+    RequestControl,
+    HandOffControl { viewer: u64, approved: bool },
+    ControlRequestResult { message: String },
 }
 
 /// Screen region copied from `(src_x, src_y)` to `(dst_x, dst_y)` before dirty tiles paint.
