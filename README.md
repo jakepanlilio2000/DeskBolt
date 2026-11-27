@@ -18,7 +18,7 @@ Self-hosted remote desktop, file transfer, and system administration for Windows
 
 ## Core Capabilities
 
-- **Remote desktop.** Control a remote computer, view its screen, or open a file-only session. Choose one display, stitch **All Screens** into one canvas, or open separate desktop windows with **Pop Out Displays**. Synchronize the clipboard over the same encrypted connection. Supported devices accelerate motion video and fall back to bundled codecs when needed. Open **Quality HUD** in the session toolbar to see latency, render rate, codec, bandwidth, decode time, and recent frame drops.
+- **Remote desktop.** Control a remote computer, view its screen, or open a file-only session. Choose one display, stitch **All Screens** into one canvas, or open separate desktop windows with **Pop Out Displays**. Synchronize the clipboard over the same encrypted connection. Record desktop sessions locally for replay and share control between connected operators. Supported devices accelerate motion video and fall back to bundled codecs when needed. Open **Quality HUD** in the session toolbar to see latency, render rate, codec, bandwidth, decode time, and recent frame drops.
 - **Terminal access.** Open an interactive host shell, connect to SSH and serial devices, reuse command snippets, and run a command on multiple saved hosts.
 - **Files and logs.** Browse and transfer files, resume interrupted copies, compare directories with exclusion rules, edit remote text files, and follow live logs. Transfers use SHA-256 verification.
 - **Network and system administration.** Forward TCP ports, troubleshoot connectivity, and inspect remote systems, processes, and services.
@@ -38,6 +38,9 @@ The first connection shows the host certificate's SHA-256 fingerprint. Confirm i
 
 ### Desktop session controls
 
+- Select **Record Session**, choose a local .dbrec file, then select **Start Recording**. **Stop Recording** saves the indexed video and any active voice or system audio. Open the file in **Tools → Session Replay Player** to scrub the timeline, choose a display, change speed from ½× to 4×, or export that display with mixed audio as MP4 or WebM. Replay needs a compatible decoder for the video stored in the recording.
+- Open **Annotate** to draw freehand marks, arrows, or rectangles, or use the fading laser pointer. **Clear Annotations** removes the marks. The host must allow desktop messages. On Linux, the overlay requires X11 or a desktop compositor that supports overlay surfaces.
+- **Viewers** shows the connected operators and who has control. When the host allows only one controller, select **Request Control** and wait for that operator to select **Hand Off Control**. Host access rules still apply. Enable **Ghost Cursors** in **Viewers** to share your pointer position and see other participating operators' named pointers.
 - **Cursor Sync** displays the host cursor over the remote desktop. Supported capture backends send its shape and position separately from the screen image.
 - **Clipboard → Send Local Clipboard** sends text, PNG images, HTML, or a list of file paths. **Auto-sync clipboard** receives clipboard changes from the active full-control session. Set the size limit under **Options → Display & Input** or with `clipboard_max_bytes` in the host's `config.toml`.
 - Drop local files on the remote desktop to upload them to the directory selected in **Files**, or to the host user's Desktop when no directory is selected. Transfer progress appears on the canvas.
