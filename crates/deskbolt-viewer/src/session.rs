@@ -32,6 +32,8 @@ use tokio::task::JoinHandle;
 #[cfg(target_os = "windows")]
 use windows::Win32::Storage::FileSystem::GetLogicalDrives;
 
+use crate::recording::{Recorder, Track};
+
 pub const FILE_CHUNK_SIZE: usize = 64 * 1024;
 pub const MAX_UNACKED_CHUNKS: u32 = 8;
 
@@ -221,6 +223,8 @@ pub enum SessionCommand {
     Input(InputMsg),
     TypeClipboard { text: String, delay_ms: u16 },
     StopTyping,
+    StartRecording(PathBuf),
+    StopRecording,
     Control(ControlMsg),
     Clipboard(ClipboardSync),
     File(FileTransferMsg),
@@ -259,6 +263,7 @@ pub struct ChatLine {
 pub enum SessionUiEvent {
     PhaseChanged(ConnectionPhase),
     ModeUpdated(SessionMode),
+    Recording { active: bool, status: String },
     Viewers { self_id: u64, exclusive: bool, viewers: Vec<ViewerPresence>, request: Option<u64> },
     PinAccepted { host_id: Option<i64>, fingerprint: String },
     MonitorsUpdated { monitors: Vec<MonitorInfo>, active_id: u8 },
@@ -343,6 +348,8 @@ pub struct ViewerSession {
     pub(crate) exclusive_control: bool,
     pub(crate) viewers: Vec<ViewerPresence>,
     pub(crate) control_request: Option<u64>,
+    pub(crate) recording: bool,
+    pub(crate) recording_pending: bool,
     pub(crate) privacy_curtain: bool,
     pub(crate) local_input_lock: bool,
     pub file_transfer: FileTransferState,
@@ -447,6 +454,8 @@ impl ViewerSession {
             exclusive_control: false,
             viewers: Vec::new(),
             control_request: None,
+            recording: false,
+            recording_pending: false,
             privacy_curtain: false,
             local_input_lock: false,
             file_transfer: ft,
@@ -562,6 +571,11 @@ impl ViewerSession {
                             }));
                         }
                     }
+                }
+                SessionUiEvent::Recording { active, status } => {
+                    self.recording = active;
+                    self.recording_pending = false;
+                    self.status_banner = status;
                 }
                 SessionUiEvent::Viewers { self_id, exclusive, viewers, request } => {
                     if self.control_request == Some(self_id) && request.is_none() && self.mode != SessionMode::FullControl {
@@ -1219,6 +1233,12 @@ async fn run_session_task(
     let mut ft_client = FileClientQueue::new();
     let mut hash_scan: Option<HashScan> = None;
     let mut video_recovery: HashMap<u8, Instant> = HashMap::new();
+    let mut recorder = None;
+    let mut recording_closing = None;
+    let mut recording_monitors = HashSet::new();
+    let mut active_monitor = 0;
+    let mut recording_tick = tokio::time::interval(Duration::from_secs(3));
+    recording_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut next_transfer_id: u64 = 1;
     let mut quick_edit_pending: Option<String> = None;
     let mut quick_edit_uploads: HashMap<u64, (String, PathBuf)> = HashMap::new();
@@ -1257,6 +1277,16 @@ async fn run_session_task(
                     notify(SessionUiEvent::TypingChanged(false));
                 }
             }
+            _ = recording_tick.tick(), if recorder.is_some() => {
+                let monitors = recording_monitors.iter().copied().chain((!recording_monitors.contains(&active_monitor)).then_some(active_monitor));
+                for monitor_id in monitors {
+                    let frame = pack_message(ChannelId::AuthControl, FLAG_URGENT, &ControlMsg::KeyframeRequest { monitor_id }, None)
+                        .expect("keyframe request is fixed size");
+                    if write_frame_async(&mut writer, frame.channel, frame.flags, &frame.payload).await.is_err() {
+                        break 'session;
+                    }
+                }
+            }
             _ = ping_tick.tick() => {
                 let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
                 if let Ok(f) = pack_message(ChannelId::AuthControl, FLAG_NONE, &ControlMsg::Ping { timestamp_ms: ts }, None) {
@@ -1280,6 +1310,7 @@ async fn run_session_task(
                 }
             }
             Some(packet) = voice_rx.recv() => {
+                record(&mut recorder, Track::LocalVoice, 0, 0, &packet, false);
                 if let Ok(f) = pack_message(ChannelId::Comms, FLAG_NONE, &CommsMsg::VoiceFrame(packet), None) {
                     let _ = write_frame_async(&mut writer, f.channel, f.flags, &f.payload).await;
                 }
@@ -1341,11 +1372,43 @@ async fn run_session_task(
                         typing_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                         notify(SessionUiEvent::TypingChanged(!typing.is_empty()));
                     }
+                    SessionCommand::StartRecording(path) => {
+                        if mode == SessionMode::FileTransfer || recorder.is_some() {
+                            continue;
+                        }
+                        if let Some(done) = recording_closing.take() {
+                            let _: Result<(), _> = done.await;
+                        }
+                        let worker_notifier = notifier.clone();
+                        let (done, receiver) = tokio::sync::oneshot::channel::<()>();
+                        let start = tokio::task::spawn_blocking(move || Recorder::start(&path, move |result| {
+                            worker_notifier.send(SessionUiEvent::Recording {
+                                active: false,
+                                status: result.map_or_else(|error| format!("Recording stopped. {error}"), |()| "Recording saved.".into()),
+                            });
+                            let _ = done.send(());
+                        })).await;
+                        match start {
+                            Ok(Ok(new)) => {
+                                recorder = Some(new);
+                                recording_closing = Some(receiver);
+                                recording_monitors.clear();
+                                recording_tick.reset_immediately();
+                                notify(SessionUiEvent::Recording { active: true, status: "Recording this session locally.".into() });
+                            }
+                            Ok(Err(error)) => notify(SessionUiEvent::Recording { active: false, status: format!("Could not start recording. {error}") }),
+                            Err(error) => notify(SessionUiEvent::Recording { active: false, status: format!("Could not start recording. {error}") }),
+                        }
+                    }
+                    SessionCommand::StopRecording => { recorder = None; }
                     SessionCommand::StopTyping => {
                         typing.clear();
                         notify(SessionUiEvent::TypingChanged(false));
                     }
                     SessionCommand::Control(ctrl) => {
+                        if let ControlMsg::MonitorSelect { monitor_id } = ctrl {
+                            active_monitor = monitor_id;
+                        }
                         if matches!(ctrl, ControlMsg::SessionModeSwitch { mode } if mode != SessionMode::FullControl) {
                             typing.clear();
                             notify(SessionUiEvent::TypingChanged(false));
@@ -1586,6 +1649,18 @@ async fn run_session_task(
                     Ok(Some(frame)) => match frame.channel {
                         ChannelId::VideoTiles => {
                             if let Ok(v) = unpack_message::<VideoMsg>(&frame) {
+                                if recorder.is_some() {
+                                    if let Some((id, _, _, key)) = video_metadata(&v) {
+                                        if key {
+                                            recording_monitors.insert(id);
+                                        }
+                                        if recording_monitors.contains(&id) {
+                                            record(&mut recorder, Track::Video, id, frame.flags, &frame.payload, key);
+                                        }
+                                    } else if let VideoMsg::CursorUpdate { monitor_id, .. } = &v {
+                                        record(&mut recorder, Track::Video, *monitor_id, frame.flags, &frame.payload, false);
+                                    }
+                                }
                                 if matches!(v, VideoMsg::CursorUpdate { .. }) {
                                     notify(SessionUiEvent::Cursor(v));
                                 } else if let Err(std::sync::mpsc::TrySendError::Full((missed, _))) =
@@ -1612,6 +1687,7 @@ async fn run_session_task(
                             if let Ok(ctrl) = unpack_message::<ControlMsg>(&frame) {
                                 match ctrl {
                                     ControlMsg::MonitorList { monitors, active_monitor_id } => {
+                                        active_monitor = active_monitor_id;
                                         notify(SessionUiEvent::MonitorsUpdated { monitors, active_id: active_monitor_id });
                                     }
                                     ControlMsg::SessionModeSwitch { mode: granted } => {
@@ -1741,6 +1817,7 @@ async fn run_session_task(
                             if let Ok(cmsg) = unpack_message::<CommsMsg>(&frame) {
                                 match cmsg {
                                     CommsMsg::VoiceFrame(bytes) => {
+                                        record(&mut recorder, Track::RemoteVoice, 0, 0, &bytes, false);
                                         if let Some(eng) = voice_engine.as_ref() {
                                             eng.push_remote_frame(&bytes);
                                         }
@@ -1756,6 +1833,7 @@ async fn run_session_task(
                                         }
                                     }
                                     CommsMsg::SystemAudioFrame(packet) => {
+                                        record(&mut recorder, Track::SystemAudio, 0, 0, &packet, false);
                                         if system_audio_active && let Some(player) = &mut system_audio_player {
                                             player.push(&packet);
                                         }
@@ -2103,6 +2181,12 @@ fn attach_viewer_tunnel_stream(
     tasks.lock().unwrap().insert(tunnel_id, vec![rd_task, wr_task]);
 }
 
+fn record(recorder: &mut Option<Recorder>, track: Track, monitor: u8, flags: u8, data: &[u8], key: bool) {
+    if recorder.as_ref().is_some_and(|writer| !writer.queue(track, monitor, flags, data, key)) {
+        *recorder = None;
+    }
+}
+
 async fn wait_tofu_decision(cmd_rx: &mut mpsc::Receiver<SessionCommand>) -> Option<(bool, bool)> {
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -2131,12 +2215,74 @@ struct NativeDecoder {
 }
 
 #[derive(Default)]
-struct MonitorDecoder {
+pub(crate) struct MonitorDecoder {
     native: Option<NativeDecoder>,
     h264: Option<H264VideoDecoder>,
-    rgba: Vec<u8>,
-    width: u32,
-    height: u32,
+    pub(crate) rgba: Vec<u8>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+}
+
+impl MonitorDecoder {
+    pub(crate) fn decode(&mut self, msg: &VideoMsg, codec: VideoCodec, capabilities: &mut VideoCapabilities)
+        -> Option<VideoCodec>
+    {
+        let Self { native, h264, rgba, width: buf_w, height: buf_h } = self;
+        let mut actual = codec;
+        let mut updated = false;
+        if let VideoMsg::EncodedFrame { width, height, codec, .. } = msg
+            && VideoCodec::HARDWARE.contains(codec)
+            && capabilities.includes(*codec)
+        {
+            let spec = (*codec, *width, *height);
+            if native.as_ref().is_none_or(|active| active.spec != spec) {
+                *native = platform_video_decoder(*codec, *width, *height).map(|decoder| NativeDecoder { spec, decoder });
+            }
+            if let Some(Ok(rendered)) = native.as_mut().map(|active| {
+                active.decoder.decode(msg, rgba, buf_w, buf_h)
+            }) {
+                updated = rendered;
+            } else {
+                *native = None;
+                capabilities.remove(*codec);
+            }
+        }
+        if !updated {
+            updated = match codec {
+                VideoCodec::ZstdTiles => {
+                    *native = None;
+                    ZstdVideo.decode(msg, rgba, buf_w, buf_h).unwrap_or(false)
+                }
+                VideoCodec::H264Sw | VideoCodec::H264Hw if codec == VideoCodec::H264Sw
+                    || !capabilities.includes(VideoCodec::H264Hw) =>
+                {
+                    *native = None;
+                    actual = VideoCodec::H264Sw;
+                    if h264.is_none() {
+                        *h264 = H264VideoDecoder::new().ok();
+                    }
+                    h264.as_mut().is_some_and(|decoder| {
+                        decoder.decode(msg, rgba, buf_w, buf_h).unwrap_or(false)
+                    })
+                }
+                _ => false,
+            };
+        }
+
+        (updated && *buf_w > 0 && *buf_h > 0).then_some(actual)
+    }
+}
+
+pub(crate) fn video_metadata(msg: &VideoMsg) -> Option<(u8, u64, VideoCodec, bool)> {
+    Some(match msg {
+        VideoMsg::TileBatch { monitor_id, frame_seq, is_full_refresh, .. } =>
+            (*monitor_id, *frame_seq, VideoCodec::ZstdTiles, *is_full_refresh),
+        VideoMsg::H264Frame { monitor_id, frame_seq, is_keyframe, .. } =>
+            (*monitor_id, *frame_seq, VideoCodec::H264Sw, *is_keyframe),
+        VideoMsg::EncodedFrame { monitor_id, frame_seq, codec, is_keyframe, .. } =>
+            (*monitor_id, *frame_seq, *codec, *is_keyframe),
+        VideoMsg::CursorUpdate { .. } => return None,
+    })
 }
 
 fn run_decode_worker(
@@ -2153,15 +2299,7 @@ fn run_decode_worker(
 
     while let Ok((msg, queued_at)) = rx.recv() {
         let decode_start = Instant::now();
-        let (id, seq, codec, reset) = match &msg {
-            VideoMsg::TileBatch { monitor_id, frame_seq, is_full_refresh, .. } =>
-                (*monitor_id, *frame_seq, VideoCodec::ZstdTiles, *is_full_refresh),
-            VideoMsg::H264Frame { monitor_id, frame_seq, is_keyframe, .. } =>
-                (*monitor_id, *frame_seq, VideoCodec::H264Sw, *is_keyframe),
-            VideoMsg::EncodedFrame { monitor_id, frame_seq, codec, is_keyframe, .. } =>
-                (*monitor_id, *frame_seq, *codec, *is_keyframe),
-            VideoMsg::CursorUpdate { .. } => continue,
-        };
+        let Some((id, seq, codec, reset)) = video_metadata(&msg) else { continue };
         if !monitors.contains_key(&id) {
             if !reset {
                 continue;
@@ -2176,55 +2314,18 @@ fn run_decode_worker(
                 }
             }
         }
-        let MonitorDecoder { native, h264, rgba, width: buf_w, height: buf_h } =
-            monitors.entry(id).or_default();
-        let mut actual = codec;
-        let mut updated = false;
-        if let VideoMsg::EncodedFrame { width, height, codec, .. } = &msg
-            && VideoCodec::HARDWARE.contains(codec)
-            && capabilities.includes(*codec)
-        {
-            let spec = (*codec, *width, *height);
-            if native.as_ref().is_none_or(|active| active.spec != spec) {
-                *native = platform_video_decoder(*codec, *width, *height).map(|decoder| NativeDecoder { spec, decoder });
-            }
-            if let Some(Ok(rendered)) = native.as_mut().map(|active| {
-                active.decoder.decode(&msg, rgba, buf_w, buf_h)
-            }) {
-                updated = rendered;
-            } else {
-                *native = None;
-                capabilities.remove(*codec);
-                supported.send_replace(capabilities);
-            }
-        }
-        if !updated {
-            updated = match codec {
-                VideoCodec::ZstdTiles => {
-                    *native = None;
-                    ZstdVideo.decode(&msg, rgba, buf_w, buf_h).unwrap_or(false)
-                }
-                VideoCodec::H264Sw | VideoCodec::H264Hw if codec == VideoCodec::H264Sw
-                    || !capabilities.includes(VideoCodec::H264Hw) =>
-                {
-                    *native = None;
-                    actual = VideoCodec::H264Sw;
-                    if h264.is_none() {
-                        *h264 = H264VideoDecoder::new().ok();
-                    }
-                    h264.as_mut().is_some_and(|decoder| {
-                        decoder.decode(&msg, rgba, buf_w, buf_h).unwrap_or(false)
-                    })
-                }
-                _ => false,
-            };
+        let decoder = monitors.entry(id).or_default();
+        let previous = capabilities;
+        let actual = decoder.decode(&msg, codec, &mut capabilities);
+        if capabilities != previous {
+            supported.send_replace(capabilities);
         }
 
-        if updated && *buf_w > 0 && *buf_h > 0 {
+        if let Some(actual) = actual {
             let latency = decode_start.elapsed().as_millis().min(u128::from(u16::MAX)) as u16;
             stats.lock().unwrap().decoded(seq, actual.label(), latency);
             let next_seq = frame_seq.fetch_add(1, Ordering::SeqCst) + 1;
-            let frame = Arc::new(DecodedFrame { seq: next_seq, width: *buf_w, height: *buf_h, rgba: rgba.clone() });
+            let frame = Arc::new(DecodedFrame { seq: next_seq, width: decoder.width, height: decoder.height, rgba: decoder.rgba.clone() });
             surfaces.monitors.lock().unwrap().insert(id, frame.clone());
             *surfaces.latest_frame.lock().unwrap() = Some(frame);
             repaint();

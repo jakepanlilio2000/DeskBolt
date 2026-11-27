@@ -78,6 +78,7 @@ pub struct DeskBoltViewerApp {
     #[cfg(not(target_os = "android"))]
     clipboard: Option<NativeClipboard>,
     show_about: bool,
+    replay: crate::replay::ReplayUi,
     touch_two_finger: Option<(Pos2, f64, f32)>,
     #[cfg(target_os = "android")]
     android_kbd_open: bool,
@@ -245,6 +246,7 @@ impl DeskBoltViewerApp {
             #[cfg(not(target_os = "android"))]
             clipboard: None,
             show_about: false,
+            replay: crate::replay::ReplayUi::default(),
             touch_two_finger: None,
             #[cfg(target_os = "android")]
             android_kbd_open: false,
@@ -383,6 +385,7 @@ impl eframe::App for DeskBoltViewerApp {
             crate::monitor_workspace::show_windows(&ctx, session, self.settings.remote_cursor_sync);
         }
         self.poll_admin_background(&ctx);
+        self.replay.show(&ctx, &mut self.sessions);
 
         #[cfg(target_os = "android")]
         if let Some(s_idx) = self.sessions.iter().position(|s| s.file_transfer.open) {
@@ -548,6 +551,10 @@ impl eframe::App for DeskBoltViewerApp {
                 });
 
                 ui.menu_button("Tools", |ui| {
+                    if ui.button("Session Replay Player").clicked() {
+                        self.replay.open = true;
+                        ui.close();
+                    }
                     if ui.button("Subnet Scanner").clicked() {
                         self.admin.net_tools_open = true;
                         self.admin.net_tab = NetToolTab::Scanner;
@@ -1420,6 +1427,17 @@ impl DeskBoltViewerApp {
                             }
                         }
                     });
+                    let label = if s.recording { "Stop Recording" } else { "Record Session" };
+                    if ui.add_enabled(connected && !s.recording_pending, egui::Button::new(label)).clicked() {
+                        if s.recording {
+                            s.recording_pending = s.cmd_tx.try_send(SessionCommand::StopRecording).is_ok();
+                        } else {
+                            self.replay.save = Some((s.id, crate::replay::recording_path()));
+                        }
+                    }
+                    if s.recording {
+                        ui.strong("Recording");
+                    }
                     if ui.selectable_label(s.quality_hud, "Quality HUD").clicked() {
                         s.quality_hud = !s.quality_hud;
                     }

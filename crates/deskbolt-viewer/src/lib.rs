@@ -3,6 +3,8 @@ pub mod comms_ui;
 mod cursor;
 mod monitor_workspace;
 mod quality_hud;
+mod recording;
+mod replay;
 pub mod db;
 pub mod hook;
 pub mod net_tools;

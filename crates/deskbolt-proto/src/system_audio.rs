@@ -35,11 +35,18 @@ pub struct SystemAudioPlayer {
 
 impl SystemAudioPlayer {
     pub fn start(device: Option<&str>, controls: Arc<SystemAudioControls>) -> Result<Self, String> {
+        Self::start_track(device, controls, false, 2)
+    }
+
+    pub fn start_track(
+        device: Option<&str>, controls: Arc<SystemAudioControls>, mono: bool, double_speed: u32,
+    ) -> Result<Self, String> {
         let output = select_output_device(&cpal::default_host(), device)
             .ok_or("No speaker is available.")?;
-        let buffer = Arc::new(Mutex::new(PlaybackBuffer::new(2)));
+        let channels = if mono { opus::Channels::Mono } else { opus::Channels::Stereo };
+        let buffer = Arc::new(Mutex::new(PlaybackBuffer::new(channels as usize)));
         let playback = buffer.clone();
-        let decoder = AudioDecoder::new(opus::Channels::Stereo).map_err(|e| e.to_string())?;
+        let decoder = AudioDecoder::new(channels).map_err(|e| e.to_string())?;
         let stream = playback_stream(&output, move |samples, channels, rate| {
             let gain = if controls.muted.load(Ordering::Relaxed) {
                 0.0
@@ -49,7 +56,7 @@ impl SystemAudioPlayer {
             playback
                 .lock()
                 .unwrap()
-                .render(samples, channels, rate, gain);
+                .render(samples, channels, (rate * 2 / double_speed.clamp(1, 8)).max(1), gain);
         })?;
         stream.play().map_err(|e| e.to_string())?;
         Ok(Self {
