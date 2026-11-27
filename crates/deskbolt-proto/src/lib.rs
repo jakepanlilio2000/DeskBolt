@@ -1,4 +1,5 @@
 mod audio_codec;
+pub use audio_codec::valid_audio_packet;
 mod audio_io;
 mod echo;
 pub mod system_audio;

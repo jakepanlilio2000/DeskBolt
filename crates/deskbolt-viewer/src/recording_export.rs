@@ -77,7 +77,7 @@ fn export_into(
             if record.track == Track::Video {
                 decode_record(record, display, &mut decoder, &mut capabilities)?;
             } else {
-                audio.add(record.track, &record.data);
+                audio.add(record.track, &record.data, record.audio_reset());
             }
             pending = recording.next()?;
         }
@@ -108,7 +108,7 @@ struct MixedAudio {
     decoder: [opus::Decoder; 3],
     encoder: opus::Encoder,
     pre_skip: u16,
-    mixed: [i32; AUDIO_SAMPLES * 2],
+    queues: [VecDeque<Vec<i16>>; 3],
 }
 
 impl MixedAudio {
@@ -120,28 +120,40 @@ impl MixedAudio {
         Ok(Self {
             encoder, pre_skip,
             decoder: [Mono, Mono, Stereo].map(|ch| opus::Decoder::new(AUDIO_RATE, ch).expect("valid Opus format")),
-            mixed: [0; AUDIO_SAMPLES * 2],
+            queues: std::array::from_fn(|_| VecDeque::new()),
         })
     }
 
-    fn add(&mut self, track: Track, data: &[u8]) {
+    fn add(&mut self, track: Track, data: &[u8], reset: bool) {
+        let index = track as usize - 1;
+        if reset {
+            let _ = self.decoder[index].reset_state();
+            self.queues[index].clear();
+            return;
+        }
         let Some(packet) = data.get(4..) else { return };
         if opus::packet::get_nb_samples(packet, AUDIO_RATE).ok() != Some(AUDIO_SAMPLES) {
             return;
         }
-        let stereo = track == Track::SystemAudio;
-        let mut pcm = [0i16; AUDIO_SAMPLES * 2];
-        if self.decoder[track as usize - 1].decode(packet, &mut pcm, false).ok() != Some(AUDIO_SAMPLES) {
-            return;
-        }
-        for (i, value) in self.mixed.iter_mut().enumerate() {
-            *value = value.saturating_add(i32::from(pcm[if stereo { i } else { i / 2 }]));
+        let channels = if track == Track::SystemAudio { 2 } else { 1 };
+        let mut pcm = vec![0i16; AUDIO_SAMPLES * channels];
+        if self.decoder[index].decode(packet, &mut pcm, false).ok() == Some(AUDIO_SAMPLES) {
+            let queue = &mut self.queues[index];
+            if queue.len() >= 10 {
+                queue.pop_front();
+            }
+            queue.push_back(pcm);
         }
     }
 
     fn packet(&mut self) -> io::Result<Vec<u8>> {
-        let pcm = self.mixed.map(|value| value.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16);
-        self.mixed.fill(0);
+        let tracks = self.queues.each_mut().map(VecDeque::pop_front);
+        let pcm: [i16; AUDIO_SAMPLES * 2] = std::array::from_fn(|sample| {
+            let sum: i32 = tracks.iter().flatten().map(|track| {
+                i32::from(track[if track.len() == AUDIO_SAMPLES { sample / 2 } else { sample }])
+            }).sum();
+            sum.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
+        });
         let mut data = vec![0; 1275];
         let n = self.encoder.encode(&pcm, &mut data).map_err(io::Error::other)?;
         data.truncate(n);
@@ -352,6 +364,13 @@ mod tests {
             is_full_refresh: true, move_rects: Vec::new(), tiles: vec![tile],
         }, None).unwrap();
         assert!(recorder.queue(Track::Video, 0, frame.flags, &frame.payload, true));
+        let mut speech = opus::Encoder::new(AUDIO_RATE, opus::Channels::Mono, opus::Application::Voip).unwrap();
+        let pcm: [i16; AUDIO_SAMPLES] = std::array::from_fn(|i| ((i as f32 / 12.0).sin() * 6_000.0) as i16);
+        let mut packet = vec![0; 1279];
+        let bytes = speech.encode(&pcm, &mut packet[4..]).unwrap();
+        packet.truncate(bytes + 4);
+        assert!(recorder.queue(Track::RemoteVoice, 0, crate::recording::AUDIO_RESET, &[], false));
+        assert!(recorder.queue(Track::RemoteVoice, 0, 0, &packet, false));
         drop(recorder);
         ready.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
         for (ext, format, magic, video) in [

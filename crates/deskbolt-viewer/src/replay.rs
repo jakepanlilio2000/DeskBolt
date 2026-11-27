@@ -102,6 +102,12 @@ fn play(
                 changed |= decode_record(record, display, &mut decoder, &mut capabilities)?;
             } else if playing {
                 let index = record.track as usize - 1;
+                if record.audio_reset() {
+                    players[index] = None;
+                    audio_attempted[index] = false;
+                    pending = file.next()?;
+                    continue;
+                }
                 if !audio_attempted[index] {
                     audio_attempted[index] = true;
                     let mono = record.track != Track::SystemAudio;
@@ -126,6 +132,9 @@ fn play(
             }
             if playing && position >= duration {
                 playing = false;
+                if output.frame.is_none() {
+                    output.status = "This device could not decode the recorded display.".into();
+                }
             }
             output.position = position;
             output.playing = playing;

@@ -74,6 +74,7 @@ GEMINI.md
 *.db-shm
 *.db-wal
 *.db-journal
+*.dbrec
 *.sqlite
 *.sqlite3
 config.toml

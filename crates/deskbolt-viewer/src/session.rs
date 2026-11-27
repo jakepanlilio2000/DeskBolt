@@ -32,7 +32,7 @@ use tokio::task::JoinHandle;
 #[cfg(target_os = "windows")]
 use windows::Win32::Storage::FileSystem::GetLogicalDrives;
 
-use crate::recording::{Recorder, Track};
+use crate::recording::{AUDIO_RESET, Recorder, Track};
 
 pub const FILE_CHUNK_SIZE: usize = 64 * 1024;
 pub const MAX_UNACKED_CHUNKS: u32 = 8;
@@ -1556,6 +1556,8 @@ async fn run_session_task(
                             voice_controls.clone(),
                         ) {
                             Ok(eng) => {
+                                record(&mut recorder, Track::LocalVoice, 0, AUDIO_RESET, &[], false);
+                                record(&mut recorder, Track::RemoteVoice, 0, AUDIO_RESET, &[], false);
                                 voice_engine = Some(eng);
                                 notify(SessionUiEvent::VoiceState {
                                     active: true,
@@ -1846,6 +1848,7 @@ async fn run_session_task(
                                     }
                                     CommsMsg::SystemAudioOffer => {
                                         if system_audio_player.is_some() {
+                                            record(&mut recorder, Track::SystemAudio, 0, AUDIO_RESET, &[], false);
                                             system_audio_active = true;
                                             notify(SessionUiEvent::SystemAudioActive(true));
                                         }

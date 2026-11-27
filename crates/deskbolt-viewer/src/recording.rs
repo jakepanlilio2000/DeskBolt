@@ -11,7 +11,8 @@ const FOOTER: &[u8; 8] = b"DBINDEX\0";
 const RECORD_HEADER: u64 = 15;
 const INDEX_ENTRY: u64 = 17;
 const MAX_INDEX: usize = 1_000_000;
-const MAX_AUDIO_BYTES: usize = 1280;
+const MAX_AUDIO_BYTES: usize = 1279;
+pub(crate) const AUDIO_RESET: u8 = 1;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -43,6 +44,8 @@ pub(crate) struct Record {
 }
 
 impl Record {
+    pub(crate) fn audio_reset(&self) -> bool { self.track != Track::Video && self.flags == AUDIO_RESET }
+
     pub(crate) fn video(self) -> Result<deskbolt_proto::VideoMsg, deskbolt_proto::ProtoError> {
         deskbolt_proto::unpack_message(&Frame {
             channel: ChannelId::VideoTiles, flags: self.flags, payload: self.data,
@@ -147,6 +150,12 @@ impl Recorder {
     }
 
     pub(crate) fn queue(&self, track: Track, monitor: u8, flags: u8, data: &[u8], key: bool) -> bool {
+        if track != Track::Video
+            && !(flags == AUDIO_RESET && data.is_empty())
+            && (flags != 0 || !deskbolt_proto::valid_audio_packet(data))
+        {
+            return true;
+        }
         let queued = self.tx.try_send((Record {
             ms: self.start.elapsed().as_millis() as u64,
             track, monitor, flags, data: data.to_vec(),
@@ -236,8 +245,9 @@ impl<R: Read + Seek> Recording<R> {
         let track = Track::try_from(kind)?;
         let bytes = u32::from_le_bytes(read(&mut self.input)?) as usize;
         let limit = if track == Track::Video { MAX_FRAME_PAYLOAD } else { MAX_AUDIO_BYTES };
-        if bytes == 0 || bytes > limit || offset + RECORD_HEADER + bytes as u64 > self.end
-            || ms > self.duration_ms
+        let reset = track != Track::Video && flags == AUDIO_RESET;
+        if (reset && bytes != 0) || (!reset && bytes == 0) || (track != Track::Video && flags > AUDIO_RESET)
+            || bytes > limit || offset + RECORD_HEADER + bytes as u64 > self.end || ms > self.duration_ms
         {
             return Err(invalid("Invalid recording frame length or timestamp."));
         }
