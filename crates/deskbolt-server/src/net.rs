@@ -746,11 +746,15 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                 }
             }
             Ok((src_id, cmsg)) = chat_rx.recv() => {
-                if src_id != conn_id
-                    && policy.permissions.text_chat
-                    && let Ok(f) = pack_message(ChannelId::Comms, FLAG_NONE, &cmsg, None)
-                {
-                    let _ = out_tx.send(f).await;
+                if src_id == conn_id { continue; }
+                let ghost = matches!(cmsg, CommsMsg::GhostCursor { .. });
+                let allowed = if ghost { *mode != SessionMode::FileTransfer } else { policy.permissions.text_chat };
+                if allowed && let Ok(f) = pack_message(ChannelId::Comms, FLAG_NONE, &cmsg, None) {
+                    if ghost {
+                        let _ = out_tx.try_send(f);
+                    } else {
+                        let _ = out_tx.send(f).await;
+                    }
                 }
             }
             ev = agent_rx.recv(), if *mode != SessionMode::FileTransfer => {
@@ -909,6 +913,7 @@ struct VideoFeedback {
     monitor_workspace: bool,
     desktop_settings_used: bool,
     last_annotation: Option<Instant>,
+    last_ghost: Option<Instant>,
     probe: Option<(u64, Instant)>,
     next_probe: u64,
     rtt: Option<(u64, Instant)>,
@@ -1356,6 +1361,16 @@ async fn dispatch_client_frame(
         ChannelId::Comms => {
             let msg: CommsMsg = unpack_message(&frame).map_err(|e| e.to_string())?;
             match msg {
+                CommsMsg::GhostCursor { cursor, .. } => {
+                    let now = Instant::now();
+                    if *mode != SessionMode::FileTransfer
+                        && video_feedback.last_ghost.is_none_or(|last| now.duration_since(last) >= Duration::from_millis(75))
+                        && hub.monitors_rx.borrow().0.iter().any(|display| display.id == cursor.display)
+                    {
+                        video_feedback.last_ghost = Some(now);
+                        let _ = chat_tx.send((conn_id, CommsMsg::GhostCursor { viewer: conn_id, cursor }));
+                    }
+                }
                 CommsMsg::AnnotationEvent(event) => {
                     if cfg!(target_os = "android") || *mode == SessionMode::FileTransfer
                         || !policy.permissions.send_message || !policy.os_prompts_enabled()
@@ -2382,7 +2397,9 @@ mod tests {
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (hub, _to_agent_rx) = test_hub();
+        let (mut hub, _to_agent_rx) = test_hub();
+        let (monitor_updates, monitors_rx) = watch::channel((Vec::new(), 0));
+        hub.monitors_rx = monitors_rx;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let server_task = tokio::spawn(serve_listener(
@@ -2445,6 +2462,22 @@ mod tests {
         send(&mut tls2, ControlMsg::RequestControl).await;
         let prompt = wait_for(&mut tls1, |msg| matches!(msg, ControlMsg::ViewerPresenceList { request: Some(_), .. })).await;
         let ControlMsg::ViewerPresenceList { request: Some(requester), .. } = prompt else { unreachable!() };
+        monitor_updates.send_replace((vec![deskbolt_proto::MonitorInfo {
+            id: 0, name: "Display".into(), is_primary: true, left: 0, top: 0,
+            width: 64, height: 64, dpi_scale: 1.0,
+        }], 0));
+        let cursor = deskbolt_proto::GhostCursor { display: 0, point: [42, 99] };
+        let ghost = pack_message(ChannelId::Comms, FLAG_NONE, &CommsMsg::GhostCursor { viewer: 99, cursor }, None).unwrap();
+        write_frame_async(&mut tls2, ghost.channel, ghost.flags, &ghost.payload).await.unwrap();
+        let shared = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame = read_frame_async(&mut tls1).await.unwrap().unwrap();
+                if frame.channel == ChannelId::Comms {
+                    break unpack_message::<CommsMsg>(&frame).unwrap();
+                }
+            }
+        }).await.unwrap();
+        assert_eq!(shared, CommsMsg::GhostCursor { viewer: requester, cursor });
         send(&mut tls1, ControlMsg::HandOffControl { viewer: requester, approved: true }).await;
         wait_for(&mut tls1, |msg| matches!(msg, ControlMsg::SessionModeSwitch { mode: SessionMode::ViewOnly })).await;
         wait_for(&mut tls2, |msg| matches!(msg, ControlMsg::SessionModeSwitch { mode: SessionMode::FullControl })).await;

@@ -2,6 +2,7 @@ pub mod admin_ui;
 mod annotations;
 pub mod comms_ui;
 mod cursor;
+mod ghost_cursor;
 mod monitor_workspace;
 mod quality_hud;
 mod recording;

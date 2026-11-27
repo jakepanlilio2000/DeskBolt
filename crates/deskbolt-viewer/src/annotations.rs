@@ -101,7 +101,7 @@ pub(crate) fn send(sender: &mpsc::Sender<SessionCommand>, event: AnnotationEvent
     let _ = sender.try_send(SessionCommand::Comms(CommsMsg::AnnotationEvent(event)));
 }
 
-fn normalize(rect: Rect, point: Pos2) -> [u16; 2] {
+pub(crate) fn normalize(rect: Rect, point: Pos2) -> [u16; 2] {
     let factor = f32::from(u16::MAX);
     [
         ((point.x - rect.min.x) / rect.width().max(1.0) * factor).round() as u16,

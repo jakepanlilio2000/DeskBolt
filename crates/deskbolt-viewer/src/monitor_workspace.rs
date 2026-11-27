@@ -77,6 +77,7 @@ struct Popout {
 #[derive(Default)]
 struct Canvas {
     drawing: crate::annotations::Drawing,
+    ghost_emitter: crate::ghost_cursor::Emitter,
     textures: HashMap<u8, (u64, TextureHandle)>,
     pressed: [Option<Hit>; 5],
     hover: Option<Hit>,
@@ -175,6 +176,7 @@ struct Sources<'a> {
     sender: &'a mpsc::Sender<SessionCommand>,
     controllable: bool,
     annotation: crate::annotations::Tool,
+    ghosts: Option<(&'a crate::ghost_cursor::SharedGhosts, &'a [deskbolt_proto::ViewerPresence])>,
 }
 
 impl Canvas {
@@ -230,6 +232,9 @@ impl Canvas {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::None);
                 }
             }
+        }
+        if let Some((ghosts, viewers)) = sources.ghosts {
+            self.ghost_emitter.paint(ui, &layout.screens, sources.sender, ghosts, viewers);
         }
         if sources.annotation != crate::annotations::Tool::Off {
             self.release_pointer(sources.sender);
@@ -363,6 +368,7 @@ pub(crate) fn paint_stitched(ui: &mut Ui, session: &mut ViewerSession, show_curs
         sender: &session.cmd_tx,
         controllable: session.mode == SessionMode::FullControl && session.annotation_tool == crate::annotations::Tool::Off,
         annotation: session.annotation_tool,
+        ghosts: session.share_ghosts.then_some((&session.ghosts, &session.viewers)),
     };
     if let Some(canvas) = session.workspace.canvas.paint(ui, sources)
         && session.quality_hud
@@ -401,6 +407,7 @@ pub(crate) fn show_windows(ctx: &Context, session: &mut ViewerSession, show_curs
         let cursors = show_cursor.then(|| session.cursors.clone());
         let sender = session.cmd_tx.clone();
         let annotation = session.annotation_tool;
+        let ghosts = session.share_ghosts.then(|| (session.ghosts.clone(), session.viewers.clone()));
         let controllable = session.mode == SessionMode::FullControl && annotation == crate::annotations::Tool::Off;
         ctx.show_viewport_deferred(viewport, builder, move |ui, _| {
             if ui.input(|i| i.viewport().close_requested()) {
@@ -422,6 +429,7 @@ pub(crate) fn show_windows(ctx: &Context, session: &mut ViewerSession, show_curs
                         sender: &sender,
                         controllable,
                         annotation,
+                        ghosts: ghosts.as_ref().map(|(samples, names)| (samples, names.as_slice())),
                     },
                 );
             });

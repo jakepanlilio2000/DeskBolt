@@ -350,6 +350,9 @@ pub struct ViewerSession {
     pub(crate) control_request: Option<u64>,
     pub(crate) annotation_tool: crate::annotations::Tool,
     pub(crate) drawing: crate::annotations::Drawing,
+    pub(crate) share_ghosts: bool,
+    pub(crate) ghosts: crate::ghost_cursor::SharedGhosts,
+    pub(crate) ghost_emitter: crate::ghost_cursor::Emitter,
     pub(crate) recording: bool,
     pub(crate) recording_pending: bool,
     pub(crate) privacy_curtain: bool,
@@ -458,6 +461,9 @@ impl ViewerSession {
             control_request: None,
             annotation_tool: crate::annotations::Tool::Off,
             drawing: crate::annotations::Drawing::default(),
+            share_ghosts: false,
+            ghosts: Default::default(),
+            ghost_emitter: Default::default(),
             recording: false,
             recording_pending: false,
             privacy_curtain: false,
@@ -555,6 +561,9 @@ impl ViewerSession {
                         self.annotation_tool = crate::annotations::Tool::Off;
                         self.drawing = crate::annotations::Drawing::default();
                         self.viewers.clear();
+                        self.share_ghosts = false;
+                        self.ghosts.lock().unwrap().clear();
+                        self.ghost_emitter = Default::default();
                         self.control_request = None;
                         self.privacy_curtain = false;
                         self.local_input_lock = false;
@@ -812,6 +821,9 @@ impl ViewerSession {
                     _ => {}
                 },
                 SessionUiEvent::Comms(cmsg) => match cmsg {
+                    CommsMsg::GhostCursor { viewer, cursor } if self.share_ghosts && viewer != self.self_id => {
+                        crate::ghost_cursor::received(&self.ghosts, viewer, cursor);
+                    }
                     CommsMsg::ChatMessage {
                         sender,
                         timestamp,

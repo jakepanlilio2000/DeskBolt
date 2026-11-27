@@ -671,6 +671,12 @@ impl AnnotationEvent {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GhostCursor {
+    pub display: u8,
+    pub point: [u16; 2],
+}
+
 /// Channel `0x09` chat, desktop messages, sound, and annotation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommsMsg {
@@ -699,6 +705,7 @@ pub enum CommsMsg {
     SystemAudioFrame(#[serde(deserialize_with = "crate::audio_codec::bounded_packet")] Vec<u8>),
     SystemAudioStop,
     AnnotationEvent(AnnotationEvent),
+    GhostCursor { viewer: u64, cursor: GhostCursor },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

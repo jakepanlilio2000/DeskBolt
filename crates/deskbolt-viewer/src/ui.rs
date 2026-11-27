@@ -1351,6 +1351,12 @@ impl DeskBoltViewerApp {
                     }
                     if !s.viewers.is_empty() {
                         ui.menu_button(format!("Viewers ({})", s.viewers.len()), |ui| {
+                            if ui.checkbox(&mut s.share_ghosts, "Ghost Cursors")
+                                .on_hover_text("Share pointer positions and show named pointers.").changed() && !s.share_ghosts
+                            {
+                                s.ghosts.lock().unwrap().clear();
+                            }
+                            ui.separator();
                             for viewer in &s.viewers {
                                 ui.horizontal(|ui| {
                                     ui.label(&viewer.name);
@@ -1758,6 +1764,9 @@ impl DeskBoltViewerApp {
                                     if s.quality_hud {
                                         stats.paint(ui, display_rect.intersect(ui.clip_rect()), s.last_rtt_ms);
                                     }
+                                }
+                                if s.share_ghosts {
+                                    s.ghost_emitter.paint(ui, &[(s.active_monitor_id, display_rect)], &s.cmd_tx, &s.ghosts, &s.viewers);
                                 }
                                 if s.annotation_tool != crate::annotations::Tool::Off {
                                     s.drawing.paint(ui, &[(s.active_monitor_id, display_rect)], s.annotation_tool, &s.cmd_tx);
