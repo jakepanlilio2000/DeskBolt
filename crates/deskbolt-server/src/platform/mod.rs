@@ -23,6 +23,8 @@ mod desktop_common;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
+pub(crate) use linux::start_annotation_overlay;
+#[cfg(target_os = "linux")]
 mod x11_cursor;
 #[cfg(target_os = "linux")]
 mod x11_framebuffer;

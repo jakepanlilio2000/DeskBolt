@@ -348,6 +348,8 @@ pub struct ViewerSession {
     pub(crate) exclusive_control: bool,
     pub(crate) viewers: Vec<ViewerPresence>,
     pub(crate) control_request: Option<u64>,
+    pub(crate) annotation_tool: crate::annotations::Tool,
+    pub(crate) drawing: crate::annotations::Drawing,
     pub(crate) recording: bool,
     pub(crate) recording_pending: bool,
     pub(crate) privacy_curtain: bool,
@@ -454,6 +456,8 @@ impl ViewerSession {
             exclusive_control: false,
             viewers: Vec::new(),
             control_request: None,
+            annotation_tool: crate::annotations::Tool::Off,
+            drawing: crate::annotations::Drawing::default(),
             recording: false,
             recording_pending: false,
             privacy_curtain: false,
@@ -548,6 +552,8 @@ impl ViewerSession {
                         self.monitor_frames.lock().unwrap().clear();
                         self.workspace = crate::monitor_workspace::Workspace::default();
                         self.window_match = crate::monitor_workspace::WindowMatch::default();
+                        self.annotation_tool = crate::annotations::Tool::Off;
+                        self.drawing = crate::annotations::Drawing::default();
                         self.viewers.clear();
                         self.control_request = None;
                         self.privacy_curtain = false;

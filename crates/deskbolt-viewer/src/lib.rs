@@ -1,4 +1,5 @@
 pub mod admin_ui;
+mod annotations;
 pub mod comms_ui;
 mod cursor;
 mod monitor_workspace;

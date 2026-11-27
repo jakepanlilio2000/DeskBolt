@@ -1441,6 +1441,30 @@ impl DeskBoltViewerApp {
                     if ui.selectable_label(s.quality_hud, "Quality HUD").clicked() {
                         s.quality_hud = !s.quality_hud;
                     }
+                    if !s.android_controls {
+                        use crate::annotations::{Drawing, Tool};
+                        ui.add_enabled_ui(connected, |ui| {
+                            ui.menu_button(if s.annotation_tool == Tool::Off { "Annotate" } else { "Annotating" }, |ui| {
+                                let before = s.annotation_tool;
+                                for (tool, label) in Tool::OPTIONS {
+                                    if ui.selectable_value(&mut s.annotation_tool, tool, label).clicked() {
+                                        ui.close();
+                                    }
+                                }
+                                if before != s.annotation_tool {
+                                    s.drawing = Drawing::default();
+                                    if s.mode == SessionMode::FullControl {
+                                        s.send_cmd(SessionCommand::Input(InputMsg::ReleaseAllKeys));
+                                        s.send_cmd(SessionCommand::StopTyping);
+                                    }
+                                }
+                                if ui.button("Clear Annotations").clicked() {
+                                    crate::annotations::send(&s.cmd_tx, deskbolt_proto::AnnotationEvent::Clear);
+                                    ui.close();
+                                }
+                            });
+                        });
+                    }
                     if ui.button("Message").clicked() {
                         s.popup_open = true;
                     }
@@ -1734,6 +1758,10 @@ impl DeskBoltViewerApp {
                                     if s.quality_hud {
                                         stats.paint(ui, display_rect.intersect(ui.clip_rect()), s.last_rtt_ms);
                                     }
+                                }
+                                if s.annotation_tool != crate::annotations::Tool::Off {
+                                    s.drawing.paint(ui, &[(s.active_monitor_id, display_rect)], s.annotation_tool, &s.cmd_tx);
+                                    return;
                                 }
                                 if self.settings.remote_cursor_sync {
                                     let local = if s.mode == SessionMode::FullControl && response.hovered() {

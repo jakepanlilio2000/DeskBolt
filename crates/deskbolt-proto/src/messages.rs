@@ -652,7 +652,26 @@ pub enum SysAdminMsg {
     },
 }
 
-/// Channel `0x09` text chat, one-shot desktop popup messages, and bidirectional voice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AnnotationEvent {
+    Stroke { display: u8, start: [u16; 2], end: [u16; 2] },
+    Arrow { display: u8, start: [u16; 2], end: [u16; 2] },
+    Rectangle { display: u8, start: [u16; 2], end: [u16; 2] },
+    Laser { display: u8, point: [u16; 2] },
+    Clear,
+}
+
+impl AnnotationEvent {
+    pub fn display(self) -> Option<u8> {
+        match self {
+            Self::Stroke { display, .. } | Self::Arrow { display, .. }
+            | Self::Rectangle { display, .. } | Self::Laser { display, .. } => Some(display),
+            Self::Clear => None,
+        }
+    }
+}
+
+/// Channel `0x09` chat, desktop messages, sound, and annotation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommsMsg {
     ChatMessage {
@@ -679,6 +698,7 @@ pub enum CommsMsg {
     SystemAudioOffer,
     SystemAudioFrame(#[serde(deserialize_with = "crate::audio_codec::bounded_packet")] Vec<u8>),
     SystemAudioStop,
+    AnnotationEvent(AnnotationEvent),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -746,6 +766,8 @@ pub enum IpcMsg {
     },
     PolicyCurtain { viewer: u64, enabled: bool },
     SetCaptureCursor(bool),
+    Annotation { viewer: u64, event: AnnotationEvent },
+    AnnotationUnavailable { viewer: u64, reason: String },
     ShowPopup {
         title: String,
         body: String,
@@ -946,5 +968,27 @@ mod tests {
             message: "Scheduled".into(),
         };
         assert_eq!(decode_bincode::<PowerMsg>(&encode_bincode(&ack).unwrap()).unwrap(), ack);
+    }
+}
+
+#[cfg(test)]
+mod annotation_tests {
+    use super::*;
+    use crate::{ChannelId, FLAG_NONE, pack_message, unpack_message};
+
+    #[test]
+    fn annotation_events_round_trip_on_the_comms_channel() {
+        for event in [
+            AnnotationEvent::Stroke { display: 1, start: [0, u16::MAX], end: [16, 42] },
+            AnnotationEvent::Arrow { display: 1, start: [40, 58], end: [31, 45] },
+            AnnotationEvent::Rectangle { display: 8, start: [0, 0], end: [u16::MAX, u16::MAX] },
+            AnnotationEvent::Laser { display: 9, point: [40, 64] },
+            AnnotationEvent::Clear,
+        ] {
+            let frame = pack_message(ChannelId::Comms, FLAG_NONE, &CommsMsg::AnnotationEvent(event), None).unwrap();
+            assert!(frame.payload.len() <= 17);
+            assert!(matches!(unpack_message::<CommsMsg>(&frame).unwrap(),
+                CommsMsg::AnnotationEvent(decoded) if decoded == event));
+        }
     }
 }

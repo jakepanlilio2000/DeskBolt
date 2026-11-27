@@ -213,6 +213,8 @@ fn run_agent_workers(
     let mut audio_viewers = std::collections::HashSet::new();
     let mut workspace_viewers = HashSet::new();
     let mut curtain = crate::privacy::CurtainState::default();
+    #[cfg(not(target_os = "android"))]
+    let mut annotation_failed_at: Option<Instant> = None;
     let display_backend = crate::display_modes::Native;
     let mut display = crate::display_modes::DisplayController::new(crate::display_modes::recovery_path());
     if let Err(error) = display.recover(&display_backend) {
@@ -326,6 +328,16 @@ fn run_agent_workers(
                     warn!("Could not change screen blanking: {error}");
                 }
             }
+            #[cfg(not(target_os = "android"))]
+            IpcMsg::Annotation { viewer, event } => {
+                if annotation_failed_at.is_none_or(|last| last.elapsed() >= Duration::from_secs(1)) {
+                    let monitors = shared.monitors.lock().unwrap().clone();
+                    if let Err(reason) = crate::annotations::submit(event, &monitors) {
+                        annotation_failed_at = Some(Instant::now());
+                        let _ = ev_tx.try_send(IpcMsg::AnnotationUnavailable { viewer, reason });
+                    }
+                }
+            }
             IpcMsg::SetCaptureCursor(enabled) => {
                 shared.capture_cursor.store(enabled, Ordering::Relaxed);
             }
@@ -368,6 +380,8 @@ fn run_agent_workers(
         }
     }
 
+    #[cfg(not(target_os = "android"))]
+    crate::annotations::clear();
     let _ = platform::set_curtain_mode(false);
     if let Err(error) = display.shutdown(&display_backend) {
         warn!("Could not restore display mode: {error}");

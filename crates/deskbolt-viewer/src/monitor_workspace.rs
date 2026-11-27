@@ -76,6 +76,7 @@ struct Popout {
 
 #[derive(Default)]
 struct Canvas {
+    drawing: crate::annotations::Drawing,
     textures: HashMap<u8, (u64, TextureHandle)>,
     pressed: [Option<Hit>; 5],
     hover: Option<Hit>,
@@ -173,6 +174,7 @@ struct Sources<'a> {
     cursors: Option<&'a MonitorCursors>,
     sender: &'a mpsc::Sender<SessionCommand>,
     controllable: bool,
+    annotation: crate::annotations::Tool,
 }
 
 impl Canvas {
@@ -229,8 +231,14 @@ impl Canvas {
                 }
             }
         }
-        if sources.controllable {
-            self.route_input(ui, &layout, sources.sender);
+        if sources.annotation != crate::annotations::Tool::Off {
+            self.release_pointer(sources.sender);
+            self.drawing.paint(ui, &layout.screens, sources.annotation, sources.sender);
+        } else {
+            self.drawing = crate::annotations::Drawing::default();
+            if sources.controllable {
+                self.route_input(ui, &layout, sources.sender);
+            }
         }
         Some(layout.canvas)
     }
@@ -353,7 +361,8 @@ pub(crate) fn paint_stitched(ui: &mut Ui, session: &mut ViewerSession, show_curs
         frames: &session.monitor_frames,
         cursors: show_cursor.then_some(&session.cursors),
         sender: &session.cmd_tx,
-        controllable: session.mode == SessionMode::FullControl,
+        controllable: session.mode == SessionMode::FullControl && session.annotation_tool == crate::annotations::Tool::Off,
+        annotation: session.annotation_tool,
     };
     if let Some(canvas) = session.workspace.canvas.paint(ui, sources)
         && session.quality_hud
@@ -391,7 +400,8 @@ pub(crate) fn show_windows(ctx: &Context, session: &mut ViewerSession, show_curs
         let frames = session.monitor_frames.clone();
         let cursors = show_cursor.then(|| session.cursors.clone());
         let sender = session.cmd_tx.clone();
-        let controllable = session.mode == SessionMode::FullControl;
+        let annotation = session.annotation_tool;
+        let controllable = session.mode == SessionMode::FullControl && annotation == crate::annotations::Tool::Off;
         ctx.show_viewport_deferred(viewport, builder, move |ui, _| {
             if ui.input(|i| i.viewport().close_requested()) {
                 popout.closed.store(true, Ordering::Relaxed);
@@ -411,6 +421,7 @@ pub(crate) fn show_windows(ctx: &Context, session: &mut ViewerSession, show_curs
                         cursors: cursors.as_ref(),
                         sender: &sender,
                         controllable,
+                        annotation,
                     },
                 );
             });

@@ -764,6 +764,10 @@ async fn run_authenticated_session<S: AsyncRead + AsyncWrite + Unpin + Send + 's
                                 }
                                 continue;
                             }
+                            IpcMsg::AnnotationUnavailable { viewer, reason } if *viewer == conn_id => {
+                                send_control_error(&out_tx, reason);
+                                continue;
+                            }
                             IpcMsg::SystemAudioReady { viewer, error } if *viewer == conn_id => {
                                 if system_audio == SystemAudioState::Pending {
                                     if let Some(error) = error {
@@ -904,6 +908,7 @@ struct VideoFeedback {
     decoders: VideoCapabilities,
     monitor_workspace: bool,
     desktop_settings_used: bool,
+    last_annotation: Option<Instant>,
     probe: Option<(u64, Instant)>,
     next_probe: u64,
     rtt: Option<(u64, Instant)>,
@@ -1351,6 +1356,19 @@ async fn dispatch_client_frame(
         ChannelId::Comms => {
             let msg: CommsMsg = unpack_message(&frame).map_err(|e| e.to_string())?;
             match msg {
+                CommsMsg::AnnotationEvent(event) => {
+                    if cfg!(target_os = "android") || *mode == SessionMode::FileTransfer
+                        || !policy.permissions.send_message || !policy.os_prompts_enabled()
+                    {
+                        send_control_error(out_tx, "Desktop annotation is unavailable for this session.");
+                        return Ok(());
+                    }
+                    let now = Instant::now();
+                    if video_feedback.last_annotation.is_none_or(|last| now.duration_since(last) >= Duration::from_millis(10)) {
+                        video_feedback.last_annotation = Some(now);
+                        let _ = hub.to_agent_tx.try_send(IpcMsg::Annotation { viewer: conn_id, event });
+                    }
+                }
                 CommsMsg::ChatMessage { .. } => {
                     if !policy.permissions.text_chat {
                         send_control_error(out_tx, "Text chat is disabled by host administrator.");

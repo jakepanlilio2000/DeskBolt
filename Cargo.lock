@@ -1680,6 +1680,7 @@ dependencies = [
  "sysinfo",
  "tempfile",
  "thiserror 2.0.21",
+ "tiny-skia",
  "tokio",
  "tracing",
  "tracing-subscriber",

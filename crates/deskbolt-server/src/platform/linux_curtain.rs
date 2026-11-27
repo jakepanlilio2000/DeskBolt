@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd};
+use std::os::unix::fs::FileExt;
 use std::sync::{Mutex, mpsc};
 use std::time::Duration;
 
@@ -23,6 +24,19 @@ enum Curtain {
 }
 
 static CURTAIN: Mutex<Option<Curtain>> = Mutex::new(None);
+static ANNOTATION: Mutex<Option<Curtain>> = Mutex::new(None);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Purpose { Curtain, Annotation }
+
+pub(super) fn start_annotation() -> Result<(), String> {
+    let mut active = ANNOTATION.lock().unwrap();
+    if matches!(&*active, Some(Curtain::Wayland { worker, .. }) if !worker.is_finished()) {
+        return Ok(());
+    }
+    *active = Some(open_wayland(Purpose::Annotation)?);
+    Ok(())
+}
 
 pub(super) fn set(enabled: bool) -> Result<(), String> {
     let mut current = CURTAIN.lock().unwrap();
@@ -43,7 +57,7 @@ pub(super) fn set(enabled: bool) -> Result<(), String> {
         None => {}
     }
     *current = Some(if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        open_wayland()?
+        open_wayland(Purpose::Curtain)?
     } else {
         Curtain::X11(Box::new(open_x11().map_err(|error| error.to_string())?))
     });
@@ -90,11 +104,11 @@ fn open_x11() -> Result<x11rb::rust_connection::RustConnection, Box<dyn std::err
     Ok(connection)
 }
 
-fn open_wayland() -> Result<Curtain, String> {
+fn open_wayland(purpose: Purpose) -> Result<Curtain, String> {
     let (ready, reported) = mpsc::sync_channel(1);
     let (stop, stopping) = mpsc::channel();
     let worker = std::thread::spawn(move || {
-        if let Err(error) = run_wayland(&ready, &stopping) {
+        if let Err(error) = run_wayland(&ready, &stopping, purpose) {
             let _ = ready.try_send(Err(error.to_string()));
         }
     });
@@ -107,6 +121,7 @@ fn open_wayland() -> Result<Curtain, String> {
 fn run_wayland(
     ready: &mpsc::SyncSender<Result<(), String>>,
     stop: &mpsc::Receiver<()>,
+    purpose: Purpose,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let connection = Connection::connect_to_env()?;
     let (globals, mut queue) = registry_queue_init::<DisplayState>(&connection)?;
@@ -115,10 +130,11 @@ fn run_wayland(
         compositor: globals.bind(&qh, 1..=4, ())?,
         layer_shell: globals
             .bind(&qh, 1..=4, ())
-            .map_err(|_| "This desktop does not offer screen blanking.")?,
+            .map_err(|_| "This desktop does not support the requested overlay.")?,
         shm: globals.bind(&qh, 1..=1, ())?,
         outputs: HashMap::new(),
         failure: None,
+        purpose,
     };
     for output in globals
         .contents()
@@ -130,6 +146,7 @@ fn run_wayland(
     }
     queue.roundtrip(&mut state)?;
     let mut announced = false;
+    let mut last = 0;
     loop {
         if !matches!(stop.try_recv(), Err(mpsc::TryRecvError::Empty)) {
             return Ok(());
@@ -139,6 +156,24 @@ fn run_wayland(
         }
         if state.outputs.is_empty() {
             return Err("No active screen can be blanked.".into());
+        }
+        if purpose == Purpose::Annotation
+            && let Some(scene) = crate::annotations::snapshot(&mut last)
+        {
+            let displays = scene.displays();
+            let only_output = state.outputs.len() == 1;
+            for output in state.outputs.values_mut() {
+                let (width, height) = output.size;
+                if width == 0 || height == 0 { continue; }
+                let display = displays.iter().find(|m| (m.left, m.top) == output.position)
+                    .or_else(|| only_output.then(|| displays.first()).flatten());
+                let image = display.and_then(|monitor| scene.render(monitor.id, width, height));
+                let active = image.is_some();
+                if active || output.has_mark {
+                    present(output, &state.shm, &qh, purpose, image)?;
+                    output.has_mark = active;
+                }
+            }
         }
         queue.flush()?;
         if !announced && state.outputs.values().all(|output| output.buffer.is_some()) {
@@ -165,6 +200,9 @@ struct Output {
     layer: zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
     buffer: Option<wl_buffer::WlBuffer>,
     output: wl_output::WlOutput,
+    position: (i32, i32),
+    size: (u32, u32),
+    has_mark: bool,
 }
 
 impl Drop for Output {
@@ -187,6 +225,7 @@ struct DisplayState {
     shm: wl_shm::WlShm,
     outputs: HashMap<u32, Output>,
     failure: Option<String>,
+    purpose: Purpose,
 }
 
 impl DisplayState {
@@ -199,7 +238,7 @@ impl DisplayState {
     ) {
         use zwlr_layer_shell_v1::Layer;
         use zwlr_layer_surface_v1::Anchor;
-        let output: wl_output::WlOutput = registry.bind(name, version.min(4), qh, ());
+        let output: wl_output::WlOutput = registry.bind(name, version.min(4), qh, name);
         let surface = self.compositor.create_surface(qh, ());
         let transparent_input = self.compositor.create_region(qh, ());
         surface.set_input_region(Some(&transparent_input));
@@ -208,7 +247,10 @@ impl DisplayState {
             &surface,
             Some(&output),
             Layer::Overlay,
-            "deskbolt-curtain".into(),
+            match self.purpose {
+                Purpose::Curtain => "deskbolt-curtain",
+                Purpose::Annotation => "deskbolt-annotation",
+            }.into(),
             qh,
             name,
         );
@@ -223,6 +265,9 @@ impl DisplayState {
                 layer,
                 buffer: None,
                 output,
+                position: (0, 0),
+                size: (0, 0),
+                has_mark: false,
             },
         );
     }
@@ -271,40 +316,10 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, u32> for DisplayState {
                 let Some(output) = state.outputs.get_mut(name) else {
                     return;
                 };
-                let Some((stride, size)) = buffer_layout(width, height) else {
-                    state.failure = Some("The desktop supplied an unsupported screen size.".into());
-                    return;
-                };
-                // SAFETY: memfd_create returns a newly owned anonymous file descriptor.
-                let fd =
-                    unsafe { libc::memfd_create(c"deskbolt-curtain".as_ptr(), libc::MFD_CLOEXEC) };
-                if fd < 0 {
-                    state.failure = Some(std::io::Error::last_os_error().to_string());
-                    return;
-                }
-                // SAFETY: The successful descriptor is owned by this file.
-                let file = unsafe { File::from_raw_fd(fd) };
-                if let Err(error) = file.set_len(size as u64) {
-                    state.failure = Some(error.to_string());
-                    return;
-                }
-                let pool = state.shm.create_pool(file.as_fd(), size, qh, ());
-                let buffer = pool.create_buffer(
-                    0,
-                    width as i32,
-                    height as i32,
-                    stride,
-                    wl_shm::Format::Xrgb8888,
-                    qh,
-                    (),
-                );
-                pool.destroy();
                 layer.ack_configure(serial);
-                output.surface.attach(Some(&buffer), 0, 0);
-                output.surface.damage(0, 0, width as i32, height as i32);
-                output.surface.commit();
-                if let Some(old) = output.buffer.replace(buffer) {
-                    old.destroy();
+                output.size = (width, height);
+                if let Err(error) = present(output, &state.shm, qh, state.purpose, None) {
+                    state.failure = Some(error.to_string());
                 }
             }
             zwlr_layer_surface_v1::Event::Closed => {
@@ -313,6 +328,56 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, u32> for DisplayState {
             _ => {}
         }
     }
+}
+
+impl Dispatch<wl_output::WlOutput, u32> for DisplayState {
+    fn event(
+        state: &mut Self, _: &wl_output::WlOutput, event: wl_output::Event,
+        name: &u32, _: &Connection, _: &QueueHandle<Self>,
+    ) {
+        if let wl_output::Event::Geometry { x, y, .. } = event
+            && let Some(output) = state.outputs.get_mut(name)
+        {
+            output.position = (x, y);
+        }
+    }
+}
+
+fn present(
+    output: &mut Output, shm: &wl_shm::WlShm, qh: &QueueHandle<DisplayState>,
+    purpose: Purpose, image: Option<tiny_skia::Pixmap>,
+) -> std::io::Result<()> {
+    let (width, height) = output.size;
+    let (stride, size) = buffer_layout(width, height)
+        .ok_or_else(|| std::io::Error::other("The desktop supplied an unsupported screen size."))?;
+    // SAFETY: memfd_create returns a newly owned anonymous file descriptor.
+    let fd = unsafe { libc::memfd_create(c"deskbolt-overlay".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: The successful descriptor is owned by this file.
+    let file = unsafe { File::from_raw_fd(fd) };
+    file.set_len(size as u64)?;
+    if let Some(mut image) = image {
+        for pixel in image.data_mut().as_chunks_mut::<4>().0 {
+            if cfg!(target_endian = "little") { pixel.swap(0, 2); } else { pixel.rotate_right(1); }
+        }
+        file.write_all_at(image.data(), 0)?;
+    }
+    let pool = shm.create_pool(file.as_fd(), size, qh, ());
+    let format = match purpose {
+        Purpose::Curtain => wl_shm::Format::Xrgb8888,
+        Purpose::Annotation => wl_shm::Format::Argb8888,
+    };
+    let buffer = pool.create_buffer(0, width as i32, height as i32, stride, format, qh, ());
+    pool.destroy();
+    output.surface.attach(Some(&buffer), 0, 0);
+    output.surface.damage(0, 0, width as i32, height as i32);
+    output.surface.commit();
+    if let Some(old) = output.buffer.replace(buffer) {
+        old.destroy();
+    }
+    Ok(())
 }
 
 fn buffer_layout(width: u32, height: u32) -> Option<(i32, i32)> {
@@ -324,7 +389,6 @@ fn buffer_layout(width: u32, height: u32) -> Option<(i32, i32)> {
 delegate_noop!(DisplayState: ignore wl_compositor::WlCompositor);
 delegate_noop!(DisplayState: ignore wl_region::WlRegion);
 delegate_noop!(DisplayState: ignore wl_surface::WlSurface);
-delegate_noop!(DisplayState: ignore wl_output::WlOutput);
 delegate_noop!(DisplayState: ignore wl_shm::WlShm);
 delegate_noop!(DisplayState: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(DisplayState: ignore wl_buffer::WlBuffer);

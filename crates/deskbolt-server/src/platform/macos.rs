@@ -557,6 +557,7 @@ pub fn set_os_autostart(enabled: bool) -> Result<(), String> {
 }
 
 pub(crate) fn run_tray_icon(
+    show_tray: bool,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<(), String> {
@@ -573,6 +574,8 @@ pub(crate) fn run_tray_icon(
     use winit::window::WindowId;
 
     struct HostMenu {
+        show_tray: bool,
+        overlay: crate::annotations::macos::Overlay,
         tray: Option<TrayIcon>,
         items: Vec<(MenuId, TrayAction)>,
         error: Option<String>,
@@ -603,18 +606,19 @@ pub(crate) fn run_tray_icon(
     }
 
     impl ApplicationHandler for HostMenu {
-        fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-            if self.tray.is_none()
+        fn resumed(&mut self, _: &ActiveEventLoop) {
+            if self.show_tray && self.tray.is_none()
                 && let Err(error) = self.install()
             {
                 self.error = Some(error);
-                event_loop.exit();
+                self.show_tray = false;
             }
         }
 
         fn window_event(&mut self, _: &ActiveEventLoop, _: WindowId, _: WindowEvent) {}
 
         fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+            self.overlay.refresh();
             while let Ok(event) = MenuEvent::receiver().try_recv() {
                 if let Some((_, action)) = self.items.iter().find(|(id, _)| *id == event.id) {
                     let action = *action;
@@ -626,7 +630,7 @@ pub(crate) fn run_tray_icon(
                 event_loop.exit();
             } else {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(
-                    Instant::now() + Duration::from_millis(100),
+                    Instant::now() + Duration::from_millis(50),
                 ));
             }
         }
@@ -637,6 +641,8 @@ pub(crate) fn run_tray_icon(
         .build()
         .map_err(|error| error.to_string())?;
     let mut host = HostMenu {
+        show_tray,
+        overlay: crate::annotations::macos::Overlay::default(),
         tray: None,
         items: Vec::new(),
         error: None,

@@ -16,6 +16,16 @@ use super::{InputInjector, ScreenCapturer};
 
 #[path = "linux_curtain.rs"]
 mod curtain;
+#[path = "annotation_x11.rs"]
+mod annotation_x11;
+
+pub(crate) fn start_annotation_overlay() -> Result<(), String> {
+    if super::wayland_capture::is_wayland() {
+        curtain::start_annotation()
+    } else {
+        annotation_x11::start()
+    }
+}
 
 const SYSTEMD_UNIT_PATH: &str = "/etc/systemd/system/deskbolt-server.service";
 const OPENRC_INIT_PATH: &str = "/etc/init.d/deskbolt-server";

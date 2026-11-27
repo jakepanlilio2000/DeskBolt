@@ -33,6 +33,7 @@ default = []
 dev-mcp = ["dep:rmcp", "dep:schemars", "dep:rustls", "dep:tempfile", "deskbolt-proto/dev-mcp"]
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
+tiny-skia = { version = "0.11.4", default-features = false, features = ["std", "simd"] }
 portable-pty = { workspace = true }
 serialport = { workspace = true }
 eframe = { workspace = true }
@@ -63,10 +64,10 @@ xcap = { workspace = true }
 enigo = { workspace = true }
 libc = { workspace = true }
 objc2 = "0.6.5"
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSCursor", "NSGraphicsContext", "NSImage", "NSImageRep", "objc2-core-graphics"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSBitmapImageRep", "NSCell", "NSColor", "NSControl", "NSCursor", "NSGraphics", "NSGraphicsContext", "NSImage", "NSImageRep", "NSImageView", "NSResponder", "NSView", "NSWindow", "objc2-core-graphics"] }
 objc2-core-foundation = "0.3.2"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSBundle", "NSString", "NSUserNotification"] }
-objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["CGBitmapContext", "CGColorSpace", "CGContext", "CGEvent", "CGEventSource", "CGEventTypes", "CGImage", "CGRemoteOperation"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["CGBitmapContext", "CGColorSpace", "CGContext", "CGDirectDisplay", "CGEvent", "CGEventSource", "CGEventTypes", "CGImage", "CGRemoteOperation"] }
 tray-icon = { version = "0.27.0", default-features = false }
 winit = { version = "0.30.13", default-features = false }
 

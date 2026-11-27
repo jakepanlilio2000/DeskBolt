@@ -13,6 +13,8 @@ pub mod ipc;
 pub mod loopback;
 pub mod net;
 mod collaboration;
+#[cfg(not(target_os = "android"))]
+mod annotations;
 pub mod platform;
 #[cfg(not(target_os = "android"))]
 pub mod settings_ui;
@@ -226,9 +228,9 @@ pub fn run_inprocess_server_mode() -> Result<(), String> {
         res
     };
     #[cfg(target_os = "macos")]
-    if show_tray && platform::macos::interactive_session() {
+    if platform::macos::interactive_session() {
         let server = std::thread::spawn(move || rt.block_on(run));
-        if let Err(error) = platform::macos::run_tray_icon(ui_channels.0, ui_channels.1) {
+        if let Err(error) = platform::macos::run_tray_icon(show_tray, ui_channels.0, ui_channels.1) {
             tracing::warn!("Host menu unavailable: {error}");
         }
         return server.join().map_err(|_| "The host stopped unexpectedly.")?;
