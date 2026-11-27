@@ -1,12 +1,13 @@
 use std::io;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use deskbolt_proto::system_audio::{SystemAudioControls, SystemAudioPlayer};
 use deskbolt_proto::video_pipeline::{VideoCapabilities, platform_video_decoders};
 
 use crate::recording::{Record, Recording, Track};
+use crate::recording_export::{self, Format};
 use crate::session::{DecodedFrame, MonitorDecoder, SessionCommand, ViewerSession, video_metadata};
 
 pub(crate) fn recording_path() -> String {
@@ -32,6 +33,7 @@ enum Command {
 }
 
 struct Playback {
+    source: PathBuf,
     command: mpsc::Sender<Command>,
     view: Arc<Mutex<View>>,
 }
@@ -41,6 +43,7 @@ impl Playback {
         let (command, receive) = mpsc::channel();
         let view = Arc::new(Mutex::new(View::default()));
         let worker_view = view.clone();
+        let source = path.clone();
         std::thread::Builder::new().name("session-replay".into()).spawn(move || {
             if let Err(error) = play(path, receive, &worker_view, &context) {
                 let mut view = worker_view.lock().unwrap();
@@ -49,7 +52,7 @@ impl Playback {
             }
             context.request_repaint();
         })?;
-        Ok(Self { command, view })
+        Ok(Self { source, command, view })
     }
 }
 
@@ -185,6 +188,16 @@ fn play(
     }
 }
 
+struct ExportJob {
+    done: mpsc::Receiver<io::Result<()>>,
+    cancelled: Arc<AtomicBool>,
+}
+impl Drop for ExportJob {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct ReplayUi {
     pub(crate) open: bool,
@@ -195,9 +208,74 @@ pub(crate) struct ReplayUi {
     monitor: Option<u8>,
     speed: u32,
     texture: Option<(u64, egui::TextureHandle)>,
+    export_path: Option<(Format, String)>,
+    export: Option<ExportJob>,
+    export_status: String,
 }
 
 impl ReplayUi {
+    fn export_controls(&mut self, ui: &mut egui::Ui, source: PathBuf, monitor: u8) {
+        if let Some(export) = &self.export {
+            match export.done.try_recv() {
+                Ok(result) => {
+                    self.export_status = result.map_or_else(|error| error.to_string(), |()| "Export saved.".into());
+                    self.export = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.export_status = "The export worker stopped.".into();
+                    self.export = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    if ui.button("Cancel Export").clicked() {
+                        export.cancelled.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+        } else {
+            ui.horizontal(|ui| {
+                for (label, ext, format) in [("Export MP4", "mp4", Format::Mp4), ("Export WebM", "webm", Format::Webm)] {
+                    if ui.button(label).clicked() {
+                        self.export_path = Some((format, source.with_extension(ext).to_string_lossy().into_owned()));
+                    }
+                }
+            });
+            if let Some((format, path)) = &mut self.export_path {
+                let mut close = false;
+                ui.horizontal(|ui| {
+                    ui.label("Export file");
+                    ui.text_edit_singleline(path);
+                    let target = PathBuf::from(path.trim());
+                    let ext = match format { Format::Mp4 => "mp4", Format::Webm => "webm" };
+                    if ui.add_enabled(target.extension().is_some_and(|e| e.eq_ignore_ascii_case(ext)), egui::Button::new("Save")).clicked() {
+                        let (send, done) = mpsc::channel();
+                        let cancelled = Arc::new(AtomicBool::new(false));
+                        let flag = cancelled.clone();
+                        let context = ui.ctx().clone();
+                        let format = *format;
+                        match std::thread::Builder::new().name("recording-export".into()).spawn(move || {
+                            let _ = send.send(recording_export::export(&source, &target, monitor, format, &flag));
+                            context.request_repaint();
+                        }) {
+                            Ok(_) => {
+                                self.export = Some(ExportJob { done, cancelled });
+                                self.export_status = "Exporting the selected display.".into();
+                            }
+                            Err(error) => self.export_status = error.to_string(),
+                        }
+                        close = true;
+                    }
+                    close |= ui.button("Cancel").clicked();
+                });
+                if close {
+                    self.export_path = None;
+                }
+            }
+        }
+        if !self.export_status.is_empty() {
+            ui.label(&self.export_status);
+        }
+    }
+
     pub(crate) fn show(&mut self, ctx: &egui::Context, sessions: &mut [ViewerSession]) {
         if let Some((id, path)) = &mut self.save {
             let mut close = false;
@@ -231,6 +309,7 @@ impl ReplayUi {
                 ui.text_edit_singleline(&mut self.path);
                 if ui.button("Open Recording").clicked() {
                     self.playback = None;
+                    self.export_path = None;
                     self.monitor = None;
                     self.texture = None;
                     self.speed = 2;
@@ -294,10 +373,14 @@ impl ReplayUi {
                     ui.add(egui::Image::new(tex).max_size(egui::vec2(ui.available_width(), 480.0)));
                 }
             }
+            let source = playback.source.clone();
+            let monitor = *monitor;
+            self.export_controls(ui, source, monitor);
         });
         self.open = open;
         if !open {
             self.playback = None;
+            self.export_path = None;
             self.texture = None;
         }
     }

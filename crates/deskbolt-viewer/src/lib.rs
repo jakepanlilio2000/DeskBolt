@@ -4,6 +4,7 @@ mod cursor;
 mod monitor_workspace;
 mod quality_hud;
 mod recording;
+mod recording_export;
 mod replay;
 pub mod db;
 pub mod hook;

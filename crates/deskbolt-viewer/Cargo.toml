@@ -31,6 +31,10 @@ russh-sftp = { workspace = true }
 surge-ping = { workspace = true }
 hickory-resolver = { workspace = true }
 cpal = { workspace = true }
+muxide = { version = "0.5", default-features = false }
+webm-muxer = "0.1"
+rav1e = { version = "0.8", default-features = false, features = ["threading"] }
+opus = "0.3"
 
 [features]
 default = []
